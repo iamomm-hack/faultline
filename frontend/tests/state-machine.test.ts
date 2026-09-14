@@ -1,0 +1,14 @@
+import { describe,expect,it } from "vitest";import { initialSnapshot } from "../faultline/fixtures";import { advanceDemo,countsAsPreserved,executeProposal } from "../faultline/state-machine";import { MockFaultlineClient } from "../faultline/mock-client";
+function run(steps:number){let state=initialSnapshot();for(let i=0;i<steps;i++)state=advanceDemo(state).state;return state}
+describe("Faultline deterministic demo",()=>{
+ it("rejects vulnerable v2 after a 2-of-3 reproduced quorum",()=>{const s=run(10),p=s.proposals[0];expect(p.state).toBe("rejected");expect(p.assignment?.results.filter(r=>r.verdict==="reproduced")).toHaveLength(2)});
+ it("never executes rejected v2",()=>{const r=executeProposal(run(10),"proposal-v2");expect(r).toMatchObject({ok:false,code:"UPGRADE_REJECTED"})});
+ it("settles the hunter bounty exactly once",()=>{const s=run(11);expect(s.hunterBalance.baseUnits).toBe("120000000");expect(s.proposals[0].settlement?.amount.baseUnits).toBe("100000000");expect(advanceDemo(s).state.hunterBalance.baseUnits).toBe("120000000")});
+ it("approves patched v3 only after the window completes",()=>{expect(run(18).proposals[1].state).toBe("verifying");expect(run(19).proposals[1].state).toBe("approved")});
+ it("executes approved v3 exactly once",()=>{const s=run(20);expect(s.deployedVersion).toBe("v3");expect(s.proposals[1].state).toBe("executed");expect(executeProposal(s,"proposal-v3")).toMatchObject({ok:false,code:"ALREADY_EXECUTED"})});
+ it("rehydrates a serialized demo snapshot",()=>{const saved=JSON.stringify(run(7));const client=new MockFaultlineClient({initialState:JSON.parse(saved) as ReturnType<typeof initialSnapshot>,delayMs:0});expect(client.getSnapshot().step).toBe(7);expect(client.getSnapshot().proposals[0].assignment?.results[0].verdict).toBe("reproduced")});
+ it("reset restores v1 and original balances",async()=>{const client=new MockFaultlineClient({initialState:run(20),delayMs:0});await client.resetDemo();expect(client.getSnapshot()).toMatchObject({deployedVersion:"v1",treasuryBalance:{baseUnits:"500000000"},hunterBalance:{baseUnits:"20000000"},step:0})});
+ it("rejects invalid terminal transitions",()=>{expect(advanceDemo(run(20)).result).toMatchObject({ok:false,code:"INVALID_TRANSITION"});expect(executeProposal(initialSnapshot(),"proposal-v2")).toMatchObject({ok:false,code:"INVALID_TRANSITION"})});
+ it("injects typed prototype failures without corrupting progress",async()=>{const client=new MockFaultlineClient({delayMs:0});client.setNextError("CANDIDATE_ARTIFACT_MISMATCH");expect(await client.advanceDemo()).toMatchObject({ok:false,code:"CANDIDATE_ARTIFACT_MISMATCH"});expect(client.getSnapshot().step).toBe(0)});
+ it("does not count infrastructure outcomes as preservation",()=>{expect(countsAsPreserved("runner_fault")).toBe(false);expect(countsAsPreserved("unsupported_environment")).toBe(false);expect(countsAsPreserved("preserved")).toBe(true)});
+});

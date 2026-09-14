@@ -1,0 +1,3 @@
+import { describe,expect,it } from "vitest";import { readFileSync,readdirSync,statSync } from "node:fs";import { join } from "node:path";
+function sourceFiles(root:string):string[]{return readdirSync(root).flatMap(name=>{const p=join(root,name);return statSync(p).isDirectory()?sourceFiles(p):/\.(tsx|ts)$/.test(name)?[p]:[]})}
+describe("epistemic language",()=>{it("does not render prohibited product claims",()=>{const roots=["app","components"].flatMap(sourceFiles);const ui=roots.map(p=>readFileSync(p,"utf8")).join("\n").toLowerCase();for(const phrase of ["bug-free","audit passed","100% safe","v3 is secure"])expect(ui).not.toContain(phrase)})});
