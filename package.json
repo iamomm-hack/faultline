@@ -1,14 +1,18 @@
 {
-  "name": "faultline-milestone-1",
+  "name": "faultline-milestone-2",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "bootstrap:ids": "tsx scripts/bootstrap-ids.ts",
     "build:programs": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-programs.ps1",
+    "build:treasury:all": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-programs.ps1",
     "demo:guard": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-guard-demo.ps1",
+    "demo:exploit-v2": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-treasury-demo.ps1 -Scenario v2 -AllowVulnerableV2",
+    "demo:patch-v3": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-treasury-demo.ps1 -Scenario v3",
     "test": "npm run demo:guard",
     "test:guard": "npm run demo:guard",
+    "test:treasury-versions": "npm run demo:exploit-v2 && npm run demo:patch-v3",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

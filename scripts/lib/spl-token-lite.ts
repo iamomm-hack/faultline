@@ -1,4 +1,12 @@
-import { Connection, Keypair, PublicKey, SYSVAR_RENT_PUBKEY, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  SYSVAR_RENT_PUBKEY,
+  SystemProgram,
+  Transaction,
+  sendAndConfirmTransaction
+} from "@solana/web3.js";
 import { COMMITMENT } from "./solana.js";
 
 export const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -21,11 +29,10 @@ export async function createMint(
 ): Promise<string> {
   const lamports = await connection.getMinimumBalanceForRentExemption(MINT_SIZE, COMMITMENT);
   const data = Buffer.alloc(67);
-  data[0] = 0;
+  data[0] = 20; // TokenInstruction::InitializeMint2
   data[1] = decimals;
-  data.writeUInt32LE(1, 2);
-  mintAuthority.toBuffer().copy(data, 6);
-  data.writeUInt32LE(0, 38);
+  mintAuthority.toBuffer().copy(data, 2);
+  data.writeUInt32LE(0, 34);
   const tx = new Transaction()
     .add(
       SystemProgram.createAccount({
@@ -38,10 +45,7 @@ export async function createMint(
     )
     .add({
       programId: TOKEN_PROGRAM_ID,
-      keys: [
-        { pubkey: mint.publicKey, isSigner: false, isWritable: true },
-        { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false }
-      ],
+      keys: [{ pubkey: mint.publicKey, isSigner: false, isWritable: true }],
       data
     });
   return sendAndConfirmTransaction(connection, tx, [payer, mint], { commitment: COMMITMENT });

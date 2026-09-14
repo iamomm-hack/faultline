@@ -1,5 +1,6 @@
 docs/*
 !docs/MILESTONE_1_GUARD.md
+!docs/MILESTONE_2_TREASURY.md
 /.anchor/
 /.localnet/
 /artifacts/

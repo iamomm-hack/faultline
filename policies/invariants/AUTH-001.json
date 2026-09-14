@@ -1,0 +1,47 @@
+{
+  "schema": "faultline.invariant.v1",
+  "invariant_id": "AUTH-001",
+  "version": 1,
+  "name": "Unauthorized treasury token outflow is forbidden",
+  "statement": "A non-admin signer must never cause the tracked treasury token balance to decrease.",
+  "machine_evaluator": {
+    "type": "unauthorized_token_outflow_v1",
+    "version": 1
+  },
+  "tracked_treasury_account": {
+    "fixture_account_ref": "treasury_pda",
+    "state_account_type": "TreasuryState",
+    "vault_field": "vault_token_account"
+  },
+  "admin_authority_source": {
+    "kind": "pre_state_treasury_admin",
+    "field": "TreasuryState.admin"
+  },
+  "allowed_outflow_conditions": [
+    {
+      "operation": "admin_withdraw",
+      "required_authority": "original_admin",
+      "required_signature": true
+    },
+    {
+      "operation": "migrate_authority",
+      "required_authority": "original_admin",
+      "required_signature": true
+    }
+  ],
+  "pre_state_selector": "treasury_vault.token_balance",
+  "post_state_selector": "treasury_vault.token_balance",
+  "violation_relation": "if_no_valid_original_admin_authorization_then_post_balance_must_be_greater_than_or_equal_to_pre_balance",
+  "semantic_rule": "Let original_admin be TreasuryState.admin in the captured pre-state. If no transaction in the trace contains a valid authorization from original_admin for the relevant migration or withdrawal operation, then post_treasury_vault_balance >= pre_treasury_vault_balance. A trace cannot satisfy authorization by first corrupting TreasuryState.admin.",
+  "supported_trace_schema": "faultline.trace.v1",
+  "limits": {
+    "max_transactions": 32,
+    "token_program": "spl-token-v3-tokenkeg",
+    "amount_encoding": "u64_base_units"
+  },
+  "limitations": [
+    "Milestone 2 defines the evaluator contract and canonical policy but does not implement the verifier quorum or generic replay daemon.",
+    "Only the configured fixture treasury and Tokenkeg mint are in scope.",
+    "Token-2022 extensions, transfer fees, confidential balances, rebasing assets, and oracle-dependent policies are out of scope."
+  ]
+}

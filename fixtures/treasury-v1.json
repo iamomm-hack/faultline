@@ -1,0 +1,71 @@
+{
+  "schema": "faultline.fixture.v1",
+  "fixture_id": "treasury-v1",
+  "canonicalization": {
+    "encoding": "utf8",
+    "json": "sorted_keys_no_insignificant_whitespace_for_hashing",
+    "integers": "decimal_strings_for_u64"
+  },
+  "cluster": {
+    "kind": "localnet",
+    "rpc_url": "http://127.0.0.1:8899"
+  },
+  "programs": {
+    "faultline_gate": {
+      "alias": "faultline-gate-program"
+    },
+    "faultline_treasury": {
+      "alias": "faultline-treasury-program",
+      "build": "v1"
+    },
+    "spl_token": {
+      "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+    }
+  },
+  "accounts": {
+    "treasury_pda": {
+      "program_alias": "faultline-treasury-program",
+      "seeds_utf8": ["treasury"]
+    },
+    "legitimate_admin": {
+      "signer_alias": "treasury-admin"
+    },
+    "attacker": {
+      "signer_alias": "attacker"
+    },
+    "user": {
+      "signer_alias": "user"
+    },
+    "payment_mint": {
+      "keypair_alias": "payment-mint",
+      "decimals": 6,
+      "symbol": "fUSDC"
+    },
+    "treasury_vault": {
+      "keypair_alias": "treasury-vault-token",
+      "mint_alias": "payment-mint",
+      "token_authority": "treasury_pda"
+    },
+    "attacker_token_account": {
+      "keypair_alias": "attacker-token",
+      "mint_alias": "payment-mint",
+      "token_authority": "attacker"
+    }
+  },
+  "initial_balances": {
+    "treasury_vault_base_units": "1000000000",
+    "treasury_vault_display": "1000.000000 fUSDC",
+    "attacker_base_units": "0",
+    "attacker_display": "0.000000 fUSDC"
+  },
+  "exploit_amount": {
+    "base_units": "100000000",
+    "display": "100.000000 fUSDC"
+  },
+  "state": {
+    "schema_version": 1,
+    "current_deployed_version": "v1",
+    "treasury_state_account": "treasury_pda",
+    "vault_binding": "treasury_vault"
+  }
+}

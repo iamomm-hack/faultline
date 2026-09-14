@@ -11,7 +11,19 @@ npm.cmd install
 npm.cmd run demo:guard
 ```
 
-The command builds isolated treasury v1/v2 SBF artifacts, starts a clean validator, deploys v1, transfers ProgramData and buffer authority to the Guard PDA, proves unauthorized/pending/rejected paths fail, performs the guarded loader upgrade, verifies v2 behavior under the same program ID, and proves repeat execution fails.
+The command builds isolated treasury v1/v2/v3 SBF artifacts, starts a clean validator, deploys v1, transfers ProgramData and buffer authority to the Guard PDA, proves unauthorized/pending/rejected paths fail, performs the guarded loader upgrade, verifies v2 behavior under the same program ID, and proves repeat execution fails.
+
+## Milestone 2: treasury vulnerability and patch
+
+Milestone 2 adds the real AUTH-001 treasury target: `v1` safe baseline, intentionally vulnerable `v2` authority-migration regression, and patched `v3`, all under the same program ID with isolated ELF artifacts. See [docs/MILESTONE_2_TREASURY.md](docs/MILESTONE_2_TREASURY.md).
+
+```powershell
+npm.cmd run build:treasury:all
+npm.cmd run demo:exploit-v2
+npm.cmd run demo:patch-v3
+```
+
+The v2 demo proves an attacker-only two-transaction trace drains `100.000000 fUSDC`. The v3 demo replays the same trace and proves the migration fails before any outflow, then verifies legitimate admin migration still works.
 
 The prototype is intentionally honest: it demonstrates protocol behavior locally and does not submit transactions, sign with a wallet, run Solana RPC, execute LiteSVM, or move real tokens.
 
