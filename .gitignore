@@ -1,1 +1,7 @@
 docs/
+/.anchor/
+/.localnet/
+/artifacts/
+/target/
+/node_modules/
+/test-ledger/
