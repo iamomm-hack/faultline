@@ -34,11 +34,11 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Gate deployment failed' }
   & solana program set-upgrade-authority $localIds.'faultline-gate-program' --final --upgrade-authority .localnet\payer.json --keypair .localnet\payer.json --url http://127.0.0.1:8899 --output json
   if ($LASTEXITCODE -ne 0) { throw 'Finalizing gate program failed' }
-  & solana program deploy artifacts\treasury-v1\faultline_treasury.so --program-id .localnet\faultline-treasury-program.json --upgrade-authority .localnet\payer.json --keypair .localnet\payer.json --url http://127.0.0.1:8899 --max-len 400000 --output json
+  & solana program deploy artifacts\treasury\v1\faultline_treasury.so --program-id .localnet\faultline-treasury-program.json --upgrade-authority .localnet\payer.json --keypair .localnet\payer.json --url http://127.0.0.1:8899 --max-len 400000 --output json
   if ($LASTEXITCODE -ne 0) { throw 'Treasury v1 deployment failed' }
 
   foreach ($buffer in @('candidate-approved', 'candidate-rejected', 'candidate-spare')) {
-    & solana program write-buffer artifacts\treasury-v2\faultline_treasury.so --buffer ".localnet\$buffer.json" --buffer-authority .localnet\proposer.json --fee-payer .localnet\payer.json --keypair .localnet\payer.json --url http://127.0.0.1:8899 --output json
+    & solana program write-buffer artifacts\treasury\v2\faultline_treasury.so --buffer ".localnet\$buffer.json" --buffer-authority .localnet\proposer.json --fee-payer .localnet\payer.json --keypair .localnet\payer.json --url http://127.0.0.1:8899 --output json
     if ($LASTEXITCODE -ne 0) { throw "Writing $buffer failed" }
   }
 

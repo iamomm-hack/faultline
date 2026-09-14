@@ -13,11 +13,26 @@ const names = [
   "governance",
   "proposer",
   "random",
+  "treasury-admin",
+  "attacker",
+  "user",
+  "new-admin",
+  "payment-mint",
+  "wrong-payment-mint",
+  "treasury-vault-token",
+  "user-token",
+  "attacker-token",
+  "admin-token",
+  "new-admin-token",
+  "wrong-vault-token",
+  "wrong-user-token",
   "faultline-gate-program",
   "faultline-treasury-program",
   "candidate-approved",
   "candidate-rejected",
-  "candidate-spare"
+  "candidate-spare",
+  "candidate-v2",
+  "candidate-v3"
 ] as const;
 
 type KeyName = (typeof names)[number];
@@ -62,4 +77,3 @@ const fingerprint = createHash("sha256")
 console.log(`Synchronized local program IDs (fingerprint ${fingerprint.slice(0, 16)})`);
 console.log(`Faultline gate: ${ids["faultline-gate-program"]}`);
 console.log(`Treasury:       ${ids["faultline-treasury-program"]}`);
-

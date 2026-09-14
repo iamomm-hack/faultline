@@ -1,7 +1,7 @@
 [package]
 name = "faultline_treasury"
 version = "0.1.0"
-description = "Minimal genuinely-upgradeable target for Faultline Milestone 1"
+description = "Faultline demo treasury target with safe, vulnerable, and patched builds"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -10,13 +10,15 @@ crate-type = ["cdylib", "lib"]
 name = "faultline_treasury"
 
 [features]
-default = []
+default = ["v3"]
 cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
 idl-build = ["anchor-lang/idl-build"]
+v1 = []
 v2 = []
+v3 = []
 
 [dependencies]
 anchor-lang = "=0.30.1"
