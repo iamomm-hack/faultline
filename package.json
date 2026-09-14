@@ -7,6 +7,7 @@
     "bootstrap:ids": "tsx scripts/bootstrap-ids.ts",
     "build:programs": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-programs.ps1",
     "demo:guard": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-guard-demo.ps1",
+    "test": "npm run demo:guard",
     "test:guard": "npm run demo:guard",
     "typecheck": "tsc --noEmit"
   },
@@ -17,4 +18,3 @@
     "typescript": "5.9.3"
   }
 }
-

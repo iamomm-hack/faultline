@@ -14,7 +14,8 @@ if (Test-Path -LiteralPath $ledger) { Remove-Item -LiteralPath $ledger -Recurse 
 
 $validatorLog = Join-Path $root '.localnet\validator.log'
 $validatorErr = Join-Path $root '.localnet\validator.err.log'
-$validator = Start-Process -FilePath 'solana-test-validator.exe' -ArgumentList @('--reset', '--ledger', $ledger, '--rpc-port', '8899', '--faucet-port', '9900', '--log') -RedirectStandardOutput $validatorLog -RedirectStandardError $validatorErr -WindowStyle Hidden -PassThru
+$localIds = Get-Content -Raw .localnet\ids.json | ConvertFrom-Json
+$validator = Start-Process -FilePath 'solana-test-validator.exe' -ArgumentList @('--reset', '--ledger', $ledger, '--rpc-port', '8899', '--faucet-port', '9900', '--mint', $localIds.payer, '--log') -RedirectStandardOutput $validatorLog -RedirectStandardError $validatorErr -WindowStyle Hidden -PassThru
 
 try {
   $ready = $false
@@ -25,12 +26,14 @@ try {
   }
   if (-not $ready) { throw "Local validator did not become ready. See $validatorErr" }
 
-  & solana airdrop 100 .localnet\payer.json -u http://127.0.0.1:8899
-  if ($LASTEXITCODE -ne 0) { throw 'Payer airdrop failed' }
+  & solana balance .localnet\payer.json -u http://127.0.0.1:8899 --output json
+  if ($LASTEXITCODE -ne 0) { throw 'Genesis payer funding check failed' }
 
   Write-Output 'Deploying real loader-v3 programs...'
   & solana program deploy artifacts\gate\faultline_gate.so --program-id .localnet\faultline-gate-program.json --upgrade-authority .localnet\payer.json --keypair .localnet\payer.json --url http://127.0.0.1:8899 --output json
   if ($LASTEXITCODE -ne 0) { throw 'Gate deployment failed' }
+  & solana program set-upgrade-authority $localIds.'faultline-gate-program' --final --upgrade-authority .localnet\payer.json --keypair .localnet\payer.json --url http://127.0.0.1:8899 --output json
+  if ($LASTEXITCODE -ne 0) { throw 'Finalizing gate program failed' }
   & solana program deploy artifacts\treasury-v1\faultline_treasury.so --program-id .localnet\faultline-treasury-program.json --upgrade-authority .localnet\payer.json --keypair .localnet\payer.json --url http://127.0.0.1:8899 --max-len 400000 --output json
   if ($LASTEXITCODE -ne 0) { throw 'Treasury v1 deployment failed' }
 

@@ -1,6 +1,17 @@
-# Faultline — Day-1 frontend prototype
+# Faultline
 
 Faultline is an optimistic deployment gate for upgradeable Solana programs. This repository contains a polished, deterministic Vite + React frontend prototype of the complete vulnerable-v2 rejection and patched-v3 guarded-execution story.
+
+## Milestone 1: real Guard authority proof
+
+The repository now also contains a real localnet feasibility proof that a Faultline PDA can be the recorded loader-v3 upgrade authority and authorize an approved upgrade through the gate program. See [docs/MILESTONE_1_GUARD.md](docs/MILESTONE_1_GUARD.md) for the loader contract, buffer-locking mechanism, adversarial cases, evidence, and limitations.
+
+```powershell
+npm.cmd install
+npm.cmd run demo:guard
+```
+
+The command builds isolated treasury v1/v2 SBF artifacts, starts a clean validator, deploys v1, transfers ProgramData and buffer authority to the Guard PDA, proves unauthorized/pending/rejected paths fail, performs the guarded loader upgrade, verifies v2 behavior under the same program ID, and proves repeat execution fails.
 
 The prototype is intentionally honest: it demonstrates protocol behavior locally and does not submit transactions, sign with a wallet, run Solana RPC, execute LiteSVM, or move real tokens.
 

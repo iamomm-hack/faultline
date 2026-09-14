@@ -2,6 +2,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $env:CARGO_REGISTRIES_CRATES_IO_PROTOCOL = 'sparse'
+$env:CARGO_NET_OFFLINE = 'true'
 
 & npm.cmd run bootstrap:ids
 if ($LASTEXITCODE -ne 0) { throw 'Program ID bootstrap failed' }

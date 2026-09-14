@@ -1,4 +1,5 @@
-docs/
+docs/*
+!docs/MILESTONE_1_GUARD.md
 /.anchor/
 /.localnet/
 /artifacts/

@@ -10,7 +10,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "vite preview",
-    "lint": "oxlint src app components/app-shell.tsx components/faultline-ui.tsx components/router-link.tsx faultline lib/router-compat.ts tests",
+    "lint": "oxlint src app/page.tsx app/demo app/proposals app/researcher components/app-shell.tsx components/faultline-ui.tsx components/router-link.tsx faultline lib/router-compat.ts tests",
     "typecheck": "tsc --noEmit",
     "test": "vitest --config vitest.config.ts run",
     "format": "oxfmt"

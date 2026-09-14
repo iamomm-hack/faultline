@@ -60,17 +60,63 @@ export async function send(
   });
 }
 
-export async function expectFailure(label: string, operation: () => Promise<unknown>): Promise<void> {
+export async function sendExpectingOnchainFailure(
+  connection: Connection,
+  instruction: TransactionInstruction,
+  feePayer: Keypair,
+  label: string,
+  expectedEvidence: RegExp,
+  signers: Keypair[] = []
+): Promise<string> {
+  const latest = await connection.getLatestBlockhash(COMMITMENT);
+  const transaction = new Transaction({
+    feePayer: feePayer.publicKey,
+    recentBlockhash: latest.blockhash
+  }).add(instruction);
+  transaction.sign(feePayer, ...signers);
+  const signature = await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
+  const confirmation = await connection.confirmTransaction(
+    { signature, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight },
+    COMMITMENT
+  );
+  if (!confirmation.value.err) throw new Error(`Expected onchain failure did not occur: ${label}`);
+  const result = await connection.getTransaction(signature, {
+    commitment: "confirmed",
+    maxSupportedTransactionVersion: 0
+  });
+  const logs = result?.meta?.logMessages ?? [];
+  const evidence = logs.join("\n");
+  if (!expectedEvidence.test(evidence)) {
+    throw new Error(`Onchain failure for ${label} did not contain ${expectedEvidence}:\n${evidence}`);
+  }
+  const decisiveLog = [...logs].reverse().find((line) => line.includes("authority")) ?? String(confirmation.value.err);
+  console.log(`EXPECTED ONCHAIN FAILURE [${label}] ${signature}: ${decisiveLog}`);
+  return signature;
+}
+
+export async function expectFailure(
+  label: string,
+  operation: () => Promise<unknown>,
+  expectedEvidence?: RegExp
+): Promise<void> {
   try {
     await operation();
   } catch (error) {
+    const logs = error instanceof SendTransactionError ? (error.logs ?? []) : [];
     const detail =
       error instanceof SendTransactionError
         ? error.message
         : error instanceof Error
           ? error.message
           : String(error);
-    console.log(`EXPECTED FAILURE [${label}]: ${detail.split("\n")[0]}`);
+    const completeEvidence = [detail, ...logs].join("\n");
+    if (expectedEvidence && !expectedEvidence.test(completeEvidence)) {
+      throw new Error(`Failure for ${label} did not contain ${expectedEvidence}:\n${completeEvidence}`);
+    }
+    const decisiveLog = [...logs]
+      .reverse()
+      .find((line) => line.includes("authority") || line.includes("AnchorError") || line.includes("Program log:"));
+    console.log(`EXPECTED FAILURE [${label}]: ${decisiveLog ?? detail.split("\n")[0]}`);
     return;
   }
   throw new Error(`Expected failure did not occur: ${label}`);
@@ -85,13 +131,24 @@ export async function loaderAuthority(
   account: PublicKey,
   expectedVariant: 1 | 3
 ): Promise<PublicKey> {
+  const authority = await loaderAuthorityOptional(connection, account, expectedVariant);
+  if (!authority) throw new Error(`${account.toBase58()} has no authority`);
+  return authority;
+}
+
+export async function loaderAuthorityOptional(
+  connection: Connection,
+  account: PublicKey,
+  expectedVariant: 1 | 3
+): Promise<PublicKey | null> {
   const info = await connection.getAccountInfo(account, COMMITMENT);
   if (!info) throw new Error(`Missing loader account ${account.toBase58()}`);
   if (!info.owner.equals(LOADER_V3)) throw new Error(`${account.toBase58()} is not owned by loader-v3`);
   const variant = info.data.readUInt32LE(0);
   if (variant !== expectedVariant) throw new Error(`Unexpected loader state ${variant} for ${account.toBase58()}`);
   const optionOffset = variant === 1 ? 4 : 12;
-  if (info.data[optionOffset] !== 1) throw new Error(`${account.toBase58()} has no authority`);
+  if (info.data[optionOffset] === 0) return null;
+  if (info.data[optionOffset] !== 1) throw new Error(`${account.toBase58()} has an invalid authority option`);
   return new PublicKey(info.data.subarray(optionOffset + 1, optionOffset + 33));
 }
 
@@ -155,4 +212,3 @@ export function loaderWriteInstruction(
     data
   });
 }
-

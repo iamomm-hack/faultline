@@ -21,10 +21,12 @@ import {
   loadIds,
   loadKeypair,
   loaderAuthority,
+  loaderAuthorityOptional,
   loaderUpgradeInstruction,
   loaderWriteInstruction,
   programDataAddress,
   send,
+  sendExpectingOnchainFailure,
   setLoaderAuthorityInstruction
 } from "../scripts/lib/solana.js";
 import { transferUpgradeAuthority } from "../scripts/transfer-upgrade-authority.js";
@@ -169,6 +171,8 @@ async function main(): Promise<void> {
     gateProgram
   );
   assert(guardAgain.equals(guardPda), "Guard PDA derivation is not deterministic");
+  assert.equal(await loaderAuthorityOptional(connection, gateProgramData, 3), null, "gate program must be immutable");
+  console.log("Verified Faultline gate is immutable (no deployer bypass authority)");
   await fundActors();
 
   const initializeVersion = anchorInstruction(treasuryProgram, "initialize_version", [
@@ -203,18 +207,26 @@ async function main(): Promise<void> {
     console.log(`Lock buffer ${buffer}: ${await handoffBuffer(buffer)}`);
   }
 
-  await expectFailure("original deployer direct upgrade", () =>
-    send(connection, loaderUpgradeInstruction(treasuryProgram, approvedBuffer, payer.publicKey, payer.publicKey), payer)
+  await sendExpectingOnchainFailure(
+    connection,
+    loaderUpgradeInstruction(treasuryProgram, approvedBuffer, payer.publicKey, payer.publicKey),
+    payer,
+    "original deployer direct upgrade",
+    /Buffer and upgrade authority don't match/
   );
-  await expectFailure("random wallet direct upgrade", () =>
-    send(
-      connection,
-      loaderUpgradeInstruction(treasuryProgram, approvedBuffer, random.publicKey, random.publicKey),
-      random
-    )
+  await sendExpectingOnchainFailure(
+    connection,
+    loaderUpgradeInstruction(treasuryProgram, approvedBuffer, random.publicKey, random.publicKey),
+    random,
+    "random wallet direct upgrade",
+    /Buffer and upgrade authority don't match/
   );
-  await expectFailure("proposer writes locked buffer", () =>
-    send(connection, loaderWriteInstruction(approvedBuffer, proposer.publicKey, Buffer.from([0xff])), proposer)
+  await sendExpectingOnchainFailure(
+    connection,
+    loaderWriteInstruction(approvedBuffer, proposer.publicKey, Buffer.from([0xff])),
+    proposer,
+    "proposer writes locked buffer",
+    /Incorrect buffer authority provided/
   );
 
   const approvedId = proposalId("approved-v2");
@@ -253,8 +265,12 @@ async function main(): Promise<void> {
       governance
     )}`
   );
-  await expectFailure("post-approval candidate mutation", () =>
-    send(connection, loaderWriteInstruction(approvedBuffer, proposer.publicKey, Buffer.from([0x00])), proposer)
+  await sendExpectingOnchainFailure(
+    connection,
+    loaderWriteInstruction(approvedBuffer, proposer.publicKey, Buffer.from([0x00])),
+    proposer,
+    "post-approval candidate mutation",
+    /Incorrect buffer authority provided/
   );
   await expectFailure("approved proposal buffer replacement", () =>
     send(connection, executeIx(approved.proposal, { buffer: spareBuffer }), random)
@@ -289,6 +305,10 @@ async function main(): Promise<void> {
 
   const executeSignature = await send(connection, executeIx(approved.proposal), random);
   console.log(`Guarded loader upgrade transaction: ${executeSignature}`);
+  const visibilityStartSlot = await connection.getSlot(COMMITMENT);
+  while ((await connection.getSlot(COMMITMENT)) < visibilityStartSlot + 2) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
   const refreshVersion = anchorInstruction(treasuryProgram, "refresh_version", [
     { pubkey: versionPda, isSigner: false, isWritable: true }
   ]);
@@ -322,4 +342,3 @@ main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
-
