@@ -29,6 +29,9 @@ if (Test-Path -LiteralPath $ledger) { Remove-Item -LiteralPath $ledger -Recurse 
 $validatorLog = Join-Path $root ".localnet\validator-$Scenario.log"
 $validatorErr = Join-Path $root ".localnet\validator-$Scenario.err.log"
 $localIds = Get-Content -Raw .localnet\ids.json | ConvertFrom-Json
+if (Get-NetTCPConnection -LocalPort 8899 -State Listen -ErrorAction SilentlyContinue) {
+  throw 'Refusing to attach to an existing validator on port 8899. Stop the owning process and rerun; this demo requires a fresh ledger.'
+}
 $validator = Start-Process -FilePath 'solana-test-validator.exe' -ArgumentList @('--reset', '--ledger', $ledger, '--rpc-port', '8899', '--faucet-port', '9900', '--mint', $localIds.payer, '--log') -RedirectStandardOutput $validatorLog -RedirectStandardError $validatorErr -WindowStyle Hidden -PassThru
 
 try {
@@ -58,6 +61,9 @@ try {
   & npx.cmd tsx tests\treasury-versions.spec.ts "--scenario=$Scenario"
   if ($LASTEXITCODE -ne 0) { throw "Treasury $Scenario scenario failed" }
 } finally {
+  if ($validator) {
+    $validator.Refresh()
+  }
   if ($validator -and -not $validator.HasExited) {
     Stop-Process -Id $validator.Id -Force
     $validator.WaitForExit()
