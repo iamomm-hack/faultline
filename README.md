@@ -25,6 +25,14 @@ npm.cmd run demo:patch-v3
 
 The v2 demo proves an attacker-only two-transaction trace drains `100.000000 fUSDC`. The v3 demo replays the same trace and proves the migration fails before any outflow, then verifies legitimate admin migration still works.
 
+## Milestone 3
+
+The canonical on-chain policy/proposal lifecycle is documented in [MILESTONE_3_PROPOSAL_STATE_MACHINE.md](docs/MILESTONE_3_PROPOSAL_STATE_MACHINE.md).
+
+```powershell
+npm.cmd run demo:proposal
+```
+
 The prototype is intentionally honest: it demonstrates protocol behavior locally and does not submit transactions, sign with a wallet, run Solana RPC, execute LiteSVM, or move real tokens.
 
 ## Run locally

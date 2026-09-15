@@ -10,6 +10,7 @@
     "demo:guard": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-guard-demo.ps1",
     "demo:exploit-v2": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-treasury-demo.ps1 -Scenario v2 -AllowVulnerableV2",
     "demo:patch-v3": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-treasury-demo.ps1 -Scenario v3",
+    "demo:proposal": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-treasury-demo.ps1 -Scenario v3",
     "test": "npm run demo:guard",
     "test:guard": "npm run demo:guard",
     "test:treasury-versions": "npm run demo:exploit-v2 && npm run demo:patch-v3",

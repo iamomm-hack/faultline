@@ -287,19 +287,66 @@ async function guardedUpgradeToScenario(): Promise<void> {
   console.log(`Transfer treasury authority to Guard: ${await transferUpgradeAuthority(connection, treasuryProgram, payer, guardPda)}`);
   await verifyGuardAuthority(connection, treasuryProgram, guardPda);
   await handoffSelectedBuffer();
-
-  const id = proposalId(`treasury-${scenario}`);
-  const { proposal, claim } = proposalAddresses(id, selectedBuffer);
+  const [policy] = PublicKey.findProgramAddressSync([Buffer.from("safety-policy"), treasuryProgram.toBuffer()], gateProgram);
+  const policyId = 2n;
+  const minSlots = 2n;
+  const invariantHash = createHash("sha256").update("AUTH-001").digest();
+  console.log(`Initialize SafetyPolicy: ${await send(connection, anchorInstruction(gateProgram, "initialize_safety_policy", [
+    { pubkey: governance.publicKey, isSigner: true, isWritable: true }, { pubkey: guardPda, isSigner: false, isWritable: false },
+    { pubkey: treasuryProgram, isSigner: false, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: true },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+  ], Buffer.concat([u64(policyId), Buffer.from([1, 0]), u64(minSlots), Buffer.from([1]), invariantHash, governance.publicKey.toBuffer()])), governance)}`);
+  console.log("[1] SafetyPolicy created");
+  const proposalNumber = 1n;
+  const [proposal] = PublicKey.findProgramAddressSync([Buffer.from("upgrade-proposal"), policy.toBuffer(), u64(proposalNumber)], gateProgram);
+  const [claim] = PublicKey.findProgramAddressSync([Buffer.from("faultline"), Buffer.from("buffer"), selectedBuffer.toBuffer()], gateProgram);
+  const bufferInfo = await connection.getAccountInfo(selectedBuffer, COMMITMENT);
+  assert(bufferInfo, "candidate buffer missing for canonical proposal");
+  const candidateHash = createHash("sha256").update(bufferInfo.data).digest();
   console.log(`Proposal PDA: ${proposal}`);
-  console.log(`Create ${scenario} proposal: ${await send(connection, createProposalIx(id, selectedBuffer, proposal, claim), proposer)}`);
-  console.log(`Approve ${scenario} proposal: ${await send(connection, approveIx(proposal, claim, selectedBuffer), governance)}`);
-  console.log(`Guarded ${scenario} upgrade: ${await send(connection, executeUpgradeIx(proposal, selectedBuffer), random)}`);
+  console.log(`Create ${scenario} proposal: ${await send(connection, anchorInstruction(gateProgram, "create_upgrade_proposal", [
+    { pubkey: proposer.publicKey, isSigner: true, isWritable: true }, { pubkey: guardPda, isSigner: false, isWritable: true },
+    { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: treasuryProgram, isSigner: false, isWritable: false },
+    { pubkey: treasuryProgramData, isSigner: false, isWritable: false }, { pubkey: selectedBuffer, isSigner: false, isWritable: false },
+    { pubkey: proposal, isSigner: false, isWritable: true }, { pubkey: claim, isSigner: false, isWritable: true },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+  ], Buffer.concat([u64(proposalNumber), candidateHash])), proposer)}`);
+  console.log("[2] UpgradeProposal created in Draft");
+  console.log(`Start challenge: ${await send(connection, anchorInstruction(gateProgram, "start_challenge", [
+    { pubkey: proposer.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposal, isSigner: false, isWritable: true }
+  ], u64(minSlots)), proposer)}`);
+  console.log("[3] Challenge started with start/end slots");
+  const lifecycleExecute = () => anchorInstruction(gateProgram, "execute_guarded_upgrade", [
+    { pubkey: random.publicKey, isSigner: true, isWritable: false }, { pubkey: guardPda, isSigner: false, isWritable: false },
+    { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposal, isSigner: false, isWritable: true }, { pubkey: claim, isSigner: false, isWritable: false },
+    { pubkey: treasuryProgram, isSigner: false, isWritable: true }, { pubkey: treasuryProgramData, isSigner: false, isWritable: true },
+    { pubkey: selectedBuffer, isSigner: false, isWritable: true }, { pubkey: governance.publicKey, isSigner: false, isWritable: true },
+    { pubkey: SYSVAR_RENT, isSigner: false, isWritable: false }, { pubkey: SYSVAR_CLOCK, isSigner: false, isWritable: false }, { pubkey: LOADER_V3, isSigner: false, isWritable: false }
+  ]);
+  await expectFailure("Draft/ChallengeActive execution blocked", () => send(connection, lifecycleExecute(), random));
+  console.log("[4] Early execution correctly rejected");
+  console.log(`Temporary approve: ${await send(connection, anchorInstruction(gateProgram, "record_temporary_decision", [
+    { pubkey: governance.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposal, isSigner: false, isWritable: true }
+  ], Buffer.from([2, 0, 0])), governance)}`);
+  console.log("[5] Governance temporary approval recorded");
+  const proposalInfo = await connection.getAccountInfo(proposal, COMMITMENT);
+  assert(proposalInfo, "proposal missing");
+  const challengeEnd = proposalInfo.data.readBigUInt64LE(8 + 32 + 8 + 32 + 32 + 32 + 32 + 32 + 8 + 1 + 8 + 1);
+  while (BigInt(await connection.getSlot(COMMITMENT)) <= challengeEnd) {
+    await send(connection, SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: random.publicKey, lamports: 1 }), payer);
+  }
+  console.log("[6] Challenge window completed");
+  console.log(`Guarded ${scenario} upgrade: ${await send(connection, lifecycleExecute(), random)}`);
+  console.log("[7] Guard PDA executed upgrade");
   const start = await connection.getSlot(COMMITMENT);
   while ((await connection.getSlot(COMMITMENT)) < start + 2) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   const refresh = anchorInstruction(treasuryProgram, "refresh_version", [{ pubkey: versionPda, isSigner: false, isWritable: true }]);
   console.log(`Refresh ${scenario} behavior: ${await send(connection, refresh, payer)}`);
+  console.log(`[8] Treasury reports expected ${scenario} demo version`);
+  await expectFailure("Executed proposal cannot execute twice", () => send(connection, lifecycleExecute(), random));
+  console.log("[9] Repeated execution correctly rejected");
 }
 
 function sortValue(value: unknown): unknown {
