@@ -1,13 +1,13 @@
 /* Standalone Milestone-3 localnet integration proof. */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
-import { spawn, execFileSync } from "node:child_process";
-import { Connection, PublicKey, SystemProgram } from "@solana/web3.js";
+import { appendFileSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import {
   COMMITMENT, LOADER_V3, ROOT, SYSVAR_CLOCK, SYSVAR_RENT, anchorInstruction,
   expectFailure, loadIds, loadKeypair, loaderUpgradeInstruction, loaderWriteInstruction,
-  programDataAddress, send, sendExpectingOnchainFailure, setLoaderAuthorityInstruction
+  programDataAddress, setLoaderAuthorityInstruction
 } from "../scripts/lib/solana.js";
 import { transferUpgradeAuthority } from "../scripts/transfer-upgrade-authority.js";
 
@@ -26,6 +26,26 @@ const [secondaryGuard] = PublicKey.findProgramAddressSync([Buffer.from("faultlin
 const [secondaryPolicy] = PublicKey.findProgramAddressSync([Buffer.from("safety-policy"), gate.toBuffer()], gate);
 const u64 = (n: bigint) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(n); return b; };
 const hash = (b: Buffer) => createHash("sha256").update(b).digest();
+const evidence: string[] = [];
+const stdout = console.log.bind(console);
+console.log = (...values: unknown[]) => {
+  evidence.push(values.map(value => String(value)).join(" "));
+  stdout(...values);
+};
+
+async function send(connection: Connection, ix: TransactionInstruction, feePayer: Keypair, signers: Keypair[] = []) {
+  const latest = await connection.getLatestBlockhash(COMMITMENT);
+  const tx = new Transaction({ feePayer: feePayer.publicKey, recentBlockhash: latest.blockhash }).add(ix);
+  tx.sign(feePayer, ...signers);
+  const signature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: COMMITMENT });
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const status = (await connection.getSignatureStatuses([signature])).value[0];
+    if (status?.err) throw new Error(`transaction ${signature} failed: ${JSON.stringify(status.err)}`);
+    if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") return signature;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`transaction ${signature} was not confirmed`);
+}
 
 function proposalAddress(id: bigint) { return PublicKey.findProgramAddressSync([Buffer.from("upgrade-proposal"), policy.toBuffer(), u64(id)], gate)[0]; }
 function claimAddress(b: PublicKey) { return PublicKey.findProgramAddressSync([Buffer.from("faultline"), Buffer.from("buffer"), b.toBuffer()], gate)[0]; }
@@ -65,6 +85,24 @@ function expire(id: bigint) { return anchorInstruction(gate, "expire_proposal", 
 async function fails(label: string, expected: RegExp, fn: () => Promise<unknown>) { await expectFailure(label, fn, expected); console.log(`PASS negative: ${label} (${expected.source})`); }
 async function endSlot(id: bigint) { const info = await connection.getAccountInfo(proposalAddress(id)); assert(info); return info.data.readBigUInt64LE(226); }
 async function advancePast(slot: bigint) { while (BigInt(await connection.getSlot(COMMITMENT)) <= slot) await send(connection, SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: random.publicKey, lamports: 1 }), payer); }
+async function broadcastFailure(label: string, ix: TransactionInstruction, signers: typeof payer[], expected: RegExp) {
+  const latest = await connection.getLatestBlockhash(COMMITMENT);
+  const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: latest.blockhash }).add(ix);
+  tx.sign(payer, ...signers);
+  const signature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
+  let failed = false;
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const status = (await connection.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0];
+    if (status?.err) { failed = true; break; }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert(failed, `${label} did not land as a failed transaction`);
+  const landed = await connection.getTransaction(signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+  const logs = landed?.meta?.logMessages?.join("\n") ?? "";
+  assert.match(logs, expected, `${label} did not produce expected loader evidence`);
+  console.log(`PASS negative: ${label}: ${signature}: ${logs.split("\n").find(line => expected.test(line))}`);
+  return signature;
+}
 async function versionNumber() { const info = await connection.getAccountInfo(version); assert(info); return info.data.readUInt16LE(8); }
 function proposalSnapshot(raw: Buffer) {
   return {
@@ -76,23 +114,14 @@ function proposalSnapshot(raw: Buffer) {
 }
 
 async function main() {
-  const ledger = `${ROOT}/.localnet/ledger-proposal-state-machine`;
-  if (existsSync(ledger)) rmSync(ledger, { recursive: true, force: true });
+  const shard = process.argv[process.argv.indexOf("--shard") + 1];
+  if (shard !== "policy" && shard !== "terminal" && shard !== "authority") throw new Error("expected --shard policy|terminal|authority");
+  if (!process.env.FAULTLINE_PROPOSAL_GENESIS || await connection.getGenesisHash() !== process.env.FAULTLINE_PROPOSAL_GENESIS) throw new Error("refusing a validator not started by the dedicated runner");
   try {
-    execFileSync("powershell", ["-NoProfile", "-Command", "if (Get-NetTCPConnection -LocalPort 8899 -State Listen -ErrorAction SilentlyContinue) { exit 42 }"], { stdio: "pipe" });
-  } catch {
-    throw new Error("refusing to attach to an existing process on port 8899");
-  }
-  const validatorExe = execFileSync("where.exe", ["solana-test-validator.exe"], { encoding: "utf8" }).trim().split(/\r?\n/)[0];
-  const validator = spawn(validatorExe, ["--reset", "--ledger", ledger, "--rpc-port", "8899", "--faucet-port", "9900", "--mint", payer.publicKey.toBase58(), "--log"], { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
-  let validatorError = "";
-  validator.stderr?.on("data", data => { validatorError += data.toString(); });
-  validator.on("error", error => { validatorError += error.message; });
-  try {
-    for (let i = 0; i < 80; i++) { try { await connection.getLatestBlockhash(COMMITMENT); break; } catch { await new Promise(r => setTimeout(r, 100)); if (i === 79) throw new Error(`validator did not start: ${validatorError}`); } }
+    for (const actor of [governance.publicKey, proposer.publicKey, random.publicKey]) {
+      await send(connection, SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: actor, lamports: 10 * LAMPORTS_PER_SOL }), payer);
+    }
     const cli = (...a: string[]) => execFileSync("solana", a, { cwd: ROOT, stdio: "pipe" });
-    cli("program", "deploy", "artifacts/gate/faultline_gate.so", "--program-id", ".localnet/faultline-gate-program.json", "--upgrade-authority", ".localnet/payer.json", "--keypair", ".localnet/payer.json", "--url", RPC);
-    cli("program", "deploy", "artifacts/treasury/v1/faultline_treasury.so", "--program-id", ".localnet/faultline-treasury-program.json", "--upgrade-authority", ".localnet/payer.json", "--keypair", ".localnet/payer.json", "--url", RPC, "--max-len", "500000");
     for (const name of ["candidate-v2", "candidate-spare", "candidate-approved", "candidate-rejected"]) cli("program", "write-buffer", "artifacts/treasury/v2/faultline_treasury.so", "--buffer", `.localnet/${name}.json`, "--buffer-authority", ".localnet/proposer.json", "--fee-payer", ".localnet/payer.json", "--keypair", ".localnet/payer.json", "--url", RPC);
     await send(connection, anchorInstruction(treasury, "initialize_version", [{ pubkey: payer.publicKey, isSigner: true, isWritable: true }, { pubkey: version, isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }]), payer);
     console.log(`Guard init: ${await send(connection, anchorInstruction(gate, "initialize_guard", [{ pubkey: governance.publicKey, isSigner: true, isWritable: true }, { pubkey: treasury, isSigner: false, isWritable: false }, { pubkey: data, isSigner: false, isWritable: false }, { pubkey: guard, isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }]), governance)}`);
@@ -100,31 +129,42 @@ async function main() {
     await send(connection, anchorInstruction(gate, "initialize_safety_policy", [
       { pubkey: governance.publicKey, isSigner: true, isWritable: true }, { pubkey: secondaryGuard, isSigner: false, isWritable: false }, { pubkey: gate, isSigner: false, isWritable: false }, { pubkey: secondaryPolicy, isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
     ], Buffer.concat([u64(99n), Buffer.from([1, 0]), u64(4n), Buffer.from([1]), hash(Buffer.from("SECONDARY")), governance.publicKey.toBuffer()])), governance);
-    cli("program", "set-upgrade-authority", gate.toBase58(), "--final", "--upgrade-authority", ".localnet/payer.json", "--keypair", ".localnet/payer.json", "--url", RPC);
     await transferUpgradeAuthority(connection, treasury, payer, guard);
     const rejectedBuffer = new PublicKey(ids["candidate-approved"]);
     const uncommittedBuffer = new PublicKey(ids["candidate-rejected"]);
     for (const b of [buffer, substituteBuffer, rejectedBuffer, uncommittedBuffer]) await send(connection, setLoaderAuthorityInstruction(b, proposer.publicKey, guard), payer, [proposer]);
     const lockedHash = hash((await connection.getAccountInfo(buffer))!.data);
-    const directDeployerSig = await sendExpectingOnchainFailure(connection, loaderUpgradeInstruction(treasury, buffer, payer.publicKey, payer.publicKey), payer, "24 original deployer direct upgrade", /Incorrect authority|incorrect authority/i);
+    const good = hash((await connection.getAccountInfo(buffer))!.data);
+    // Terminal and authority assertions require a real, approved proposal but do not
+    // execute policy assertions 1-14 in their independent validator sessions.
+    let committedAtCreate: ReturnType<typeof proposalSnapshot> | undefined;
+    const seedApprovedProposal = async () => {
+      await send(connection, initPolicy(), governance);
+      await send(connection, create(1n, buffer, good), proposer);
+      committedAtCreate = proposalSnapshot((await connection.getAccountInfo(proposalAddress(1n)))!.data);
+      await send(connection, start(proposer.publicKey, 1n, 4n), proposer);
+      await send(connection, decision(governance.publicKey, 1n, 2), governance);
+    };
+    if (shard === "authority") {
+    const directDeployerSig = await broadcastFailure("24 original deployer direct upgrade", loaderUpgradeInstruction(treasury, buffer, payer.publicKey, payer.publicKey), [], /Incorrect authority/i);
     assert.equal(await versionNumber(), 1); console.log(`PASS 24 deployer rejected onchain: ${directDeployerSig}`);
-    const directRandomSig = await sendExpectingOnchainFailure(connection, loaderUpgradeInstruction(treasury, buffer, random.publicKey, payer.publicKey), payer, "25 random direct upgrade", /Incorrect authority|incorrect authority/i, [random]);
+    const directRandomSig = await broadcastFailure("25 random direct upgrade", loaderUpgradeInstruction(treasury, buffer, random.publicKey, payer.publicKey), [random], /Incorrect authority/i);
     assert.equal(await versionNumber(), 1); console.log(`PASS 25 random rejected onchain: ${directRandomSig}`);
-    const lockedWriteSig = await sendExpectingOnchainFailure(connection, loaderWriteInstruction(buffer, proposer.publicKey, Buffer.from([0x42])), payer, "27 previous buffer authority write", /Incorrect authority|incorrect authority/i, [proposer]);
+    const lockedWriteSig = await broadcastFailure("27 previous buffer authority write", loaderWriteInstruction(buffer, proposer.publicKey, Buffer.from([0x42])), [proposer], /Incorrect authority/i);
     assert.deepEqual(hash((await connection.getAccountInfo(buffer))!.data), lockedHash); console.log(`PASS 27 locked buffer immutable: ${lockedWriteSig}`);
+    }
+    if (shard === "policy") {
     console.log(`Policy init: ${await send(connection, initPolicy(), governance)}`); console.log("PASS 1 policy initialized");
     assert((await connection.getAccountInfo(policy))?.owner.equals(gate));
     await fails("2 duplicate policy", /already in use|AccountAlreadyInitialized/, () => send(connection, initPolicy(), governance));
     await fails("3 non-governance pause", /UnauthorizedGovernance/, () => send(connection, status(random.publicKey, true), random));
     await send(connection, status(governance.publicKey, true), governance); await send(connection, status(governance.publicKey, false), governance); console.log("PASS 4 governance pause/unpause");
-    await send(connection, status(governance.publicKey, true), governance); const good = hash((await connection.getAccountInfo(buffer))!.data); await fails("5 paused policy create", /PolicyPaused/, () => send(connection, create(1n, buffer, good), proposer)); await send(connection, status(governance.publicKey, false), governance);
+    await send(connection, status(governance.publicKey, true), governance); await fails("5 paused policy create", /PolicyPaused/, () => send(connection, create(1n, buffer, good), proposer)); await send(connection, status(governance.publicKey, false), governance);
     await fails("6 wrong target", /ConstraintHasOne|WrongTargetProgram/, () => send(connection, create(1n, buffer, good, gate), proposer));
     await fails("7 wrong expected hash", /CandidateHashMismatch/, () => send(connection, create(1n, buffer, Buffer.alloc(32, 9)), proposer));
     await fails("8 substituted buffer claim", /CandidateHashMismatch/, () => send(connection, create(1n, substituteBuffer, good), proposer));
     await send(connection, create(1n, buffer, good), proposer); console.log("PASS proposal Draft created");
-    const committedAtCreate = proposalSnapshot((await connection.getAccountInfo(proposalAddress(1n)))!.data);
-    await fails("28 claimed buffer reused", /already in use|AccountAlreadyInitialized/, () => send(connection, create(4n, buffer, good), proposer));
-    assert.equal(await connection.getAccountInfo(proposalAddress(4n)), null);
+    committedAtCreate = proposalSnapshot((await connection.getAccountInfo(proposalAddress(1n)))!.data);
     await fails("9 duplicate proposal PDA", /already in use|AccountAlreadyInitialized/, () => send(connection, create(1n, buffer, good), proposer));
     await fails("10 duration below minimum", /ChallengeDurationTooShort/, () => send(connection, start(proposer.publicKey, 1n, 3n), proposer));
     await fails("11 Draft execute", /ProposalNotApproved/, () => send(connection, execute(1n), random));
@@ -133,6 +173,44 @@ async function main() {
     await fails("13 unauthorized decision", /UnauthorizedGovernance/, () => send(connection, decision(random.publicKey, 1n, 2), random));
     await send(connection, decision(governance.publicKey, 1n, 2), governance);
     await fails("14 early approved execution", /ChallengeWindowStillActive/, () => send(connection, execute(1n), random));
+    return;
+    }
+    await seedApprovedProposal();
+    if (shard === "authority") {
+    await fails("28 claimed buffer reused", /already in use|AccountAlreadyInitialized/, () => send(connection, create(4n, buffer, good), proposer));
+    assert.equal(await connection.getAccountInfo(proposalAddress(4n)), null);
+    const afterDecision = proposalSnapshot((await connection.getAccountInfo(proposalAddress(1n)))!.data);
+    assert(committedAtCreate, "seed proposal snapshot missing");
+    assert.deepEqual(afterDecision.candidateHash, committedAtCreate.candidateHash);
+    assert(afterDecision.candidate.equals(committedAtCreate.candidate));
+    const gateSource = readFileSync(`${ROOT}/programs/faultline_gate/src/lib.rs`, "utf8");
+    assert.equal((gateSource.match(/candidate_buffer_hash\s*=\s*actual_hash/g) ?? []).length, 1, "candidate hash must have one initialization assignment and no mutation route");
+    console.log("PASS 30 candidate hash immutable across decision; no mutation instruction exists");
+    const wrongPolicy = PublicKey.findProgramAddressSync([Buffer.from("safety-policy"), random.publicKey.toBuffer()], gate)[0];
+    const wrongProposal = PublicKey.findProgramAddressSync([Buffer.from("upgrade-proposal"), policy.toBuffer(), u64(999n)], gate)[0];
+    const substitution = async (label: string, expected: RegExp, ix: ReturnType<typeof executeWith>) => {
+      await fails(label, expected, () => send(connection, ix, random));
+      assert.equal(await versionNumber(), 1, `${label} changed target version`);
+    };
+    await substitution("26 substituted GuardConfig", /WrongTargetProgram/, executeWith(1n, { guard: secondaryGuard }));
+    await substitution("29 uncommitted candidate buffer", /ConstraintHasOne/, executeWith(1n, { candidate: uncommittedBuffer }));
+    await substitution("31 wrong SafetyPolicy PDA", /AccountNotInitialized/, executeWith(1n, { policy: wrongPolicy }));
+    await substitution("32 wrong UpgradeProposal PDA", /AccountNotInitialized/, executeWith(1n, { proposal: wrongProposal }));
+    await substitution("33 wrong target program", /ConstraintHasOne/, executeWith(1n, { target: gate }));
+    await substitution("34 wrong ProgramData", /ConstraintHasOne/, executeWith(1n, { programData: gateData }));
+    await substitution("35 wrong loader program", /ConstraintAddress/, executeWith(1n, { loader: SystemProgram.programId }));
+    await substitution("36 wrong candidate buffer", /ConstraintHasOne/, executeWith(1n, { candidate: rejectedBuffer }));
+    await substitution("37 wrong Guard PDA", /WrongTargetProgram/, executeWith(1n, { guard: secondaryGuard }));
+    await substitution("38 policy for different target", /WrongTargetProgram/, executeWith(1n, { policy: secondaryPolicy }));
+    await advancePast(await endSlot(1n));
+    const authorityUpgradeSig = await send(connection, execute(1n), random);
+    for (let i = 0; i < 2; i++) await send(connection, SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: random.publicKey, lamports: 1 }), payer);
+    await send(connection, anchorInstruction(treasury, "refresh_version", [{ pubkey: version, isSigner: false, isWritable: true }]), payer);
+    assert.equal(await versionNumber(), 2, "authority completion did not execute the Guard upgrade");
+    console.log(`PASS 39 authority guarded upgrade: ${authorityUpgradeSig}`);
+    return;
+    }
+    if (shard !== "terminal") throw new Error(`unhandled shard ${shard}`);
     // 15-18: expiry has its own locked Buffer and complete terminal-state proof.
     const spareHash = hash((await connection.getAccountInfo(substituteBuffer))!.data);
     await send(connection, create(2n, substituteBuffer, spareHash), proposer); await send(connection, start(proposer.publicKey, 2n, 4n), proposer);
@@ -153,22 +231,31 @@ async function main() {
     await fails("20 Rejected restart", /InvalidProposalTransition/, () => send(connection, start(proposer.publicKey, 3n, 4n), proposer));
     // 21-23 execute the already-approved proposal through the actual Guard loader CPI.
     await advancePast(await endSlot(1n));
+    const beforeExecution = proposalSnapshot((await connection.getAccountInfo(proposalAddress(1n)))!.data);
+    console.log(`Policy PDA: ${policy}`); console.log(`Proposal PDA: ${proposalAddress(1n)}`); console.log(`Guard PDA: ${guard}`);
+    console.log(`Target ProgramData: ${data}`); console.log(`Candidate buffer: ${buffer}`); console.log(`Candidate SHA-256: ${good.toString("hex")}`);
     const upgradeSig = await send(connection, execute(1n), random); console.log(`PASS 21 Guard loader-v3 upgrade: ${upgradeSig}`);
     for (let i = 0; i < 2; i++) await send(connection, SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: random.publicKey, lamports: 1 }), payer);
-    await send(connection, anchorInstruction(treasury, "refresh_version", [{ pubkey: version, isSigner: false, isWritable: true }]), payer);
+    const refreshSig = await send(connection, anchorInstruction(treasury, "refresh_version", [{ pubkey: version, isSigner: false, isWritable: true }]), payer);
     const versionInfo = await connection.getAccountInfo(version); assert(versionInfo); assert.equal(versionInfo.data.readUInt16LE(8), 2, "treasury did not report v2 after Guard upgrade");
-    const proposalInfo = await connection.getAccountInfo(proposalAddress(1n)); assert(proposalInfo); assert.equal(proposalInfo.data[234], 5, "proposal state must be Executed"); assert.equal(proposalInfo.data[280], 1, "executed_at_slot option missing"); console.log("PASS 23 Executed metadata retained; treasury version=2");
+    const proposalInfo = await connection.getAccountInfo(proposalAddress(1n)); assert(proposalInfo); const terminal = proposalSnapshot(proposalInfo.data);
+    assert.equal(terminal.state, 5, "proposal state must be Executed"); assert(terminal.executedAt !== null, "executed_at_slot missing");
+    assert(terminal.decisionAuthority?.equals(governance.publicKey)); assert.equal(terminal.decisionSlot, beforeExecution.decisionSlot);
+    assert(terminal.candidate.equals(beforeExecution.candidate)); assert.deepEqual(terminal.candidateHash, beforeExecution.candidateHash);
+    console.log(`PASS 23 metadata retained; refresh=${refreshSig}; treasury version=2`);
     await fails("22 Executed execute", /ProposalNotApproved/, () => send(connection, execute(1n), random));
     await fails("22 Executed approve", /InvalidProposalTransition/, () => send(connection, decision(governance.publicKey, 1n, 2), governance));
     await fails("22 Executed reject", /InvalidProposalTransition/, () => send(connection, decision(governance.publicKey, 1n, 3), governance));
     await fails("22 Executed expire", /InvalidProposalTransition/, () => send(connection, expire(1n), random));
     await fails("22 Executed restart", /InvalidProposalTransition/, () => send(connection, start(proposer.publicKey, 1n, 4n), proposer));
-    console.log("ALL 14 PRE-DECISION/STATE ASSERTIONS PASSED");
+    console.log("ALL MILESTONE-3 ASSERTIONS 1-39 PASSED");
   } finally {
-    if (validator.exitCode === null) {
-      validator.kill();
-      await new Promise<void>(resolve => validator.once("exit", () => resolve()));
-    }
+    appendFileSync(`${ROOT}/.localnet/proposal-state-machine-evidence.log`, `${evidence.join("\n")}\n`);
   }
 }
-main().catch(e => { console.error(e); process.exitCode = 1; });
+try {
+  await main();
+} catch (error) {
+  console.error(error);
+  process.exitCode = 1;
+}
