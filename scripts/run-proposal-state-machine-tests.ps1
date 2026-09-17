@@ -83,4 +83,8 @@ foreach ($shard in $shards) {
     }
   }
 }
-Write-Output "Proposal state-machine shard run passed: $($shards -join ', ')"
+if ($Shard) {
+  Write-Output "Proposal state-machine shard passed: $Shard"
+} else {
+  Write-Output 'ALL MILESTONE-3 ASSERTIONS 1-39 PASSED'
+}

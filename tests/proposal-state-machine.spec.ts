@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import {
   COMMITMENT, LOADER_V3, ROOT, SYSVAR_CLOCK, SYSVAR_RENT, anchorInstruction,
-  expectFailure, loadIds, loadKeypair, loaderUpgradeInstruction, loaderWriteInstruction,
+  expectFailure, loadIds, loadKeypair, loaderAuthority, loaderUpgradeInstruction, loaderWriteInstruction,
   programDataAddress, setLoaderAuthorityInstruction
 } from "../scripts/lib/solana.js";
 import { transferUpgradeAuthority } from "../scripts/transfer-upgrade-authority.js";
@@ -109,18 +109,28 @@ async function broadcastFailure(label: string, ix: TransactionInstruction, signe
   const latest = await connection.getLatestBlockhash(COMMITMENT);
   const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: latest.blockhash }).add(ix);
   tx.sign(payer, ...signers);
-  const signature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
-  let failed = false;
-  for (let attempt = 0; attempt < 120; attempt++) {
-    const status = (await connection.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0];
-    if (status?.err) { failed = true; break; }
-    await new Promise(resolve => setTimeout(resolve, 100));
+  let signature: string;
+  try {
+    signature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
+  } catch (error) {
+    throw new Error(`${label}: transaction was never accepted/broadcast: ${String(error)}`);
   }
-  assert(failed, `${label} did not land as a failed transaction`);
+  console.log(`BROADCAST negative: ${label}: ${signature}`);
+  const deadline = Date.now() + 120_000;
+  let status: Awaited<ReturnType<Connection["getSignatureStatuses"]>>["value"][number] = null;
+  while (Date.now() < deadline) {
+    status = (await connection.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0];
+    if (status) break;
+    const blockHeight = await connection.getBlockHeight(COMMITMENT);
+    if (blockHeight > latest.lastValidBlockHeight) throw new Error(`${label}: blockhash expired before status; signature=${signature} blockHeight=${blockHeight} lastValidBlockHeight=${latest.lastValidBlockHeight}`);
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  if (!status) throw new Error(`${label}: signature status remained null until timeout; signature=${signature}`);
+  if (!status.err) throw new Error(`${label}: SECURITY DEFECT: transaction landed successfully; signature=${signature} status=${JSON.stringify(status)}`);
   const landed = await connection.getTransaction(signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
   const logs = landed?.meta?.logMessages?.join("\n") ?? "";
-  assert.match(logs, expected, `${label} did not produce expected loader evidence`);
-  console.log(`PASS negative: ${label}: ${signature}: ${logs.split("\n").find(line => expected.test(line))}`);
+  if (!expected.test(logs)) throw new Error(`${label}: transaction landed with unexpected error; signature=${signature} status=${JSON.stringify(status)} logs=${logs}`);
+  console.log(`PASS negative: ${label}: signature=${signature} status=${JSON.stringify(status)} evidence=${logs.split("\n").find(line => expected.test(line))}`);
   return signature;
 }
 async function versionNumber() { const info = await connection.getAccountInfo(version); assert(info); return info.data.readUInt16LE(8); }
@@ -166,6 +176,16 @@ async function main() {
       await send(connection, decision(governance.publicKey, 1n, 2), governance);
     };
     if (shard === "authority") {
+    const targetInfo = await connection.getAccountInfo(treasury, COMMITMENT);
+    const programDataInfo = await connection.getAccountInfo(data, COMMITMENT);
+    assert(targetInfo?.executable, "Treasury target is not executable");
+    assert(targetInfo.owner.equals(LOADER_V3), "Treasury target is not loader-v3 owned");
+    assert(programDataInfo, "Treasury ProgramData does not exist");
+    assert(programDataInfo.owner.equals(LOADER_V3), "Treasury ProgramData is not loader-v3 owned");
+    const recordedAuthority = await loaderAuthority(connection, data, 3);
+    assert(recordedAuthority.equals(guard), "Treasury ProgramData authority is not the Guard PDA");
+    assert(!recordedAuthority.equals(payer.publicKey), "Original deployer remains upgrade authority");
+    assert((await loaderAuthority(connection, buffer, 1)).equals(guard), "Candidate buffer is not locked to the Guard PDA");
     const directDeployerSig = await broadcastFailure("24 original deployer direct upgrade", loaderUpgradeInstruction(treasury, buffer, payer.publicKey, payer.publicKey), [], /Incorrect authority/i);
     assert.equal(await versionNumber(), 1); console.log(`PASS 24 deployer rejected onchain: ${directDeployerSig}`);
     const directRandomSig = await broadcastFailure("25 random direct upgrade", loaderUpgradeInstruction(treasury, buffer, random.publicKey, payer.publicKey), [random], /Incorrect authority/i);
@@ -196,6 +216,7 @@ async function main() {
     await fails("13 unauthorized decision", /UnauthorizedGovernance/, () => send(connection, decision(random.publicKey, 1n, 2), random));
     await send(connection, decision(governance.publicKey, 1n, 2), governance);
     await fails("14 early approved execution", /ChallengeWindowStillActive/, () => send(connection, execute(1n), random));
+    console.log("POLICY SHARD ASSERTIONS 1-14 PASSED");
     return;
     }
     await seedApprovedProposal();
@@ -231,6 +252,7 @@ async function main() {
     await send(connection, anchorInstruction(treasury, "refresh_version", [{ pubkey: version, isSigner: false, isWritable: true }]), payer);
     assert.equal(await versionNumber(), 2, "authority completion did not execute the Guard upgrade");
     console.log(`PASS 39 authority guarded upgrade: ${authorityUpgradeSig}`);
+    console.log("AUTHORITY SHARD ASSERTIONS 24-39 PASSED");
     return;
     }
     if (shard !== "terminal") throw new Error(`unhandled shard ${shard}`);
@@ -271,7 +293,7 @@ async function main() {
     await fails("22 Executed reject", /InvalidProposalTransition/, () => send(connection, decision(governance.publicKey, 1n, 3), governance));
     await fails("22 Executed expire", /InvalidProposalTransition/, () => send(connection, expire(1n), random));
     await fails("22 Executed restart", /InvalidProposalTransition/, () => send(connection, start(proposer.publicKey, 1n, 4n), proposer));
-    console.log("ALL MILESTONE-3 ASSERTIONS 1-39 PASSED");
+    console.log("TERMINAL SHARD ASSERTIONS 15-23 PASSED");
   } finally {
     appendFileSync(`${ROOT}/.localnet/proposal-state-machine-evidence.log`, `${evidence.join("\n")}\n`);
   }
