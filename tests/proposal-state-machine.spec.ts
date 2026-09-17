@@ -152,7 +152,7 @@ async function main() {
     await transferUpgradeAuthority(connection, treasury, payer, guard);
     const rejectedBuffer = new PublicKey(ids["candidate-approved"]);
     const uncommittedBuffer = new PublicKey(ids["candidate-rejected"]);
-    for (const b of [buffer, substituteBuffer, rejectedBuffer, uncommittedBuffer]) await send(connection, setLoaderAuthorityInstruction(b, proposer.publicKey, guard), payer, [proposer]);
+    for (const b of [buffer, substituteBuffer, rejectedBuffer]) await send(connection, setLoaderAuthorityInstruction(b, proposer.publicKey, guard), payer, [proposer]);
     const lockedHash = hash((await connection.getAccountInfo(buffer))!.data);
     const good = hash((await connection.getAccountInfo(buffer))!.data);
     // Terminal and authority assertions require a real, approved proposal but do not
@@ -182,7 +182,10 @@ async function main() {
     await send(connection, status(governance.publicKey, true), governance); await fails("5 paused policy create", /PolicyPaused/, () => send(connection, create(1n, buffer, good), proposer)); await send(connection, status(governance.publicKey, false), governance);
     await fails("6 target program with mismatched GuardConfig PDA is rejected", /ConstraintSeeds/, () => send(connection, create(1n, buffer, good, gate), proposer));
     await fails("7 wrong expected hash", /CandidateHashMismatch/, () => send(connection, create(1n, buffer, Buffer.alloc(32, 9)), proposer));
-    await fails("8 substituted buffer claim", /CandidateHashMismatch/, () => send(connection, create(1n, substituteBuffer, good), proposer));
+    const unlockedHash = hash((await connection.getAccountInfo(uncommittedBuffer))!.data);
+    await fails("8 candidate buffer not controlled by the Guard is rejected", /BufferNotLocked/, () => send(connection, create(1n, uncommittedBuffer, unlockedHash), proposer));
+    assert.equal(await connection.getAccountInfo(proposalAddress(1n)), null, "failed unlocked-buffer proposal persisted");
+    assert.equal(await connection.getAccountInfo(claimAddress(uncommittedBuffer)), null, "failed unlocked-buffer claim persisted");
     await send(connection, create(1n, buffer, good), proposer); console.log("PASS proposal Draft created");
     committedAtCreate = proposalSnapshot((await connection.getAccountInfo(proposalAddress(1n)))!.data);
     await fails("9 duplicate proposal PDA", /already in use|AccountAlreadyInitialized/, () => send(connection, create(1n, buffer, good), proposer));
