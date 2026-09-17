@@ -1,3 +1,8 @@
+param(
+  [ValidateSet('policy', 'terminal', 'authority')]
+  [string]$Shard
+)
+
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
@@ -8,8 +13,9 @@ $validatorExe = (Get-Command solana-test-validator.exe -ErrorAction Stop).Source
 if (Get-NetTCPConnection -LocalPort 8899 -State Listen -ErrorAction SilentlyContinue) {
   throw 'Port 8899 is LISTENING. Refusing to connect to or stop an unowned validator.'
 }
-Set-Content -LiteralPath $evidence -Value 'Proposal state machine: three fresh localnet shards'
-foreach ($shard in @('policy', 'terminal', 'authority')) {
+$shards = if ($Shard) { @($Shard) } else { @('policy', 'terminal', 'authority') }
+Set-Content -LiteralPath $evidence -Value "Proposal state machine shards: $($shards -join ', ')"
+foreach ($shard in $shards) {
   $validator = $null
   $ledger = [IO.Path]::GetFullPath((Join-Path $localRoot "proposal-$shard"))
   if ([IO.Path]::GetDirectoryName($ledger) -ne $localRoot) { throw 'Unsafe suite ledger path' }
@@ -26,7 +32,7 @@ foreach ($shard in @('policy', 'terminal', 'authority')) {
   try {
     $validator = Start-Process -FilePath $validatorExe -ArgumentList @(
       '--reset', '--ledger', $ledger, '--rpc-port', '8899', '--faucet-port', '9900',
-      '--mint', $ids.payer, '--log'
+      '--mint', $ids.payer, '--ticks-per-slot', '1024', '--log'
     ) -RedirectStandardOutput $outLog -RedirectStandardError $errLog -WindowStyle Hidden -PassThru
     Set-Content -LiteralPath (Join-Path $localRoot "proposal-$shard.pid") -Value $validator.Id
     $deadline = [DateTime]::UtcNow.AddSeconds(45)
@@ -41,6 +47,8 @@ foreach ($shard in @('policy', 'terminal', 'authority')) {
       if (-not $ready) { Start-Sleep -Milliseconds 100 }
     } while (-not $ready -and [DateTime]::UtcNow -lt $deadline)
     if (-not $ready) { throw "RPC health timeout for $shard. See $errLog" }
+    $slotReply = Invoke-RestMethod -Uri 'http://127.0.0.1:8899' -Method Post -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' -TimeoutSec 2
+    Write-Output "[$shard] validator slot after RPC readiness: $($slotReply.result)"
     # Match the already-proven demo flow. Genesis-preloaded executable accounts cannot
     # be mutated by loader SetAuthority on this validator build; post-genesis deploys
     # create the genuine mutable loader-v3 ProgramData state required by the Guard.
@@ -54,8 +62,12 @@ foreach ($shard in @('policy', 'terminal', 'authority')) {
     $env:FAULTLINE_PROPOSAL_GENESIS = $genesis.result
     $env:FAULTLINE_PROPOSAL_SHARD = $shard
     Add-Content -LiteralPath $evidence -Value "START shard=$shard PID=$($validator.Id) genesis=$($genesis.result) ledger=$ledger"
+    $slotReply = Invoke-RestMethod -Uri 'http://127.0.0.1:8899' -Method Post -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' -TimeoutSec 2
+    Write-Output "[$shard] validator slot before shard execution: $($slotReply.result)"
     & node.exe node_modules/tsx/dist/cli.mjs tests/proposal-state-machine.spec.ts --shard $shard
     if ($LASTEXITCODE -ne 0) { throw "Proposal $shard shard failed (exit $LASTEXITCODE). See $evidence" }
+    $slotReply = Invoke-RestMethod -Uri 'http://127.0.0.1:8899' -Method Post -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' -TimeoutSec 2
+    Write-Output "[$shard] validator slot after shard completion: $($slotReply.result)"
   } finally {
     Remove-Item Env:FAULTLINE_PROPOSAL_GENESIS -ErrorAction SilentlyContinue
     Remove-Item Env:FAULTLINE_PROPOSAL_SHARD -ErrorAction SilentlyContinue
@@ -71,4 +83,4 @@ foreach ($shard in @('policy', 'terminal', 'authority')) {
     }
   }
 }
-Write-Output 'All three proposal-state-machine shards passed.'
+Write-Output "Proposal state-machine shard run passed: $($shards -join ', ')"

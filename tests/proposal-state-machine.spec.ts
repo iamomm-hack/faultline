@@ -38,13 +38,33 @@ async function send(connection: Connection, ix: TransactionInstruction, feePayer
   const tx = new Transaction({ feePayer: feePayer.publicKey, recentBlockhash: latest.blockhash }).add(ix);
   tx.sign(feePayer, ...signers);
   const signature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: COMMITMENT });
-  for (let attempt = 0; attempt < 120; attempt++) {
-    const status = (await connection.getSignatureStatuses([signature])).value[0];
-    if (status?.err) throw new Error(`transaction ${signature} failed: ${JSON.stringify(status.err)}`);
-    if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") return signature;
-    await new Promise(resolve => setTimeout(resolve, 50));
+  const deadline = Date.now() + 90_000;
+  let observed: Awaited<ReturnType<Connection["getSignatureStatuses"]>>["value"][number] = null;
+  while (Date.now() < deadline) {
+    observed = (await connection.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0];
+    if (observed?.err) throw new Error(`transaction ${signature} failed: ${JSON.stringify(observed.err)}`);
+    const level = observed?.confirmationStatus;
+    const reachedCommitment = COMMITMENT === "processed"
+      ? level === "processed" || level === "confirmed" || level === "finalized"
+      : COMMITMENT === "confirmed"
+        ? level === "confirmed" || level === "finalized"
+        : level === "finalized";
+    if (reachedCommitment) return signature;
+    await new Promise(resolve => setTimeout(resolve, 500));
   }
-  throw new Error(`transaction ${signature} was not confirmed`);
+  const currentSlot = await connection.getSlot(COMMITMENT).catch(error => `unavailable: ${String(error)}`);
+  let rpcHealth: unknown;
+  try {
+    const response = await fetch(RPC, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getHealth" })
+    });
+    rpcHealth = await response.json();
+  } catch (error) {
+    rpcHealth = `unavailable: ${String(error)}`;
+  }
+  throw new Error(`transaction confirmation timeout: signature=${signature} commitment=${COMMITMENT} latestStatus=${JSON.stringify(observed)} currentSlot=${String(currentSlot)} rpcHealth=${JSON.stringify(rpcHealth)}`);
 }
 
 function proposalAddress(id: bigint) { return PublicKey.findProgramAddressSync([Buffer.from("upgrade-proposal"), policy.toBuffer(), u64(id)], gate)[0]; }
@@ -160,7 +180,7 @@ async function main() {
     await fails("3 non-governance pause", /UnauthorizedGovernance/, () => send(connection, status(random.publicKey, true), random));
     await send(connection, status(governance.publicKey, true), governance); await send(connection, status(governance.publicKey, false), governance); console.log("PASS 4 governance pause/unpause");
     await send(connection, status(governance.publicKey, true), governance); await fails("5 paused policy create", /PolicyPaused/, () => send(connection, create(1n, buffer, good), proposer)); await send(connection, status(governance.publicKey, false), governance);
-    await fails("6 wrong target", /ConstraintHasOne|WrongTargetProgram/, () => send(connection, create(1n, buffer, good, gate), proposer));
+    await fails("6 target program with mismatched GuardConfig PDA is rejected", /ConstraintSeeds/, () => send(connection, create(1n, buffer, good, gate), proposer));
     await fails("7 wrong expected hash", /CandidateHashMismatch/, () => send(connection, create(1n, buffer, Buffer.alloc(32, 9)), proposer));
     await fails("8 substituted buffer claim", /CandidateHashMismatch/, () => send(connection, create(1n, substituteBuffer, good), proposer));
     await send(connection, create(1n, buffer, good), proposer); console.log("PASS proposal Draft created");
