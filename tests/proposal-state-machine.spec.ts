@@ -68,6 +68,7 @@ async function send(connection: Connection, ix: TransactionInstruction, feePayer
 }
 
 function proposalAddress(id: bigint) { return PublicKey.findProgramAddressSync([Buffer.from("upgrade-proposal"), policy.toBuffer(), u64(id)], gate)[0]; }
+function verificationGateAddress(proposal: PublicKey) { return PublicKey.findProgramAddressSync([Buffer.from("proposal-verification-gate"), proposal.toBuffer()], gate)[0]; }
 function claimAddress(b: PublicKey) { return PublicKey.findProgramAddressSync([Buffer.from("faultline"), Buffer.from("buffer"), b.toBuffer()], gate)[0]; }
 function initPolicy() { return anchorInstruction(gate, "initialize_safety_policy", [
   { pubkey: governance.publicKey, isSigner: true, isWritable: true }, { pubkey: guard, isSigner: false, isWritable: false },
@@ -78,14 +79,14 @@ function status(actor: PublicKey, paused: boolean) { return anchorInstruction(ga
 function create(id: bigint, candidate: PublicKey, expected: Buffer, target = treasury) { return anchorInstruction(gate, "create_upgrade_proposal", [
   { pubkey: proposer.publicKey, isSigner: true, isWritable: true }, { pubkey: guard, isSigner: false, isWritable: true }, { pubkey: policy, isSigner: false, isWritable: false },
   { pubkey: target, isSigner: false, isWritable: false }, { pubkey: target.equals(treasury) ? data : programDataAddress(target), isSigner: false, isWritable: false },
-  { pubkey: candidate, isSigner: false, isWritable: false }, { pubkey: proposalAddress(id), isSigner: false, isWritable: true }, { pubkey: claimAddress(candidate), isSigner: false, isWritable: true },
+  { pubkey: candidate, isSigner: false, isWritable: false }, { pubkey: proposalAddress(id), isSigner: false, isWritable: true }, { pubkey: verificationGateAddress(proposalAddress(id)), isSigner: false, isWritable: true }, { pubkey: claimAddress(candidate), isSigner: false, isWritable: true },
   { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
 ], Buffer.concat([u64(id), expected])); }
 function start(actor: PublicKey, id: bigint, duration: bigint) { return anchorInstruction(gate, "start_challenge", [{ pubkey: actor, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposalAddress(id), isSigner: false, isWritable: true }], u64(duration)); }
-function decision(actor: PublicKey, id: bigint, choice: number) { return anchorInstruction(gate, "record_temporary_decision", [{ pubkey: actor, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposalAddress(id), isSigner: false, isWritable: true }], Buffer.from([choice, 0, 0])); }
+function decision(actor: PublicKey, id: bigint, choice: number) { return anchorInstruction(gate, "record_temporary_decision", [{ pubkey: actor, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposalAddress(id), isSigner: false, isWritable: true }, { pubkey: verificationGateAddress(proposalAddress(id)), isSigner: false, isWritable: false }], Buffer.from([choice, 0, 0])); }
 function execute(id: bigint, candidate = buffer) { return anchorInstruction(gate, "execute_guarded_upgrade", [
   { pubkey: random.publicKey, isSigner: true, isWritable: false }, { pubkey: guard, isSigner: false, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false },
-  { pubkey: proposalAddress(id), isSigner: false, isWritable: true }, { pubkey: claimAddress(candidate), isSigner: false, isWritable: false }, { pubkey: treasury, isSigner: false, isWritable: true },
+  { pubkey: proposalAddress(id), isSigner: false, isWritable: true }, { pubkey: verificationGateAddress(proposalAddress(id)), isSigner: false, isWritable: false }, { pubkey: claimAddress(candidate), isSigner: false, isWritable: false }, { pubkey: treasury, isSigner: false, isWritable: true },
   { pubkey: data, isSigner: false, isWritable: true }, { pubkey: candidate, isSigner: false, isWritable: true }, { pubkey: governance.publicKey, isSigner: false, isWritable: true },
   { pubkey: SYSVAR_RENT, isSigner: false, isWritable: false }, { pubkey: SYSVAR_CLOCK, isSigner: false, isWritable: false }, { pubkey: LOADER_V3, isSigner: false, isWritable: false }
 ]); }
@@ -95,6 +96,7 @@ function executeWith(id: bigint, overrides: ExecuteOverrides = {}) {
   return anchorInstruction(gate, "execute_guarded_upgrade", [
     { pubkey: random.publicKey, isSigner: true, isWritable: false }, { pubkey: overrides.guard ?? guard, isSigner: false, isWritable: false },
     { pubkey: overrides.policy ?? policy, isSigner: false, isWritable: false }, { pubkey: overrides.proposal ?? proposalAddress(id), isSigner: false, isWritable: true },
+    { pubkey: verificationGateAddress(overrides.proposal ?? proposalAddress(id)), isSigner: false, isWritable: false },
     { pubkey: overrides.claim ?? claimAddress(candidate), isSigner: false, isWritable: false }, { pubkey: overrides.target ?? treasury, isSigner: false, isWritable: true },
     { pubkey: overrides.programData ?? data, isSigner: false, isWritable: true }, { pubkey: candidate, isSigner: false, isWritable: true },
     { pubkey: governance.publicKey, isSigner: false, isWritable: true }, { pubkey: SYSVAR_RENT, isSigner: false, isWritable: false },

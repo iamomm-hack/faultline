@@ -215,6 +215,12 @@ function proposalAddress(id: bigint, policyAddress = policy): PublicKey {
     gate
   )[0];
 }
+function verificationGateAddress(proposal: PublicKey): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from("proposal-verification-gate"), proposal.toBuffer()],
+    gate
+  )[0];
+}
 function bufferClaimAddress(buffer: PublicKey): PublicKey {
   return PublicKey.findProgramAddressSync(
     [Buffer.from("faultline"), Buffer.from("buffer"), buffer.toBuffer()],
@@ -328,6 +334,7 @@ function createProposal(id: bigint, buffer: PublicKey, bufferHash: Buffer): Tran
       { pubkey: programData, isSigner: false, isWritable: false },
       { pubkey: buffer, isSigner: false, isWritable: false },
       { pubkey: proposalAddress(id), isSigner: false, isWritable: true },
+      { pubkey: verificationGateAddress(proposalAddress(id)), isSigner: false, isWritable: true },
       { pubkey: bufferClaimAddress(buffer), isSigner: false, isWritable: true },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
     ],
@@ -342,7 +349,8 @@ function startChallenge(id: bigint, duration: bigint): TransactionInstruction {
     [
       { pubkey: proposer.publicKey, isSigner: true, isWritable: false },
       { pubkey: policy, isSigner: false, isWritable: false },
-      { pubkey: proposalAddress(id), isSigner: false, isWritable: true }
+      { pubkey: proposalAddress(id), isSigner: false, isWritable: true },
+      { pubkey: verificationGateAddress(proposalAddress(id)), isSigner: false, isWritable: false }
     ],
     u64(duration)
   );
@@ -375,6 +383,7 @@ function executeProposal(id: bigint, buffer: PublicKey): TransactionInstruction 
     { pubkey: guard, isSigner: false, isWritable: false },
     { pubkey: policy, isSigner: false, isWritable: false },
     { pubkey: proposalAddress(id), isSigner: false, isWritable: true },
+    { pubkey: verificationGateAddress(proposalAddress(id)), isSigner: false, isWritable: false },
     { pubkey: bufferClaimAddress(buffer), isSigner: false, isWritable: false },
     { pubkey: treasury, isSigner: false, isWritable: true },
     { pubkey: programData, isSigner: false, isWritable: true },

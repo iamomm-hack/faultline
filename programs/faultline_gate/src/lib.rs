@@ -16,9 +16,20 @@ const UPGRADE_PROPOSAL_SEED: &[u8] = b"upgrade-proposal";
 const INVARIANT_SEED: &[u8] = b"invariant";
 const CHALLENGE_COMMIT_SEED: &[u8] = b"challenge-commit";
 const TRACE_CLAIM_SEED: &[u8] = b"trace-claim";
+const VERIFIER_REGISTRY_SEED: &[u8] = b"verifier-registry";
+const VERIFIER_EPOCH_SEED: &[u8] = b"verifier-epoch";
+const PROPOSAL_VERIFICATION_GATE_SEED: &[u8] = b"proposal-verification-gate";
+const VERIFICATION_ROUND_SEED: &[u8] = b"verification-round";
+const REPLAY_RESULT_SEED: &[u8] = b"replay-result";
+const VERIFIER_ATTESTATION_SEED: &[u8] = b"verifier-attestation";
 const CHALLENGE_DOMAIN: &[u8] = b"FAULTLINE_CHALLENGE_V1";
+const REPLAY_DOMAIN: &[u8] = b"FAULTLINE_REPLAY_V1";
+const VERIFIER_SET_DOMAIN: &[u8] = b"FAULTLINE_VERIFIER_SET_V1";
 const MIN_REVEAL_DELAY_SLOTS: u64 = 1;
 const MAX_REVEAL_HORIZON_SLOTS: u64 = 8;
+const MIN_VERIFICATION_REMAINING_SLOTS: u64 = 2;
+const MAX_VERIFIERS: usize = 8;
+const AUTOMATIC_VIOLATION_REASON_CODE: u16 = 0x5001;
 
 #[program]
 pub mod faultline_gate {
@@ -216,6 +227,12 @@ pub mod faultline_gate {
         claim.proposal = proposal.key();
         claim.candidate_buffer = ctx.accounts.candidate_buffer.key();
         claim.bump = ctx.bumps.buffer_claim;
+        let verification_gate = &mut ctx.accounts.proposal_verification_gate;
+        verification_gate.proposal = proposal.key();
+        verification_gate.pending_rounds = 0;
+        verification_gate.confirmed_violation = false;
+        verification_gate.last_violation_round = None;
+        verification_gate.bump = ctx.bumps.proposal_verification_gate;
         ctx.accounts.guard_config.proposal_nonce = ctx
             .accounts
             .guard_config
@@ -406,6 +423,346 @@ pub mod faultline_gate {
         Ok(())
     }
 
+    pub fn initialize_verifier_registry(ctx: Context<InitializeVerifierRegistry>) -> Result<()> {
+        let slot = Clock::get()?.slot;
+        let registry = &mut ctx.accounts.verifier_registry;
+        registry.safety_policy = ctx.accounts.policy.key();
+        registry.governance = ctx.accounts.governance.key();
+        registry.active_epoch = None;
+        registry.next_epoch_id = 0;
+        registry.created_at_slot = slot;
+        registry.bump = ctx.bumps.verifier_registry;
+        emit!(VerifierRegistryInitialized {
+            policy: registry.safety_policy,
+            verifier_registry: registry.key(),
+            governance: registry.governance,
+            slot,
+        });
+        Ok(())
+    }
+
+    pub fn create_verifier_epoch(
+        ctx: Context<CreateVerifierEpoch>,
+        epoch_id: u64,
+        verifiers: Vec<Pubkey>,
+        threshold: u8,
+    ) -> Result<()> {
+        let mut verifiers = verifiers;
+        require!(!verifiers.is_empty(), FaultlineError::EmptyVerifierSet);
+        require!(
+            verifiers.len() <= MAX_VERIFIERS,
+            FaultlineError::TooManyVerifiers
+        );
+        require!(threshold > 0, FaultlineError::InvalidThreshold);
+        require!(
+            usize::from(threshold) <= verifiers.len(),
+            FaultlineError::InvalidThreshold
+        );
+        require!(
+            epoch_id == ctx.accounts.verifier_registry.next_epoch_id,
+            FaultlineError::WrongVerifierEpoch
+        );
+        verifiers.sort_unstable();
+        require!(
+            !verifiers.windows(2).any(|pair| pair[0] == pair[1]),
+            FaultlineError::DuplicateVerifier
+        );
+        let verifier_set_hash =
+            verifier_set_hash(&ctx.accounts.policy.key(), epoch_id, threshold, &verifiers);
+        let slot = Clock::get()?.slot;
+        let epoch = &mut ctx.accounts.verifier_epoch;
+        epoch.verifier_registry = ctx.accounts.verifier_registry.key();
+        epoch.safety_policy = ctx.accounts.policy.key();
+        epoch.epoch_id = epoch_id;
+        epoch.verifiers = verifiers;
+        epoch.threshold = threshold;
+        epoch.verifier_set_hash = verifier_set_hash;
+        epoch.creator = ctx.accounts.governance.key();
+        epoch.created_at_slot = slot;
+        epoch.bump = ctx.bumps.verifier_epoch;
+        ctx.accounts.verifier_registry.next_epoch_id = ctx
+            .accounts
+            .verifier_registry
+            .next_epoch_id
+            .checked_add(1)
+            .ok_or(FaultlineError::CounterOverflow)?;
+        emit!(VerifierEpochCreated {
+            policy: epoch.safety_policy,
+            verifier_registry: epoch.verifier_registry,
+            verifier_epoch: epoch.key(),
+            epoch_id,
+            threshold,
+            verifier_set_hash,
+            creator: epoch.creator,
+            slot,
+        });
+        Ok(())
+    }
+
+    pub fn activate_verifier_epoch(ctx: Context<ActivateVerifierEpoch>) -> Result<()> {
+        let registry = &mut ctx.accounts.verifier_registry;
+        registry.active_epoch = Some(ctx.accounts.verifier_epoch.key());
+        emit!(VerifierEpochActivated {
+            policy: ctx.accounts.policy.key(),
+            verifier_registry: registry.key(),
+            verifier_epoch: ctx.accounts.verifier_epoch.key(),
+            epoch_id: ctx.accounts.verifier_epoch.epoch_id,
+            actor: ctx.accounts.governance.key(),
+            slot: Clock::get()?.slot,
+        });
+        Ok(())
+    }
+
+    pub fn open_verification_round(ctx: Context<OpenVerificationRound>) -> Result<()> {
+        require!(
+            ctx.accounts.policy.status == PolicyStatus::Active,
+            FaultlineError::PolicyPaused
+        );
+        require!(
+            ctx.accounts.proposal.state == ProposalState::ChallengeActive,
+            FaultlineError::InvalidProposalTransition
+        );
+        require!(
+            ctx.accounts.challenge_commit.status == ChallengeCommitStatus::Revealed,
+            FaultlineError::ChallengeNotRevealed
+        );
+        require!(
+            ctx.accounts.verifier_registry.active_epoch.is_some(),
+            FaultlineError::NoActiveVerifierEpoch
+        );
+        require!(
+            ctx.accounts.verifier_registry.active_epoch == Some(ctx.accounts.verifier_epoch.key()),
+            FaultlineError::WrongVerifierEpoch
+        );
+        require!(
+            ctx.accounts.verification_round.proposal == Pubkey::default(),
+            FaultlineError::RoundAlreadyExists
+        );
+        let end = ctx
+            .accounts
+            .proposal
+            .challenge_end_slot
+            .ok_or(FaultlineError::MissingChallengeWindow)?;
+        let slot = Clock::get()?.slot;
+        let required_end = slot
+            .checked_add(MIN_VERIFICATION_REMAINING_SLOTS)
+            .ok_or(FaultlineError::CounterOverflow)?;
+        require!(required_end <= end, FaultlineError::VerificationWindowEnded);
+        let round = &mut ctx.accounts.verification_round;
+        round.policy = ctx.accounts.policy.key();
+        round.proposal = ctx.accounts.proposal.key();
+        round.invariant = ctx.accounts.invariant.key();
+        round.trace_claim = ctx.accounts.trace_claim.key();
+        round.trace_hash = ctx.accounts.trace_claim.trace_hash;
+        round.candidate_buffer_hash = ctx.accounts.proposal.candidate_buffer_hash;
+        round.invariant_specification_hash = ctx.accounts.invariant.specification_hash;
+        round.verifier_epoch = ctx.accounts.verifier_epoch.key();
+        round.threshold = ctx.accounts.verifier_epoch.threshold;
+        round.status = VerificationRoundStatus::Open;
+        round.opened_slot = slot;
+        round.finalized_slot = None;
+        round.winning_replay_result = None;
+        round.bump = ctx.bumps.verification_round;
+        let verification_gate = &mut ctx.accounts.proposal_verification_gate;
+        verification_gate.pending_rounds = verification_gate
+            .pending_rounds
+            .checked_add(1)
+            .ok_or(FaultlineError::CounterOverflow)?;
+        emit!(VerificationRoundOpened {
+            policy: round.policy,
+            proposal: round.proposal,
+            invariant: round.invariant,
+            trace_claim: round.trace_claim,
+            verification_round: round.key(),
+            verifier_epoch: round.verifier_epoch,
+            threshold: round.threshold,
+            slot,
+        });
+        Ok(())
+    }
+
+    pub fn create_replay_result(
+        ctx: Context<CreateReplayResult>,
+        result_hash: [u8; 32],
+        verdict: ReplayVerdict,
+        replay_receipt_hash: [u8; 32],
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.verification_round.status == VerificationRoundStatus::Open,
+            FaultlineError::RoundNotOpen
+        );
+        let expected = replay_result_commitment(
+            &ctx.accounts.verification_round.proposal,
+            &ctx.accounts.verification_round.invariant,
+            &ctx.accounts.verification_round.trace_claim,
+            &ctx.accounts.verification_round.candidate_buffer_hash,
+            &ctx.accounts.verification_round.invariant_specification_hash,
+            verdict,
+            &replay_receipt_hash,
+        );
+        require!(
+            expected == result_hash,
+            FaultlineError::ReplayResultMismatch
+        );
+        let slot = Clock::get()?.slot;
+        let replay_result = &mut ctx.accounts.replay_result;
+        replay_result.verification_round = ctx.accounts.verification_round.key();
+        replay_result.result_hash = result_hash;
+        replay_result.verdict = verdict;
+        replay_result.replay_receipt_hash = replay_receipt_hash;
+        replay_result.vote_count = 0;
+        replay_result.created_at_slot = slot;
+        replay_result.bump = ctx.bumps.replay_result;
+        Ok(())
+    }
+
+    pub fn submit_verifier_attestation(
+        ctx: Context<SubmitVerifierAttestation>,
+        result_hash: [u8; 32],
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.verification_round.status == VerificationRoundStatus::Open,
+            FaultlineError::RoundNotOpen
+        );
+        require!(
+            ctx.accounts.proposal.state == ProposalState::ChallengeActive,
+            FaultlineError::InvalidProposalTransition
+        );
+        require!(
+            ctx.accounts
+                .verifier_epoch
+                .verifiers
+                .contains(&ctx.accounts.verifier.key()),
+            FaultlineError::UnauthorizedVerifier
+        );
+        require!(
+            ctx.accounts.verifier_attestation.verification_round == Pubkey::default(),
+            FaultlineError::VerifierAlreadyAttested
+        );
+        require!(
+            ctx.accounts.replay_result.result_hash == result_hash,
+            FaultlineError::WrongResultBinding
+        );
+        let expected = replay_result_commitment(
+            &ctx.accounts.verification_round.proposal,
+            &ctx.accounts.verification_round.invariant,
+            &ctx.accounts.verification_round.trace_claim,
+            &ctx.accounts.verification_round.candidate_buffer_hash,
+            &ctx.accounts.verification_round.invariant_specification_hash,
+            ctx.accounts.replay_result.verdict,
+            &ctx.accounts.replay_result.replay_receipt_hash,
+        );
+        require!(
+            expected == result_hash,
+            FaultlineError::ReplayResultMismatch
+        );
+        let end = ctx
+            .accounts
+            .proposal
+            .challenge_end_slot
+            .ok_or(FaultlineError::MissingChallengeWindow)?;
+        let slot = Clock::get()?.slot;
+        require!(slot <= end, FaultlineError::VerificationWindowEnded);
+        let attestation = &mut ctx.accounts.verifier_attestation;
+        attestation.verification_round = ctx.accounts.verification_round.key();
+        attestation.verifier_epoch = ctx.accounts.verifier_epoch.key();
+        attestation.verifier = ctx.accounts.verifier.key();
+        attestation.replay_result = ctx.accounts.replay_result.key();
+        attestation.result_hash = result_hash;
+        attestation.attested_slot = slot;
+        attestation.bump = ctx.bumps.verifier_attestation;
+        let replay_result = &mut ctx.accounts.replay_result;
+        replay_result.vote_count = replay_result
+            .vote_count
+            .checked_add(1)
+            .ok_or(FaultlineError::CounterOverflow)?;
+        emit!(VerifierAttested {
+            verification_round: ctx.accounts.verification_round.key(),
+            verifier_epoch: ctx.accounts.verifier_epoch.key(),
+            verifier: ctx.accounts.verifier.key(),
+            replay_result: replay_result.key(),
+            result_hash,
+            vote_count: replay_result.vote_count,
+            slot,
+        });
+        if replay_result.vote_count == ctx.accounts.verification_round.threshold {
+            emit!(ReplayResultReachedQuorum {
+                verification_round: ctx.accounts.verification_round.key(),
+                replay_result: replay_result.key(),
+                result_hash,
+                verdict: replay_result.verdict,
+                vote_count: replay_result.vote_count,
+                threshold: ctx.accounts.verification_round.threshold,
+                slot,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn finalize_replay_result(ctx: Context<FinalizeReplayResult>) -> Result<()> {
+        require!(
+            ctx.accounts.verification_round.status == VerificationRoundStatus::Open,
+            FaultlineError::RoundNotOpen
+        );
+        require!(
+            ctx.accounts.proposal.state == ProposalState::ChallengeActive,
+            FaultlineError::InvalidProposalTransition
+        );
+        require!(
+            ctx.accounts.replay_result.vote_count >= ctx.accounts.verification_round.threshold,
+            FaultlineError::QuorumNotReached
+        );
+        let end = ctx
+            .accounts
+            .proposal
+            .challenge_end_slot
+            .ok_or(FaultlineError::MissingChallengeWindow)?;
+        let slot = Clock::get()?.slot;
+        require!(slot <= end, FaultlineError::VerificationWindowEnded);
+        let verification_gate = &mut ctx.accounts.proposal_verification_gate;
+        verification_gate.pending_rounds = verification_gate
+            .pending_rounds
+            .checked_sub(1)
+            .ok_or(FaultlineError::CounterUnderflow)?;
+        let round = &mut ctx.accounts.verification_round;
+        round.finalized_slot = Some(slot);
+        round.winning_replay_result = Some(ctx.accounts.replay_result.key());
+        match ctx.accounts.replay_result.verdict {
+            ReplayVerdict::InvariantHolds => {
+                round.status = VerificationRoundStatus::InvariantHolds;
+            }
+            ReplayVerdict::InvariantViolated => {
+                round.status = VerificationRoundStatus::InvariantViolated;
+                verification_gate.confirmed_violation = true;
+                verification_gate.last_violation_round = Some(round.key());
+                let proposal = &mut ctx.accounts.proposal;
+                proposal.state = ProposalState::Rejected;
+                proposal.decision_authority = Some(crate::ID);
+                proposal.decision_slot = Some(slot);
+                proposal.decision_reason_code = Some(AUTOMATIC_VIOLATION_REASON_CODE);
+                emit!(ProposalAutomaticallyRejected {
+                    policy: ctx.accounts.policy.key(),
+                    proposal: proposal.key(),
+                    verification_round: round.key(),
+                    replay_result: ctx.accounts.replay_result.key(),
+                    result_hash: ctx.accounts.replay_result.result_hash,
+                    reason_code: AUTOMATIC_VIOLATION_REASON_CODE,
+                    slot,
+                });
+            }
+        }
+        emit!(ReplayResultFinalized {
+            policy: ctx.accounts.policy.key(),
+            proposal: ctx.accounts.proposal.key(),
+            verification_round: round.key(),
+            replay_result: ctx.accounts.replay_result.key(),
+            result_hash: ctx.accounts.replay_result.result_hash,
+            verdict: ctx.accounts.replay_result.verdict,
+            slot,
+        });
+        Ok(())
+    }
+
     pub fn expire_proposal(ctx: Context<ExpireProposal>) -> Result<()> {
         let proposal = &mut ctx.accounts.proposal;
         require!(
@@ -461,6 +818,16 @@ pub mod faultline_gate {
             proposal.decision_authority.is_none(),
             FaultlineError::DecisionAlreadyRecorded
         );
+        if decision == ProposalState::Approved {
+            require!(
+                ctx.accounts.proposal_verification_gate.pending_rounds == 0,
+                FaultlineError::VerificationPending
+            );
+            require!(
+                !ctx.accounts.proposal_verification_gate.confirmed_violation,
+                FaultlineError::ConfirmedInvariantViolation
+            );
+        }
         proposal.state = decision;
         proposal.decision_authority = Some(ctx.accounts.governance.key());
         proposal.decision_slot = Some(slot);
@@ -481,6 +848,14 @@ pub mod faultline_gate {
     /// This is the sole Faultline route which signs loader-v3 Upgrade with the Guard PDA.
     pub fn execute_guarded_upgrade(ctx: Context<ExecuteGuardedUpgrade>) -> Result<()> {
         let proposal = &mut ctx.accounts.proposal;
+        require!(
+            ctx.accounts.proposal_verification_gate.pending_rounds == 0,
+            FaultlineError::VerificationPending
+        );
+        require!(
+            !ctx.accounts.proposal_verification_gate.confirmed_violation,
+            FaultlineError::ConfirmedInvariantViolation
+        );
         require!(
             proposal.state == ProposalState::Approved,
             FaultlineError::ProposalNotApproved
@@ -611,9 +986,9 @@ pub struct CreateUpgradeProposal<'info> {
     #[account(mut)]
     pub proposer: Signer<'info>,
     #[account(mut, seeds = [DOMAIN_SEED, GUARD_SEED, target_program.key().as_ref()], bump = guard_config.guard_bump, constraint = guard_config.target_program == target_program.key() @ FaultlineError::WrongTargetProgram)]
-    pub guard_config: Account<'info, GuardConfig>,
+    pub guard_config: Box<Account<'info, GuardConfig>>,
     #[account(seeds = [SAFETY_POLICY_SEED, target_program.key().as_ref()], bump = policy.bump, has_one = target_program)]
-    pub policy: Account<'info, SafetyPolicy>,
+    pub policy: Box<Account<'info, SafetyPolicy>>,
     /// CHECK: loader state is validated.
     pub target_program: UncheckedAccount<'info>,
     /// CHECK: loader state is validated.
@@ -622,9 +997,11 @@ pub struct CreateUpgradeProposal<'info> {
     /// CHECK: loader buffer is validated.
     pub candidate_buffer: UncheckedAccount<'info>,
     #[account(init, payer = proposer, space = 8 + UpgradeProposal::INIT_SPACE, seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal_id.to_le_bytes()], bump)]
-    pub proposal: Account<'info, UpgradeProposal>,
+    pub proposal: Box<Account<'info, UpgradeProposal>>,
+    #[account(init, payer = proposer, space = 8 + ProposalVerificationGate::INIT_SPACE, seeds = [PROPOSAL_VERIFICATION_GATE_SEED, proposal.key().as_ref()], bump)]
+    pub proposal_verification_gate: Box<Account<'info, ProposalVerificationGate>>,
     #[account(init, payer = proposer, space = 8 + BufferClaim::INIT_SPACE, seeds = [DOMAIN_SEED, BUFFER_SEED, candidate_buffer.key().as_ref()], bump)]
-    pub buffer_claim: Account<'info, BufferClaim>,
+    pub buffer_claim: Box<Account<'info, BufferClaim>>,
     pub system_program: Program<'info, System>,
 }
 #[derive(Accounts)]
@@ -668,6 +1045,111 @@ pub struct RevealChallenge<'info> {
     pub system_program: Program<'info, System>,
 }
 #[derive(Accounts)]
+pub struct InitializeVerifierRegistry<'info> {
+    #[account(mut)]
+    pub governance: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump, constraint = policy.governance_authority == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(init, payer = governance, space = 8 + VerifierRegistry::INIT_SPACE, seeds = [VERIFIER_REGISTRY_SEED, policy.key().as_ref()], bump)]
+    pub verifier_registry: Account<'info, VerifierRegistry>,
+    pub system_program: Program<'info, System>,
+}
+#[derive(Accounts)]
+#[instruction(epoch_id: u64)]
+pub struct CreateVerifierEpoch<'info> {
+    #[account(mut)]
+    pub governance: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump, constraint = policy.governance_authority == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(mut, seeds = [VERIFIER_REGISTRY_SEED, policy.key().as_ref()], bump = verifier_registry.bump, constraint = verifier_registry.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verifier_registry.governance == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub verifier_registry: Account<'info, VerifierRegistry>,
+    #[account(init, payer = governance, space = 8 + VerifierEpoch::INIT_SPACE, seeds = [VERIFIER_EPOCH_SEED, verifier_registry.key().as_ref(), &epoch_id.to_le_bytes()], bump)]
+    pub verifier_epoch: Box<Account<'info, VerifierEpoch>>,
+    pub system_program: Program<'info, System>,
+}
+#[derive(Accounts)]
+pub struct ActivateVerifierEpoch<'info> {
+    pub governance: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump, constraint = policy.governance_authority == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(mut, seeds = [VERIFIER_REGISTRY_SEED, policy.key().as_ref()], bump = verifier_registry.bump, constraint = verifier_registry.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verifier_registry.governance == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub verifier_registry: Account<'info, VerifierRegistry>,
+    #[account(seeds = [VERIFIER_EPOCH_SEED, verifier_registry.key().as_ref(), &verifier_epoch.epoch_id.to_le_bytes()], bump = verifier_epoch.bump, constraint = verifier_epoch.verifier_registry == verifier_registry.key() @ FaultlineError::WrongVerifierEpoch, constraint = verifier_epoch.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub verifier_epoch: Account<'info, VerifierEpoch>,
+}
+#[derive(Accounts)]
+pub struct OpenVerificationRound<'info> {
+    #[account(mut)]
+    pub opener: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
+    pub proposal: Account<'info, UpgradeProposal>,
+    #[account(mut, seeds = [PROPOSAL_VERIFICATION_GATE_SEED, proposal.key().as_ref()], bump = proposal_verification_gate.bump, constraint = proposal_verification_gate.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub proposal_verification_gate: Account<'info, ProposalVerificationGate>,
+    #[account(seeds = [INVARIANT_SEED, policy.key().as_ref(), &invariant.invariant_id.to_le_bytes()], bump = invariant.bump, constraint = invariant.safety_policy == policy.key() @ FaultlineError::WrongInvariantBinding)]
+    pub invariant: Account<'info, InvariantDefinition>,
+    #[account(seeds = [CHALLENGE_COMMIT_SEED, proposal.key().as_ref(), challenge_commit.hunter.as_ref(), challenge_commit.commitment_hash.as_ref()], bump = challenge_commit.bump, constraint = challenge_commit.proposal == proposal.key() @ FaultlineError::WrongProposalBinding, constraint = challenge_commit.invariant == invariant.key() @ FaultlineError::WrongInvariantBinding)]
+    pub challenge_commit: Box<Account<'info, ChallengeCommit>>,
+    #[account(seeds = [TRACE_CLAIM_SEED, proposal.key().as_ref(), trace_claim.trace_hash.as_ref()], bump = trace_claim.bump, constraint = trace_claim.proposal == proposal.key() @ FaultlineError::WrongProposalBinding, constraint = trace_claim.invariant == invariant.key() @ FaultlineError::WrongInvariantBinding, constraint = trace_claim.challenge_commit == challenge_commit.key() @ FaultlineError::WrongTraceBinding)]
+    pub trace_claim: Box<Account<'info, TraceClaim>>,
+    #[account(seeds = [VERIFIER_REGISTRY_SEED, policy.key().as_ref()], bump = verifier_registry.bump, constraint = verifier_registry.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub verifier_registry: Account<'info, VerifierRegistry>,
+    #[account(seeds = [VERIFIER_EPOCH_SEED, verifier_registry.key().as_ref(), &verifier_epoch.epoch_id.to_le_bytes()], bump = verifier_epoch.bump, constraint = verifier_epoch.verifier_registry == verifier_registry.key() @ FaultlineError::WrongVerifierEpoch, constraint = verifier_epoch.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub verifier_epoch: Box<Account<'info, VerifierEpoch>>,
+    #[account(init_if_needed, payer = opener, space = 8 + VerificationRound::INIT_SPACE, seeds = [VERIFICATION_ROUND_SEED, trace_claim.key().as_ref()], bump)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    pub system_program: Program<'info, System>,
+}
+#[derive(Accounts)]
+#[instruction(result_hash: [u8; 32])]
+pub struct CreateReplayResult<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [VERIFICATION_ROUND_SEED, verification_round.trace_claim.as_ref()], bump = verification_round.bump)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    #[account(init, payer = payer, space = 8 + ReplayResult::INIT_SPACE, seeds = [REPLAY_RESULT_SEED, verification_round.key().as_ref(), result_hash.as_ref()], bump)]
+    pub replay_result: Account<'info, ReplayResult>,
+    pub system_program: Program<'info, System>,
+}
+#[derive(Accounts)]
+#[instruction(result_hash: [u8; 32])]
+pub struct SubmitVerifierAttestation<'info> {
+    #[account(mut)]
+    pub verifier: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
+    pub proposal: Account<'info, UpgradeProposal>,
+    #[account(address = verification_round.invariant @ FaultlineError::WrongInvariantBinding)]
+    pub invariant: Account<'info, InvariantDefinition>,
+    #[account(seeds = [TRACE_CLAIM_SEED, proposal.key().as_ref(), trace_claim.trace_hash.as_ref()], bump = trace_claim.bump, address = verification_round.trace_claim @ FaultlineError::WrongTraceBinding)]
+    pub trace_claim: Account<'info, TraceClaim>,
+    #[account(seeds = [VERIFIER_EPOCH_SEED, verifier_epoch.verifier_registry.as_ref(), &verifier_epoch.epoch_id.to_le_bytes()], bump = verifier_epoch.bump, address = verification_round.verifier_epoch @ FaultlineError::WrongVerifierEpoch)]
+    pub verifier_epoch: Box<Account<'info, VerifierEpoch>>,
+    #[account(seeds = [VERIFICATION_ROUND_SEED, trace_claim.key().as_ref()], bump = verification_round.bump, constraint = verification_round.policy == policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verification_round.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    #[account(mut, seeds = [REPLAY_RESULT_SEED, verification_round.key().as_ref(), result_hash.as_ref()], bump = replay_result.bump, constraint = replay_result.verification_round == verification_round.key() @ FaultlineError::WrongRoundBinding)]
+    pub replay_result: Box<Account<'info, ReplayResult>>,
+    #[account(init_if_needed, payer = verifier, space = 8 + VerifierAttestation::INIT_SPACE, seeds = [VERIFIER_ATTESTATION_SEED, verification_round.key().as_ref(), verifier.key().as_ref()], bump)]
+    pub verifier_attestation: Box<Account<'info, VerifierAttestation>>,
+    pub system_program: Program<'info, System>,
+}
+#[derive(Accounts)]
+pub struct FinalizeReplayResult<'info> {
+    pub caller: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(mut, seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
+    pub proposal: Account<'info, UpgradeProposal>,
+    #[account(mut, seeds = [PROPOSAL_VERIFICATION_GATE_SEED, proposal.key().as_ref()], bump = proposal_verification_gate.bump, constraint = proposal_verification_gate.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub proposal_verification_gate: Account<'info, ProposalVerificationGate>,
+    #[account(mut, seeds = [VERIFICATION_ROUND_SEED, verification_round.trace_claim.as_ref()], bump = verification_round.bump, constraint = verification_round.policy == policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verification_round.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    #[account(seeds = [REPLAY_RESULT_SEED, verification_round.key().as_ref(), replay_result.result_hash.as_ref()], bump = replay_result.bump, constraint = replay_result.verification_round == verification_round.key() @ FaultlineError::WrongRoundBinding)]
+    pub replay_result: Account<'info, ReplayResult>,
+}
+#[derive(Accounts)]
 pub struct ExpireProposal<'info> {
     pub caller: Signer<'info>,
     #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump)]
@@ -682,6 +1164,8 @@ pub struct RecordTemporaryDecision<'info> {
     pub policy: Account<'info, SafetyPolicy>,
     #[account(mut, seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
     pub proposal: Account<'info, UpgradeProposal>,
+    #[account(seeds = [PROPOSAL_VERIFICATION_GATE_SEED, proposal.key().as_ref()], bump = proposal_verification_gate.bump, constraint = proposal_verification_gate.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub proposal_verification_gate: Account<'info, ProposalVerificationGate>,
 }
 #[derive(Accounts)]
 pub struct ExecuteGuardedUpgrade<'info> {
@@ -692,6 +1176,8 @@ pub struct ExecuteGuardedUpgrade<'info> {
     pub policy: Account<'info, SafetyPolicy>,
     #[account(mut, seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy, has_one = target_program, has_one = program_data, has_one = candidate_buffer)]
     pub proposal: Account<'info, UpgradeProposal>,
+    #[account(seeds = [PROPOSAL_VERIFICATION_GATE_SEED, proposal.key().as_ref()], bump = proposal_verification_gate.bump, constraint = proposal_verification_gate.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub proposal_verification_gate: Account<'info, ProposalVerificationGate>,
     #[account(seeds = [DOMAIN_SEED, BUFFER_SEED, candidate_buffer.key().as_ref()], bump = buffer_claim.bump, has_one = proposal, has_one = candidate_buffer)]
     pub buffer_claim: Account<'info, BufferClaim>,
     /// CHECK: loader state is validated.
@@ -804,6 +1290,79 @@ pub struct TraceClaim {
     pub revealed_at_slot: u64,
     pub bump: u8,
 }
+#[account]
+#[derive(InitSpace)]
+pub struct VerifierRegistry {
+    pub safety_policy: Pubkey,
+    pub governance: Pubkey,
+    pub active_epoch: Option<Pubkey>,
+    pub next_epoch_id: u64,
+    pub created_at_slot: u64,
+    pub bump: u8,
+}
+#[account]
+#[derive(InitSpace)]
+pub struct VerifierEpoch {
+    pub verifier_registry: Pubkey,
+    pub safety_policy: Pubkey,
+    pub epoch_id: u64,
+    #[max_len(8)]
+    pub verifiers: Vec<Pubkey>,
+    pub threshold: u8,
+    pub verifier_set_hash: [u8; 32],
+    pub creator: Pubkey,
+    pub created_at_slot: u64,
+    pub bump: u8,
+}
+#[account]
+#[derive(InitSpace)]
+pub struct ProposalVerificationGate {
+    pub proposal: Pubkey,
+    pub pending_rounds: u16,
+    pub confirmed_violation: bool,
+    pub last_violation_round: Option<Pubkey>,
+    pub bump: u8,
+}
+#[account]
+#[derive(InitSpace)]
+pub struct VerificationRound {
+    pub policy: Pubkey,
+    pub proposal: Pubkey,
+    pub invariant: Pubkey,
+    pub trace_claim: Pubkey,
+    pub trace_hash: [u8; 32],
+    pub candidate_buffer_hash: [u8; 32],
+    pub invariant_specification_hash: [u8; 32],
+    pub verifier_epoch: Pubkey,
+    pub threshold: u8,
+    pub status: VerificationRoundStatus,
+    pub opened_slot: u64,
+    pub finalized_slot: Option<u64>,
+    pub winning_replay_result: Option<Pubkey>,
+    pub bump: u8,
+}
+#[account]
+#[derive(InitSpace)]
+pub struct ReplayResult {
+    pub verification_round: Pubkey,
+    pub result_hash: [u8; 32],
+    pub verdict: ReplayVerdict,
+    pub replay_receipt_hash: [u8; 32],
+    pub vote_count: u8,
+    pub created_at_slot: u64,
+    pub bump: u8,
+}
+#[account]
+#[derive(InitSpace)]
+pub struct VerifierAttestation {
+    pub verification_round: Pubkey,
+    pub verifier_epoch: Pubkey,
+    pub verifier: Pubkey,
+    pub replay_result: Pubkey,
+    pub result_hash: [u8; 32],
+    pub attested_slot: u64,
+    pub bump: u8,
+}
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
 pub enum PolicyStatus {
     Active,
@@ -830,6 +1389,17 @@ pub enum InvariantKind {
 pub enum ChallengeCommitStatus {
     Committed,
     Revealed,
+}
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
+pub enum VerificationRoundStatus {
+    Open,
+    InvariantHolds,
+    InvariantViolated,
+}
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
+pub enum ReplayVerdict {
+    InvariantHolds,
+    InvariantViolated,
 }
 
 #[event]
@@ -909,6 +1479,84 @@ pub struct ChallengeRevealed {
     pub trace_claim: Pubkey,
     pub hunter: Pubkey,
     pub trace_hash: [u8; 32],
+    pub slot: u64,
+}
+#[event]
+pub struct VerifierRegistryInitialized {
+    pub policy: Pubkey,
+    pub verifier_registry: Pubkey,
+    pub governance: Pubkey,
+    pub slot: u64,
+}
+#[event]
+pub struct VerifierEpochCreated {
+    pub policy: Pubkey,
+    pub verifier_registry: Pubkey,
+    pub verifier_epoch: Pubkey,
+    pub epoch_id: u64,
+    pub threshold: u8,
+    pub verifier_set_hash: [u8; 32],
+    pub creator: Pubkey,
+    pub slot: u64,
+}
+#[event]
+pub struct VerifierEpochActivated {
+    pub policy: Pubkey,
+    pub verifier_registry: Pubkey,
+    pub verifier_epoch: Pubkey,
+    pub epoch_id: u64,
+    pub actor: Pubkey,
+    pub slot: u64,
+}
+#[event]
+pub struct VerificationRoundOpened {
+    pub policy: Pubkey,
+    pub proposal: Pubkey,
+    pub invariant: Pubkey,
+    pub trace_claim: Pubkey,
+    pub verification_round: Pubkey,
+    pub verifier_epoch: Pubkey,
+    pub threshold: u8,
+    pub slot: u64,
+}
+#[event]
+pub struct VerifierAttested {
+    pub verification_round: Pubkey,
+    pub verifier_epoch: Pubkey,
+    pub verifier: Pubkey,
+    pub replay_result: Pubkey,
+    pub result_hash: [u8; 32],
+    pub vote_count: u8,
+    pub slot: u64,
+}
+#[event]
+pub struct ReplayResultReachedQuorum {
+    pub verification_round: Pubkey,
+    pub replay_result: Pubkey,
+    pub result_hash: [u8; 32],
+    pub verdict: ReplayVerdict,
+    pub vote_count: u8,
+    pub threshold: u8,
+    pub slot: u64,
+}
+#[event]
+pub struct ReplayResultFinalized {
+    pub policy: Pubkey,
+    pub proposal: Pubkey,
+    pub verification_round: Pubkey,
+    pub replay_result: Pubkey,
+    pub result_hash: [u8; 32],
+    pub verdict: ReplayVerdict,
+    pub slot: u64,
+}
+#[event]
+pub struct ProposalAutomaticallyRejected {
+    pub policy: Pubkey,
+    pub proposal: Pubkey,
+    pub verification_round: Pubkey,
+    pub replay_result: Pubkey,
+    pub result_hash: [u8; 32],
+    pub reason_code: u16,
     pub slot: u64,
 }
 #[event]
@@ -1033,6 +1681,49 @@ pub fn challenge_commitment(
     ])
     .to_bytes()
 }
+pub fn replay_result_commitment(
+    proposal: &Pubkey,
+    invariant: &Pubkey,
+    trace_claim: &Pubkey,
+    candidate_buffer_hash: &[u8; 32],
+    invariant_specification_hash: &[u8; 32],
+    verdict: ReplayVerdict,
+    replay_receipt_hash: &[u8; 32],
+) -> [u8; 32] {
+    let verdict_byte = match verdict {
+        ReplayVerdict::InvariantHolds => [0u8],
+        ReplayVerdict::InvariantViolated => [1u8],
+    };
+    hashv(&[
+        REPLAY_DOMAIN,
+        proposal.as_ref(),
+        invariant.as_ref(),
+        trace_claim.as_ref(),
+        candidate_buffer_hash,
+        invariant_specification_hash,
+        &verdict_byte,
+        replay_receipt_hash,
+    ])
+    .to_bytes()
+}
+pub fn verifier_set_hash(
+    safety_policy: &Pubkey,
+    epoch_id: u64,
+    threshold: u8,
+    verifiers: &[Pubkey],
+) -> [u8; 32] {
+    let mut preimage =
+        Vec::with_capacity(VERIFIER_SET_DOMAIN.len() + 32 + 8 + 1 + 1 + verifiers.len() * 32);
+    preimage.extend_from_slice(VERIFIER_SET_DOMAIN);
+    preimage.extend_from_slice(safety_policy.as_ref());
+    preimage.extend_from_slice(&epoch_id.to_le_bytes());
+    preimage.push(verifiers.len() as u8);
+    preimage.push(threshold);
+    for verifier in verifiers {
+        preimage.extend_from_slice(verifier.as_ref());
+    }
+    hash(&preimage).to_bytes()
+}
 fn is_zero_hash(value: &[u8; 32]) -> bool {
     value.iter().all(|byte| *byte == 0)
 }
@@ -1048,6 +1739,54 @@ fn program_data_address(program: &Pubkey) -> Pubkey {
 pub enum FaultlineError {
     #[msg("Arithmetic overflow")]
     ArithmeticOverflow,
+    #[msg("A confirmed invariant violation permanently blocks this proposal")]
+    ConfirmedInvariantViolation,
+    #[msg("Verification counter overflow")]
+    CounterOverflow,
+    #[msg("Verification counter underflow")]
+    CounterUnderflow,
+    #[msg("Verifier appears more than once in the epoch")]
+    DuplicateVerifier,
+    #[msg("Verifier set must not be empty")]
+    EmptyVerifierSet,
+    #[msg("Verifier threshold is invalid")]
+    InvalidThreshold,
+    #[msg("No active verifier epoch is configured")]
+    NoActiveVerifierEpoch,
+    #[msg("Replay result has not reached quorum")]
+    QuorumNotReached,
+    #[msg("Replay result commitment does not match its bound inputs")]
+    ReplayResultMismatch,
+    #[msg("A verification round already exists for this trace claim")]
+    RoundAlreadyExists,
+    #[msg("Verification round is not open")]
+    RoundNotOpen,
+    #[msg("Verifier set exceeds the protocol maximum")]
+    TooManyVerifiers,
+    #[msg("Signer is not a member of the round's verifier epoch")]
+    UnauthorizedVerifier,
+    #[msg("Verifier already attested in this round")]
+    VerifierAlreadyAttested,
+    #[msg("A verification round is still pending")]
+    VerificationPending,
+    #[msg("The verification window has ended or too little time remains")]
+    VerificationWindowEnded,
+    #[msg("Challenge commitment has not been revealed")]
+    ChallengeNotRevealed,
+    #[msg("Account belongs to another invariant")]
+    WrongInvariantBinding,
+    #[msg("Account belongs to another policy")]
+    WrongPolicyBinding,
+    #[msg("Account belongs to another proposal")]
+    WrongProposalBinding,
+    #[msg("Replay result belongs to another verification round")]
+    WrongRoundBinding,
+    #[msg("Replay result binding is incorrect")]
+    WrongResultBinding,
+    #[msg("Trace account binding is incorrect")]
+    WrongTraceBinding,
+    #[msg("Verifier epoch binding is incorrect")]
+    WrongVerifierEpoch,
     #[msg("Challenge commitment was already revealed")]
     ChallengeAlreadyRevealed,
     #[msg("Proposal is not in an active challenge state")]
@@ -1152,5 +1891,36 @@ mod tests {
                 0x0c, 0x41, 0x74, 0xf0,
             ]
         );
+    }
+
+    #[test]
+    fn replay_result_commitment_vector_is_stable() {
+        let actual = replay_result_commitment(
+            &Pubkey::new_from_array([1; 32]),
+            &Pubkey::new_from_array([2; 32]),
+            &Pubkey::new_from_array([3; 32]),
+            &[4; 32],
+            &[5; 32],
+            ReplayVerdict::InvariantViolated,
+            &[6; 32],
+        );
+        assert_eq!(
+            actual,
+            [
+                0xb7, 0xeb, 0x26, 0x65, 0x42, 0xe0, 0x99, 0xbd, 0x41, 0x39, 0x8d, 0x8b, 0x78, 0xd6,
+                0xd5, 0x71, 0xb5, 0x78, 0x44, 0x35, 0x6b, 0xfe, 0x7c, 0x6f, 0x55, 0x39, 0xa7, 0x3e,
+                0x00, 0x04, 0x69, 0x21,
+            ]
+        );
+    }
+
+    #[test]
+    fn milestone_five_account_sizes_are_stable() {
+        assert_eq!(8 + VerifierRegistry::INIT_SPACE, 122);
+        assert_eq!(8 + VerifierEpoch::INIT_SPACE, 414);
+        assert_eq!(8 + ProposalVerificationGate::INIT_SPACE, 77);
+        assert_eq!(8 + VerificationRound::INIT_SPACE, 317);
+        assert_eq!(8 + ReplayResult::INIT_SPACE, 115);
+        assert_eq!(8 + VerifierAttestation::INIT_SPACE, 177);
     }
 }

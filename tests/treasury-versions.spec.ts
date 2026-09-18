@@ -299,6 +299,7 @@ async function guardedUpgradeToScenario(): Promise<void> {
   console.log("[1] SafetyPolicy created");
   const proposalNumber = 1n;
   const [proposal] = PublicKey.findProgramAddressSync([Buffer.from("upgrade-proposal"), policy.toBuffer(), u64(proposalNumber)], gateProgram);
+  const [verificationGate] = PublicKey.findProgramAddressSync([Buffer.from("proposal-verification-gate"), proposal.toBuffer()], gateProgram);
   const [claim] = PublicKey.findProgramAddressSync([Buffer.from("faultline"), Buffer.from("buffer"), selectedBuffer.toBuffer()], gateProgram);
   const bufferInfo = await connection.getAccountInfo(selectedBuffer, COMMITMENT);
   assert(bufferInfo, "candidate buffer missing for canonical proposal");
@@ -308,7 +309,7 @@ async function guardedUpgradeToScenario(): Promise<void> {
     { pubkey: proposer.publicKey, isSigner: true, isWritable: true }, { pubkey: guardPda, isSigner: false, isWritable: true },
     { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: treasuryProgram, isSigner: false, isWritable: false },
     { pubkey: treasuryProgramData, isSigner: false, isWritable: false }, { pubkey: selectedBuffer, isSigner: false, isWritable: false },
-    { pubkey: proposal, isSigner: false, isWritable: true }, { pubkey: claim, isSigner: false, isWritable: true },
+    { pubkey: proposal, isSigner: false, isWritable: true }, { pubkey: verificationGate, isSigner: false, isWritable: true }, { pubkey: claim, isSigner: false, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
   ], Buffer.concat([u64(proposalNumber), candidateHash])), proposer)}`);
   console.log("[2] UpgradeProposal created in Draft");
@@ -318,7 +319,7 @@ async function guardedUpgradeToScenario(): Promise<void> {
   console.log("[3] Challenge started with start/end slots");
   const lifecycleExecute = () => anchorInstruction(gateProgram, "execute_guarded_upgrade", [
     { pubkey: random.publicKey, isSigner: true, isWritable: false }, { pubkey: guardPda, isSigner: false, isWritable: false },
-    { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposal, isSigner: false, isWritable: true }, { pubkey: claim, isSigner: false, isWritable: false },
+    { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposal, isSigner: false, isWritable: true }, { pubkey: verificationGate, isSigner: false, isWritable: false }, { pubkey: claim, isSigner: false, isWritable: false },
     { pubkey: treasuryProgram, isSigner: false, isWritable: true }, { pubkey: treasuryProgramData, isSigner: false, isWritable: true },
     { pubkey: selectedBuffer, isSigner: false, isWritable: true }, { pubkey: governance.publicKey, isSigner: false, isWritable: true },
     { pubkey: SYSVAR_RENT, isSigner: false, isWritable: false }, { pubkey: SYSVAR_CLOCK, isSigner: false, isWritable: false }, { pubkey: LOADER_V3, isSigner: false, isWritable: false }
@@ -326,7 +327,7 @@ async function guardedUpgradeToScenario(): Promise<void> {
   await expectFailure("Draft/ChallengeActive execution blocked", () => send(connection, lifecycleExecute(), random));
   console.log("[4] Early execution correctly rejected");
   console.log(`Temporary approve: ${await send(connection, anchorInstruction(gateProgram, "record_temporary_decision", [
-    { pubkey: governance.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposal, isSigner: false, isWritable: true }
+    { pubkey: governance.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposal, isSigner: false, isWritable: true }, { pubkey: verificationGate, isSigner: false, isWritable: false }
   ], Buffer.from([2, 0, 0])), governance)}`);
   console.log("[5] Governance temporary approval recorded");
   const proposalInfo = await connection.getAccountInfo(proposal, COMMITMENT);
