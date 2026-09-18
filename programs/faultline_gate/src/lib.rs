@@ -1468,6 +1468,377 @@ pub mod faultline_gate {
         Ok(())
     }
 
+    pub fn close_finalized_round_economics(
+        ctx: Context<CloseFinalizedRoundEconomics>,
+    ) -> Result<()> {
+        require_open_round_economics(ctx.accounts.round_economic_state.status)?;
+        require!(
+            ctx.accounts.verification_round.finalized_slot.is_some(),
+            FaultlineError::RoundNotFinalized
+        );
+        let new_unclosed_rounds = decrement_liability(
+            ctx.accounts.proposal_escrow.unclosed_rounds,
+            FaultlineError::UnclosedRoundsUnderflow,
+        )?;
+        let new_status = match ctx.accounts.verification_round.status {
+            VerificationRoundStatus::InvariantHolds => RoundEconomicStatus::FinalizedHold,
+            VerificationRoundStatus::InvariantViolated => {
+                require!(
+                    ctx.accounts.proposal_verification_gate.confirmed_violation,
+                    FaultlineError::WrongWinningRound
+                );
+                require!(
+                    ctx.accounts.proposal_verification_gate.last_violation_round
+                        == Some(ctx.accounts.verification_round.key()),
+                    FaultlineError::WrongWinningRound
+                );
+                let (winning_round, winning_trace_claim) = canonical_winner(
+                    ctx.accounts.proposal_escrow.winning_round,
+                    ctx.accounts.proposal_escrow.winning_trace_claim,
+                    ctx.accounts.proposal_verification_gate.last_violation_round,
+                    ctx.accounts.verification_round.key(),
+                    ctx.accounts.verification_round.trace_claim,
+                )?;
+                ctx.accounts.proposal_escrow.winning_round = Some(winning_round);
+                ctx.accounts.proposal_escrow.winning_trace_claim = Some(winning_trace_claim);
+                RoundEconomicStatus::FinalizedViolation
+            }
+            VerificationRoundStatus::Open => return err!(FaultlineError::RoundNotFinalized),
+        };
+        ctx.accounts.round_economic_state.status = new_status;
+        ctx.accounts.round_economic_state.closed_at_slot = Some(Clock::get()?.slot);
+        ctx.accounts.proposal_escrow.unclosed_rounds = new_unclosed_rounds;
+        Ok(())
+    }
+
+    pub fn close_unfinalized_round_economics(
+        ctx: Context<CloseUnfinalizedRoundEconomics>,
+    ) -> Result<()> {
+        require_open_round_economics(ctx.accounts.round_economic_state.status)?;
+        require!(
+            ctx.accounts.verification_round.status == VerificationRoundStatus::Open
+                && ctx.accounts.verification_round.finalized_slot.is_none(),
+            FaultlineError::RoundAlreadyFinalized
+        );
+        let end = ctx
+            .accounts
+            .proposal
+            .challenge_end_slot
+            .ok_or(FaultlineError::MissingChallengeWindow)?;
+        let slot = Clock::get()?.slot;
+        require!(
+            strictly_after_deadline(slot, end),
+            FaultlineError::ChallengeWindowStillActive
+        );
+        let new_status = unfinalized_round_economic_status(
+            ctx.accounts.proposal.state,
+            ctx.accounts.proposal_verification_gate.confirmed_violation,
+            ctx.accounts.proposal_verification_gate.last_violation_round,
+            ctx.accounts.verification_round.key(),
+        )?;
+        let new_unclosed_rounds = decrement_liability(
+            ctx.accounts.proposal_escrow.unclosed_rounds,
+            FaultlineError::UnclosedRoundsUnderflow,
+        )?;
+        ctx.accounts.round_economic_state.status = new_status;
+        ctx.accounts.round_economic_state.closed_at_slot = Some(slot);
+        ctx.accounts.proposal_escrow.unclosed_rounds = new_unclosed_rounds;
+        Ok(())
+    }
+
+    pub fn settle_accepted_challenge(ctx: Context<SettleAcceptedChallenge>) -> Result<()> {
+        validate_settlement_base(&ctx.accounts.base)?;
+        require!(
+            ctx.accounts.round_economic_state.status == RoundEconomicStatus::FinalizedViolation,
+            FaultlineError::WrongRoundEconomicStatus
+        );
+        require!(
+            ctx.accounts.challenge_commit.status == ChallengeCommitStatus::Revealed,
+            FaultlineError::ChallengeNotRevealed
+        );
+        require_canonical_accepted_winner(
+            ctx.accounts.proposal_verification_gate.confirmed_violation,
+            ctx.accounts.proposal_verification_gate.last_violation_round,
+            ctx.accounts.base.proposal_escrow.winning_round,
+            ctx.accounts.base.proposal_escrow.winning_trace_claim,
+            ctx.accounts.verification_round.key(),
+            ctx.accounts.trace_claim.key(),
+        )?;
+        require!(
+            ctx.accounts.challenge_bond.status == BondStatus::Pending,
+            FaultlineError::BondNotPending
+        );
+        require!(
+            ctx.accounts.base.proposal_escrow.bounty_status == BountyStatus::Pending,
+            FaultlineError::BountyAlreadySettled
+        );
+        require!(
+            ctx.accounts
+                .base
+                .proposal_escrow
+                .bounty_settled_at_slot
+                .is_none()
+                && ctx.accounts.base.proposal_escrow.bounty_paid == 0,
+            FaultlineError::BountyAlreadySettled
+        );
+        validate_canonical_ata(
+            &ctx.accounts.hunter_token_account.to_account_info(),
+            &ctx.accounts.challenge_bond.hunter,
+            &ctx.accounts.base.economic_policy.payment_mint,
+        )?;
+        let bounty = validate_token_vault(
+            &ctx.accounts.bounty_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+            &ctx.accounts.base.proposal_escrow.key(),
+        )?;
+        let configured_bounty = configured_bounty_payout(
+            bounty.amount,
+            ctx.accounts.base.proposal_escrow.bounty_amount,
+        )?;
+        let bond_vault = validate_bond_vault(
+            &ctx.accounts.challenge_bond,
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+        )?;
+        let new_unsettled = decrement_liability(
+            ctx.accounts.base.proposal_escrow.unsettled_bonds,
+            FaultlineError::UnsettledBondsUnderflow,
+        )?;
+        let (bounty_amount, bond_amount) =
+            accepted_settlement_amounts(configured_bounty, ctx.accounts.challenge_bond.amount);
+        transfer_from_proposal_escrow(
+            &ctx.accounts.base,
+            &ctx.accounts.bounty_vault.to_account_info(),
+            &ctx.accounts.hunter_token_account.to_account_info(),
+            bounty_amount,
+        )?;
+        transfer_from_challenge_bond(
+            &ctx.accounts.base,
+            &ctx.accounts.challenge_commit,
+            &ctx.accounts.challenge_bond,
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.hunter_token_account.to_account_info(),
+            bond_vault.amount,
+        )?;
+        close_empty_bond_vault(
+            &ctx.accounts.base,
+            &ctx.accounts.challenge_commit,
+            &ctx.accounts.challenge_bond,
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.rent_recipient.to_account_info(),
+        )?;
+        let slot = Clock::get()?.slot;
+        ctx.accounts.base.proposal_escrow.bounty_status = BountyStatus::PaidToHunter;
+        ctx.accounts.base.proposal_escrow.bounty_settled_at_slot = Some(slot);
+        ctx.accounts.base.proposal_escrow.bounty_paid = bounty_amount;
+        ctx.accounts.base.proposal_escrow.unsettled_bonds = new_unsettled;
+        ctx.accounts.challenge_bond.status = BondStatus::AcceptedReturned;
+        ctx.accounts.challenge_bond.settled_at_slot = Some(slot);
+        ctx.accounts.challenge_bond.refunded_amount = bond_amount;
+        ctx.accounts.challenge_bond.forfeited_amount = 0;
+        Ok(())
+    }
+
+    pub fn settle_hold_challenge(ctx: Context<SettleHoldChallenge>) -> Result<()> {
+        validate_settlement_base(&ctx.accounts.base)?;
+        require!(
+            ctx.accounts.round_economic_state.status == RoundEconomicStatus::FinalizedHold,
+            FaultlineError::WrongRoundEconomicStatus
+        );
+        require!(
+            ctx.accounts.challenge_commit.status == ChallengeCommitStatus::Revealed,
+            FaultlineError::ChallengeNotRevealed
+        );
+        require!(
+            ctx.accounts.challenge_bond.status == BondStatus::Pending,
+            FaultlineError::BondNotPending
+        );
+        validate_canonical_ata(
+            &ctx.accounts.hunter_token_account.to_account_info(),
+            &ctx.accounts.challenge_bond.hunter,
+            &ctx.accounts.base.economic_policy.payment_mint,
+        )?;
+        let bond_vault = validate_bond_vault(
+            &ctx.accounts.challenge_bond,
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+        )?;
+        validate_token_vault(
+            &ctx.accounts.penalty_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+            &ctx.accounts.base.proposal_escrow.key(),
+        )?;
+        let (penalty, refund) = hold_bond_split(ctx.accounts.challenge_bond.amount)?;
+        let new_unsettled = decrement_liability(
+            ctx.accounts.base.proposal_escrow.unsettled_bonds,
+            FaultlineError::UnsettledBondsUnderflow,
+        )?;
+        transfer_from_challenge_bond(
+            &ctx.accounts.base,
+            &ctx.accounts.challenge_commit,
+            &ctx.accounts.challenge_bond,
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.penalty_vault.to_account_info(),
+            penalty,
+        )?;
+        transfer_from_challenge_bond(
+            &ctx.accounts.base,
+            &ctx.accounts.challenge_commit,
+            &ctx.accounts.challenge_bond,
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.hunter_token_account.to_account_info(),
+            refund,
+        )?;
+        require!(
+            bond_vault.amount
+                == penalty
+                    .checked_add(refund)
+                    .ok_or(FaultlineError::ArithmeticOverflow)?,
+            FaultlineError::VaultBalanceMismatch
+        );
+        close_empty_bond_vault(
+            &ctx.accounts.base,
+            &ctx.accounts.challenge_commit,
+            &ctx.accounts.challenge_bond,
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.rent_recipient.to_account_info(),
+        )?;
+        settle_bond_tombstone(
+            &mut ctx.accounts.challenge_bond,
+            BondStatus::HoldPenalized,
+            refund,
+            penalty,
+            Clock::get()?.slot,
+        );
+        ctx.accounts.base.proposal_escrow.unsettled_bonds = new_unsettled;
+        Ok(())
+    }
+
+    pub fn settle_non_reveal_challenge(ctx: Context<SettleNonRevealChallenge>) -> Result<()> {
+        validate_settlement_base(&ctx.accounts.base)?;
+        require!(
+            ctx.accounts.challenge_commit.status == ChallengeCommitStatus::Committed,
+            FaultlineError::ChallengeAlreadyRevealed
+        );
+        require!(
+            strictly_after_deadline(
+                Clock::get()?.slot,
+                ctx.accounts.challenge_commit.latest_reveal_slot
+            ),
+            FaultlineError::RevealWindowStillActive
+        );
+        require!(
+            ctx.accounts.challenge_bond.status == BondStatus::Pending,
+            FaultlineError::BondNotPending
+        );
+        let bond_vault = validate_bond_vault(
+            &ctx.accounts.challenge_bond,
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+        )?;
+        validate_token_vault(
+            &ctx.accounts.penalty_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+            &ctx.accounts.base.proposal_escrow.key(),
+        )?;
+        let penalty = penalty_amount(
+            ctx.accounts.challenge_bond.amount,
+            HUNTER_NON_REVEAL_SLASH_BPS,
+        )?;
+        require!(penalty > 0, FaultlineError::ZeroSettlementAmount);
+        require!(
+            bond_vault.amount == penalty,
+            FaultlineError::VaultBalanceMismatch
+        );
+        let new_unsettled = decrement_liability(
+            ctx.accounts.base.proposal_escrow.unsettled_bonds,
+            FaultlineError::UnsettledBondsUnderflow,
+        )?;
+        transfer_from_challenge_bond(
+            &ctx.accounts.base,
+            &ctx.accounts.challenge_commit,
+            &ctx.accounts.challenge_bond,
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.penalty_vault.to_account_info(),
+            penalty,
+        )?;
+        close_empty_bond_vault(
+            &ctx.accounts.base,
+            &ctx.accounts.challenge_commit,
+            &ctx.accounts.challenge_bond,
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.rent_recipient.to_account_info(),
+        )?;
+        settle_bond_tombstone(
+            &mut ctx.accounts.challenge_bond,
+            BondStatus::NonRevealPenalized,
+            0,
+            penalty,
+            Clock::get()?.slot,
+        );
+        ctx.accounts.base.proposal_escrow.unsettled_bonds = new_unsettled;
+        Ok(())
+    }
+
+    pub fn settle_timed_out_or_aborted_challenge(
+        ctx: Context<SettleRoundRefundChallenge>,
+    ) -> Result<()> {
+        validate_settlement_base(&ctx.accounts.base)?;
+        let status = match ctx.accounts.round_economic_state.status {
+            RoundEconomicStatus::TimedOut => BondStatus::TimeoutReturned,
+            RoundEconomicStatus::Aborted => BondStatus::AbortedReturned,
+            _ => return err!(FaultlineError::WrongRoundEconomicStatus),
+        };
+        require!(
+            ctx.accounts.challenge_commit.status == ChallengeCommitStatus::Revealed,
+            FaultlineError::ChallengeNotRevealed
+        );
+        settle_full_bond_refund(
+            &mut ctx.accounts.base,
+            &ctx.accounts.challenge_commit,
+            &mut ctx.accounts.challenge_bond,
+            &ctx.accounts.hunter_token_account.to_account_info(),
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.rent_recipient.to_account_info(),
+            status,
+        )
+    }
+
+    pub fn settle_revealed_unopened_challenge(
+        ctx: Context<SettleRevealedUnopenedChallenge>,
+    ) -> Result<()> {
+        validate_settlement_base(&ctx.accounts.base)?;
+        require!(
+            ctx.accounts.challenge_commit.status == ChallengeCommitStatus::Revealed,
+            FaultlineError::ChallengeNotRevealed
+        );
+        require!(
+            canonical_account_absent(&ctx.accounts.verification_round.to_account_info())
+                && canonical_account_absent(&ctx.accounts.round_economic_state.to_account_info()),
+            FaultlineError::RoundAlreadyExists
+        );
+        let end = ctx
+            .accounts
+            .base
+            .proposal
+            .challenge_end_slot
+            .ok_or(FaultlineError::MissingChallengeWindow)?;
+        let slot = Clock::get()?.slot;
+        require!(
+            revealed_unopened_eligible(ctx.accounts.base.proposal.state, slot, end),
+            FaultlineError::RevealedUnopenedNotEligible
+        );
+        settle_full_bond_refund(
+            &mut ctx.accounts.base,
+            &ctx.accounts.challenge_commit,
+            &mut ctx.accounts.challenge_bond,
+            &ctx.accounts.hunter_token_account.to_account_info(),
+            &ctx.accounts.bond_vault.to_account_info(),
+            &ctx.accounts.rent_recipient.to_account_info(),
+            BondStatus::RevealedUnopenedReturned,
+        )
+    }
+
     pub fn create_replay_result(
         ctx: Context<CreateReplayResult>,
         result_hash: [u8; 32],
@@ -2253,6 +2624,190 @@ pub struct OpenEconomicRoundBindings<'info> {
     #[account(seeds = [VERIFIER_EPOCH_ECONOMICS_SEED, verifier_epoch.key().as_ref(), economic_policy.key().as_ref()], bump = verifier_epoch_economics.bump, constraint = verifier_epoch_economics.verifier_epoch == verifier_epoch.key() @ FaultlineError::WrongVerifierEpoch, constraint = verifier_epoch_economics.economic_policy == economic_policy.key() @ FaultlineError::WrongEconomicPolicy, constraint = verifier_epoch_economics.verifier_registry == verifier_registry.key() @ FaultlineError::WrongVerifierEpoch)]
     pub verifier_epoch_economics: Box<Account<'info, VerifierEpochEconomics>>,
 }
+
+#[derive(Accounts)]
+pub struct CloseFinalizedRoundEconomics<'info> {
+    pub caller: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump)]
+    pub policy: Box<Account<'info, SafetyPolicy>>,
+    #[account(seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
+    pub proposal: Box<Account<'info, UpgradeProposal>>,
+    #[account(mut, seeds = [PROPOSAL_ESCROW_SEED, proposal.key().as_ref()], bump = proposal_escrow.bump, constraint = proposal_escrow.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub proposal_escrow: Box<Account<'info, ProposalEscrow>>,
+    #[account(seeds = [PROPOSAL_VERIFICATION_GATE_SEED, proposal.key().as_ref()], bump = proposal_verification_gate.bump, constraint = proposal_verification_gate.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub proposal_verification_gate: Box<Account<'info, ProposalVerificationGate>>,
+    #[account(seeds = [VERIFICATION_ROUND_SEED, verification_round.trace_claim.as_ref()], bump = verification_round.bump, constraint = verification_round.policy == policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verification_round.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    #[account(mut, seeds = [ROUND_ECONOMICS_SEED, verification_round.key().as_ref()], bump = round_economic_state.bump, constraint = round_economic_state.verification_round == verification_round.key() @ FaultlineError::WrongRoundBinding, constraint = round_economic_state.proposal_escrow == proposal_escrow.key() @ FaultlineError::WrongProposalEscrow)]
+    pub round_economic_state: Box<Account<'info, RoundEconomicState>>,
+}
+
+#[derive(Accounts)]
+pub struct CloseUnfinalizedRoundEconomics<'info> {
+    pub caller: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump)]
+    pub policy: Box<Account<'info, SafetyPolicy>>,
+    #[account(seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
+    pub proposal: Box<Account<'info, UpgradeProposal>>,
+    #[account(mut, seeds = [PROPOSAL_ESCROW_SEED, proposal.key().as_ref()], bump = proposal_escrow.bump, constraint = proposal_escrow.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub proposal_escrow: Box<Account<'info, ProposalEscrow>>,
+    #[account(seeds = [PROPOSAL_VERIFICATION_GATE_SEED, proposal.key().as_ref()], bump = proposal_verification_gate.bump, constraint = proposal_verification_gate.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub proposal_verification_gate: Box<Account<'info, ProposalVerificationGate>>,
+    #[account(seeds = [VERIFICATION_ROUND_SEED, verification_round.trace_claim.as_ref()], bump = verification_round.bump, constraint = verification_round.policy == policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verification_round.proposal == proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    #[account(mut, seeds = [ROUND_ECONOMICS_SEED, verification_round.key().as_ref()], bump = round_economic_state.bump, constraint = round_economic_state.verification_round == verification_round.key() @ FaultlineError::WrongRoundBinding, constraint = round_economic_state.proposal_escrow == proposal_escrow.key() @ FaultlineError::WrongProposalEscrow)]
+    pub round_economic_state: Box<Account<'info, RoundEconomicState>>,
+}
+
+#[derive(Accounts)]
+pub struct EconomicSettlementBase<'info> {
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump)]
+    pub policy: Box<Account<'info, SafetyPolicy>>,
+    #[account(seeds = [ECONOMIC_POLICY_REGISTRY_SEED, policy.key().as_ref()], bump = economic_policy_registry.bump, constraint = economic_policy_registry.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub economic_policy_registry: Box<Account<'info, EconomicPolicyRegistry>>,
+    #[account(seeds = [ECONOMIC_POLICY_SEED, economic_policy_registry.key().as_ref(), &economic_policy.config_id.to_le_bytes()], bump = economic_policy.bump, constraint = economic_policy.economic_policy_registry == economic_policy_registry.key() @ FaultlineError::WrongEconomicPolicy, constraint = economic_policy.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding, constraint = economic_policy.token_program == TOKEN_PROGRAM_ID @ FaultlineError::UnsupportedEconomicTokenProgram)]
+    pub economic_policy: Box<Account<'info, EconomicPolicy>>,
+    #[account(seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
+    pub proposal: Box<Account<'info, UpgradeProposal>>,
+    #[account(mut, seeds = [PROPOSAL_ESCROW_SEED, proposal.key().as_ref()], bump = proposal_escrow.bump, constraint = proposal_escrow.proposal == proposal.key() @ FaultlineError::WrongProposalBinding, constraint = proposal_escrow.economic_policy == economic_policy.key() @ FaultlineError::WrongEconomicPolicy, constraint = proposal_escrow.payment_mint == economic_policy.payment_mint @ FaultlineError::WrongPaymentMint)]
+    pub proposal_escrow: Box<Account<'info, ProposalEscrow>>,
+    /// CHECK: immutable legacy mint bound by EconomicPolicy.
+    #[account(address = economic_policy.payment_mint @ FaultlineError::WrongPaymentMint)]
+    pub payment_mint: UncheckedAccount<'info>,
+    /// CHECK: fixed legacy SPL Token program.
+    #[account(address = TOKEN_PROGRAM_ID @ FaultlineError::UnsupportedEconomicTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SettleAcceptedChallenge<'info> {
+    pub caller: Signer<'info>,
+    pub base: EconomicSettlementBase<'info>,
+    #[account(seeds = [PROPOSAL_VERIFICATION_GATE_SEED, base.proposal.key().as_ref()], bump = proposal_verification_gate.bump, constraint = proposal_verification_gate.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub proposal_verification_gate: Box<Account<'info, ProposalVerificationGate>>,
+    #[account(seeds = [TRACE_CLAIM_SEED, base.proposal.key().as_ref(), trace_claim.trace_hash.as_ref()], bump = trace_claim.bump, constraint = trace_claim.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub trace_claim: Box<Account<'info, TraceClaim>>,
+    #[account(seeds = [CHALLENGE_COMMIT_SEED, base.proposal.key().as_ref(), challenge_commit.hunter.as_ref(), challenge_commit.commitment_hash.as_ref()], bump = challenge_commit.bump, constraint = challenge_commit.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding, constraint = challenge_commit.invariant == trace_claim.invariant @ FaultlineError::WrongInvariantBinding, constraint = trace_claim.challenge_commit == challenge_commit.key() @ FaultlineError::WrongTraceBinding, constraint = trace_claim.hunter == challenge_commit.hunter @ FaultlineError::UnauthorizedHunter, constraint = challenge_commit.revealed_trace_hash == Some(trace_claim.trace_hash) @ FaultlineError::WrongTraceBinding)]
+    pub challenge_commit: Box<Account<'info, ChallengeCommit>>,
+    #[account(mut, seeds = [CHALLENGE_BOND_SEED, challenge_commit.key().as_ref()], bump = challenge_bond.bump, constraint = challenge_bond.challenge_commit == challenge_commit.key() @ FaultlineError::WrongChallengeBond, constraint = challenge_bond.proposal_escrow == base.proposal_escrow.key() @ FaultlineError::WrongProposalEscrow, constraint = challenge_bond.hunter == challenge_commit.hunter @ FaultlineError::UnauthorizedHunter)]
+    pub challenge_bond: Box<Account<'info, ChallengeBond>>,
+    #[account(seeds = [VERIFICATION_ROUND_SEED, trace_claim.key().as_ref()], bump = verification_round.bump, constraint = verification_round.policy == base.policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verification_round.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding, constraint = verification_round.invariant == trace_claim.invariant @ FaultlineError::WrongInvariantBinding, constraint = verification_round.trace_claim == trace_claim.key() @ FaultlineError::WrongTraceBinding, constraint = verification_round.trace_hash == trace_claim.trace_hash @ FaultlineError::WrongTraceBinding)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    #[account(seeds = [ROUND_ECONOMICS_SEED, verification_round.key().as_ref()], bump = round_economic_state.bump, constraint = round_economic_state.verification_round == verification_round.key() @ FaultlineError::WrongRoundBinding, constraint = round_economic_state.proposal_escrow == base.proposal_escrow.key() @ FaultlineError::WrongProposalEscrow)]
+    pub round_economic_state: Box<Account<'info, RoundEconomicState>>,
+    /// CHECK: validated as recorded hunter's canonical ATA.
+    #[account(mut)]
+    pub hunter_token_account: UncheckedAccount<'info>,
+    /// CHECK: validated Tokenkeg vault controlled by ProposalEscrow.
+    #[account(mut, address = base.proposal_escrow.bounty_vault @ FaultlineError::WrongVault)]
+    pub bounty_vault: UncheckedAccount<'info>,
+    /// CHECK: validated Tokenkeg vault controlled by ChallengeBond.
+    #[account(mut, address = challenge_bond.bond_vault @ FaultlineError::WrongVault)]
+    pub bond_vault: UncheckedAccount<'info>,
+    /// CHECK: immutable recorded hunter rent recipient.
+    #[account(mut, address = challenge_bond.rent_recipient @ FaultlineError::WrongRentRecipient)]
+    pub rent_recipient: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SettleHoldChallenge<'info> {
+    pub caller: Signer<'info>,
+    pub base: EconomicSettlementBase<'info>,
+    #[account(seeds = [TRACE_CLAIM_SEED, base.proposal.key().as_ref(), trace_claim.trace_hash.as_ref()], bump = trace_claim.bump, constraint = trace_claim.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub trace_claim: Box<Account<'info, TraceClaim>>,
+    #[account(seeds = [CHALLENGE_COMMIT_SEED, base.proposal.key().as_ref(), challenge_commit.hunter.as_ref(), challenge_commit.commitment_hash.as_ref()], bump = challenge_commit.bump, constraint = challenge_commit.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding, constraint = challenge_commit.invariant == trace_claim.invariant @ FaultlineError::WrongInvariantBinding, constraint = trace_claim.challenge_commit == challenge_commit.key() @ FaultlineError::WrongTraceBinding, constraint = trace_claim.hunter == challenge_commit.hunter @ FaultlineError::UnauthorizedHunter, constraint = challenge_commit.revealed_trace_hash == Some(trace_claim.trace_hash) @ FaultlineError::WrongTraceBinding)]
+    pub challenge_commit: Box<Account<'info, ChallengeCommit>>,
+    #[account(mut, seeds = [CHALLENGE_BOND_SEED, challenge_commit.key().as_ref()], bump = challenge_bond.bump, constraint = challenge_bond.challenge_commit == challenge_commit.key() @ FaultlineError::WrongChallengeBond, constraint = challenge_bond.proposal_escrow == base.proposal_escrow.key() @ FaultlineError::WrongProposalEscrow, constraint = challenge_bond.hunter == challenge_commit.hunter @ FaultlineError::UnauthorizedHunter)]
+    pub challenge_bond: Box<Account<'info, ChallengeBond>>,
+    #[account(seeds = [VERIFICATION_ROUND_SEED, trace_claim.key().as_ref()], bump = verification_round.bump, constraint = verification_round.policy == base.policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verification_round.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding, constraint = verification_round.invariant == trace_claim.invariant @ FaultlineError::WrongInvariantBinding, constraint = verification_round.trace_claim == trace_claim.key() @ FaultlineError::WrongTraceBinding, constraint = verification_round.trace_hash == trace_claim.trace_hash @ FaultlineError::WrongTraceBinding)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    #[account(seeds = [ROUND_ECONOMICS_SEED, verification_round.key().as_ref()], bump = round_economic_state.bump, constraint = round_economic_state.verification_round == verification_round.key() @ FaultlineError::WrongRoundBinding, constraint = round_economic_state.proposal_escrow == base.proposal_escrow.key() @ FaultlineError::WrongProposalEscrow)]
+    pub round_economic_state: Box<Account<'info, RoundEconomicState>>,
+    /// CHECK: canonical recorded hunter ATA.
+    #[account(mut)]
+    pub hunter_token_account: UncheckedAccount<'info>,
+    /// CHECK: validated Tokenkeg vault controlled by ChallengeBond.
+    #[account(mut, address = challenge_bond.bond_vault @ FaultlineError::WrongVault)]
+    pub bond_vault: UncheckedAccount<'info>,
+    /// CHECK: validated Tokenkeg vault controlled by ProposalEscrow.
+    #[account(mut, address = base.proposal_escrow.penalty_vault @ FaultlineError::WrongVault)]
+    pub penalty_vault: UncheckedAccount<'info>,
+    /// CHECK: immutable recorded hunter rent recipient.
+    #[account(mut, address = challenge_bond.rent_recipient @ FaultlineError::WrongRentRecipient)]
+    pub rent_recipient: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SettleNonRevealChallenge<'info> {
+    pub caller: Signer<'info>,
+    pub base: EconomicSettlementBase<'info>,
+    #[account(seeds = [CHALLENGE_COMMIT_SEED, base.proposal.key().as_ref(), challenge_commit.hunter.as_ref(), challenge_commit.commitment_hash.as_ref()], bump = challenge_commit.bump, constraint = challenge_commit.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub challenge_commit: Box<Account<'info, ChallengeCommit>>,
+    #[account(mut, seeds = [CHALLENGE_BOND_SEED, challenge_commit.key().as_ref()], bump = challenge_bond.bump, constraint = challenge_bond.challenge_commit == challenge_commit.key() @ FaultlineError::WrongChallengeBond, constraint = challenge_bond.proposal_escrow == base.proposal_escrow.key() @ FaultlineError::WrongProposalEscrow, constraint = challenge_bond.hunter == challenge_commit.hunter @ FaultlineError::UnauthorizedHunter)]
+    pub challenge_bond: Box<Account<'info, ChallengeBond>>,
+    /// CHECK: validated Tokenkeg vault controlled by ChallengeBond.
+    #[account(mut, address = challenge_bond.bond_vault @ FaultlineError::WrongVault)]
+    pub bond_vault: UncheckedAccount<'info>,
+    /// CHECK: validated Tokenkeg vault controlled by ProposalEscrow.
+    #[account(mut, address = base.proposal_escrow.penalty_vault @ FaultlineError::WrongVault)]
+    pub penalty_vault: UncheckedAccount<'info>,
+    /// CHECK: immutable recorded hunter rent recipient.
+    #[account(mut, address = challenge_bond.rent_recipient @ FaultlineError::WrongRentRecipient)]
+    pub rent_recipient: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SettleRoundRefundChallenge<'info> {
+    pub caller: Signer<'info>,
+    pub base: EconomicSettlementBase<'info>,
+    #[account(seeds = [TRACE_CLAIM_SEED, base.proposal.key().as_ref(), trace_claim.trace_hash.as_ref()], bump = trace_claim.bump, constraint = trace_claim.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub trace_claim: Box<Account<'info, TraceClaim>>,
+    #[account(seeds = [CHALLENGE_COMMIT_SEED, base.proposal.key().as_ref(), challenge_commit.hunter.as_ref(), challenge_commit.commitment_hash.as_ref()], bump = challenge_commit.bump, constraint = challenge_commit.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding, constraint = challenge_commit.invariant == trace_claim.invariant @ FaultlineError::WrongInvariantBinding, constraint = trace_claim.challenge_commit == challenge_commit.key() @ FaultlineError::WrongTraceBinding, constraint = trace_claim.hunter == challenge_commit.hunter @ FaultlineError::UnauthorizedHunter, constraint = challenge_commit.revealed_trace_hash == Some(trace_claim.trace_hash) @ FaultlineError::WrongTraceBinding)]
+    pub challenge_commit: Box<Account<'info, ChallengeCommit>>,
+    #[account(mut, seeds = [CHALLENGE_BOND_SEED, challenge_commit.key().as_ref()], bump = challenge_bond.bump, constraint = challenge_bond.challenge_commit == challenge_commit.key() @ FaultlineError::WrongChallengeBond, constraint = challenge_bond.proposal_escrow == base.proposal_escrow.key() @ FaultlineError::WrongProposalEscrow, constraint = challenge_bond.hunter == challenge_commit.hunter @ FaultlineError::UnauthorizedHunter)]
+    pub challenge_bond: Box<Account<'info, ChallengeBond>>,
+    #[account(seeds = [VERIFICATION_ROUND_SEED, trace_claim.key().as_ref()], bump = verification_round.bump, constraint = verification_round.policy == base.policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verification_round.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding, constraint = verification_round.invariant == trace_claim.invariant @ FaultlineError::WrongInvariantBinding, constraint = verification_round.trace_claim == trace_claim.key() @ FaultlineError::WrongTraceBinding, constraint = verification_round.trace_hash == trace_claim.trace_hash @ FaultlineError::WrongTraceBinding)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    #[account(seeds = [ROUND_ECONOMICS_SEED, verification_round.key().as_ref()], bump = round_economic_state.bump, constraint = round_economic_state.verification_round == verification_round.key() @ FaultlineError::WrongRoundBinding, constraint = round_economic_state.proposal_escrow == base.proposal_escrow.key() @ FaultlineError::WrongProposalEscrow)]
+    pub round_economic_state: Box<Account<'info, RoundEconomicState>>,
+    /// CHECK: canonical recorded hunter ATA.
+    #[account(mut)]
+    pub hunter_token_account: UncheckedAccount<'info>,
+    /// CHECK: validated Tokenkeg vault controlled by ChallengeBond.
+    #[account(mut, address = challenge_bond.bond_vault @ FaultlineError::WrongVault)]
+    pub bond_vault: UncheckedAccount<'info>,
+    /// CHECK: immutable recorded hunter rent recipient.
+    #[account(mut, address = challenge_bond.rent_recipient @ FaultlineError::WrongRentRecipient)]
+    pub rent_recipient: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SettleRevealedUnopenedChallenge<'info> {
+    pub caller: Signer<'info>,
+    pub base: EconomicSettlementBase<'info>,
+    #[account(seeds = [TRACE_CLAIM_SEED, base.proposal.key().as_ref(), trace_claim.trace_hash.as_ref()], bump = trace_claim.bump, constraint = trace_claim.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub trace_claim: Box<Account<'info, TraceClaim>>,
+    #[account(seeds = [CHALLENGE_COMMIT_SEED, base.proposal.key().as_ref(), challenge_commit.hunter.as_ref(), challenge_commit.commitment_hash.as_ref()], bump = challenge_commit.bump, constraint = challenge_commit.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding, constraint = challenge_commit.invariant == trace_claim.invariant @ FaultlineError::WrongInvariantBinding, constraint = trace_claim.challenge_commit == challenge_commit.key() @ FaultlineError::WrongTraceBinding, constraint = trace_claim.hunter == challenge_commit.hunter @ FaultlineError::UnauthorizedHunter, constraint = challenge_commit.revealed_trace_hash == Some(trace_claim.trace_hash) @ FaultlineError::WrongTraceBinding)]
+    pub challenge_commit: Box<Account<'info, ChallengeCommit>>,
+    #[account(mut, seeds = [CHALLENGE_BOND_SEED, challenge_commit.key().as_ref()], bump = challenge_bond.bump, constraint = challenge_bond.challenge_commit == challenge_commit.key() @ FaultlineError::WrongChallengeBond, constraint = challenge_bond.proposal_escrow == base.proposal_escrow.key() @ FaultlineError::WrongProposalEscrow, constraint = challenge_bond.hunter == challenge_commit.hunter @ FaultlineError::UnauthorizedHunter)]
+    pub challenge_bond: Box<Account<'info, ChallengeBond>>,
+    /// CHECK: canonical PDA must remain an absent, empty system account.
+    #[account(mut, seeds = [VERIFICATION_ROUND_SEED, trace_claim.key().as_ref()], bump)]
+    pub verification_round: UncheckedAccount<'info>,
+    /// CHECK: canonical PDA must remain an absent, empty system account.
+    #[account(mut, seeds = [ROUND_ECONOMICS_SEED, verification_round.key().as_ref()], bump)]
+    pub round_economic_state: UncheckedAccount<'info>,
+    /// CHECK: canonical recorded hunter ATA.
+    #[account(mut)]
+    pub hunter_token_account: UncheckedAccount<'info>,
+    /// CHECK: validated Tokenkeg vault controlled by ChallengeBond.
+    #[account(mut, address = challenge_bond.bond_vault @ FaultlineError::WrongVault)]
+    pub bond_vault: UncheckedAccount<'info>,
+    /// CHECK: immutable recorded hunter rent recipient.
+    #[account(mut, address = challenge_bond.rent_recipient @ FaultlineError::WrongRentRecipient)]
+    pub rent_recipient: UncheckedAccount<'info>,
+}
+
 #[derive(Accounts)]
 #[instruction(result_hash: [u8; 32])]
 pub struct CreateReplayResult<'info> {
@@ -3426,6 +3981,7 @@ fn validate_economic_policy_parameters(parameters: &EconomicPolicyParameters) ->
         parameters.challenger_bond_amount > 0,
         FaultlineError::ZeroBondAmount
     );
+    hold_bond_split(parameters.challenger_bond_amount)?;
     require!(
         parameters.verifier_fee_amount > 0,
         FaultlineError::ZeroVerifierFee
@@ -3631,6 +4187,286 @@ fn require_fully_funded_untouched_escrow(
             && penalty.amount == 0,
         FaultlineError::EscrowNotFullyFunded
     );
+    Ok(())
+}
+
+fn validate_settlement_base(base: &EconomicSettlementBase) -> Result<()> {
+    require_m6_proposal(&base.proposal, &base.economic_policy_registry)?;
+    require_escrow_policy_parameters(&base.proposal_escrow, &base.economic_policy)?;
+    let mint = parse_mint(&base.payment_mint.to_account_info())?;
+    require!(
+        !mint.has_freeze_authority && mint.decimals == base.economic_policy.payment_mint_decimals,
+        FaultlineError::InvalidEconomicMint
+    );
+    Ok(())
+}
+
+fn validate_bond_vault(
+    bond: &ChallengeBond,
+    vault: &AccountInfo,
+    mint: &Pubkey,
+) -> Result<TokenAccountView> {
+    let authority = Pubkey::find_program_address(
+        &[CHALLENGE_BOND_SEED, bond.challenge_commit.as_ref()],
+        &crate::ID,
+    )
+    .0;
+    let view = validate_token_vault(vault, mint, &authority)?;
+    require!(
+        view.amount == bond.amount,
+        FaultlineError::VaultBalanceMismatch
+    );
+    Ok(view)
+}
+
+fn decrement_liability(value: u8, underflow: FaultlineError) -> Result<u8> {
+    value
+        .checked_sub(1)
+        .ok_or_else(|| anchor_lang::error::Error::from(underflow))
+}
+
+fn require_open_round_economics(status: RoundEconomicStatus) -> Result<()> {
+    require!(
+        status == RoundEconomicStatus::Open,
+        FaultlineError::RoundEconomicsAlreadyClosed
+    );
+    Ok(())
+}
+
+pub fn accepted_settlement_amounts(bounty_amount: u64, bond_amount: u64) -> (u64, u64) {
+    (bounty_amount, bond_amount)
+}
+
+pub fn configured_bounty_payout(vault_balance: u64, configured_bounty: u64) -> Result<u64> {
+    require!(
+        vault_balance >= configured_bounty,
+        FaultlineError::VaultBalanceMismatch
+    );
+    Ok(configured_bounty)
+}
+
+pub fn require_canonical_accepted_winner(
+    confirmed_violation: bool,
+    last_violation_round: Option<Pubkey>,
+    winning_round: Option<Pubkey>,
+    winning_trace_claim: Option<Pubkey>,
+    current_round: Pubkey,
+    current_trace_claim: Pubkey,
+) -> Result<()> {
+    require!(confirmed_violation, FaultlineError::WrongWinningRound);
+    require!(
+        last_violation_round == Some(current_round)
+            && winning_round == Some(current_round)
+            && winning_trace_claim == Some(current_trace_claim),
+        FaultlineError::WrongWinningRound
+    );
+    Ok(())
+}
+
+pub fn canonical_winner(
+    existing_round: Option<Pubkey>,
+    existing_trace: Option<Pubkey>,
+    last_violation_round: Option<Pubkey>,
+    current_round: Pubkey,
+    current_trace: Pubkey,
+) -> Result<(Pubkey, Pubkey)> {
+    require!(
+        last_violation_round == Some(current_round),
+        FaultlineError::WrongWinningRound
+    );
+    require!(
+        existing_round.is_none() && existing_trace.is_none(),
+        FaultlineError::WinningRoundAlreadySelected
+    );
+    Ok((current_round, current_trace))
+}
+
+pub fn hold_bond_split(amount: u64) -> Result<(u64, u64)> {
+    let penalty = penalty_amount(amount, HOLD_BOND_SLASH_BPS)?;
+    require!(penalty > 0, FaultlineError::ZeroSettlementAmount);
+    let refund = amount
+        .checked_sub(penalty)
+        .ok_or(FaultlineError::ArithmeticOverflow)?;
+    Ok((penalty, refund))
+}
+
+pub fn unfinalized_round_economic_status(
+    proposal_state: ProposalState,
+    confirmed_violation: bool,
+    last_violation_round: Option<Pubkey>,
+    current_round: Pubkey,
+) -> Result<RoundEconomicStatus> {
+    if confirmed_violation {
+        let winning_round = last_violation_round.ok_or(FaultlineError::WrongWinningRound)?;
+        require!(
+            proposal_state == ProposalState::Rejected && winning_round != current_round,
+            FaultlineError::WrongWinningRound
+        );
+        Ok(RoundEconomicStatus::Aborted)
+    } else {
+        require!(
+            last_violation_round.is_none(),
+            FaultlineError::WrongWinningRound
+        );
+        Ok(RoundEconomicStatus::TimedOut)
+    }
+}
+
+pub fn revealed_unopened_eligible(
+    proposal_state: ProposalState,
+    current_slot: u64,
+    challenge_end_slot: u64,
+) -> bool {
+    matches!(
+        proposal_state,
+        ProposalState::Rejected | ProposalState::Expired | ProposalState::Executed
+    ) || strictly_after_deadline(current_slot, challenge_end_slot)
+}
+
+fn canonical_account_absent(account: &AccountInfo) -> bool {
+    canonical_account_absent_parts(account.owner, account.data_len(), account.lamports())
+}
+
+pub fn canonical_account_absent_parts(owner: &Pubkey, data_len: usize, _lamports: u64) -> bool {
+    *owner == solana_system_program::ID && data_len == 0
+}
+
+pub fn strictly_after_deadline(current_slot: u64, deadline_slot: u64) -> bool {
+    current_slot > deadline_slot
+}
+
+fn settle_bond_tombstone(
+    bond: &mut ChallengeBond,
+    status: BondStatus,
+    refunded_amount: u64,
+    forfeited_amount: u64,
+    slot: u64,
+) {
+    bond.status = status;
+    bond.settled_at_slot = Some(slot);
+    bond.refunded_amount = refunded_amount;
+    bond.forfeited_amount = forfeited_amount;
+}
+
+fn transfer_from_proposal_escrow<'info>(
+    base: &EconomicSettlementBase<'info>,
+    source: &AccountInfo<'info>,
+    destination: &AccountInfo<'info>,
+    amount: u64,
+) -> Result<()> {
+    let proposal_key = base.proposal.key();
+    let signer_seeds: &[&[u8]] = &[
+        PROPOSAL_ESCROW_SEED,
+        proposal_key.as_ref(),
+        &[base.proposal_escrow.bump],
+    ];
+    spl_token_transfer(
+        &base.token_program.to_account_info(),
+        source,
+        destination,
+        &base.proposal_escrow.to_account_info(),
+        amount,
+        Some(signer_seeds),
+    )
+}
+
+fn transfer_from_challenge_bond<'info>(
+    base: &EconomicSettlementBase<'info>,
+    challenge_commit: &Account<'info, ChallengeCommit>,
+    challenge_bond: &Account<'info, ChallengeBond>,
+    source: &AccountInfo<'info>,
+    destination: &AccountInfo<'info>,
+    amount: u64,
+) -> Result<()> {
+    let commit_key = challenge_commit.key();
+    let signer_seeds: &[&[u8]] = &[
+        CHALLENGE_BOND_SEED,
+        commit_key.as_ref(),
+        &[challenge_bond.bump],
+    ];
+    spl_token_transfer(
+        &base.token_program.to_account_info(),
+        source,
+        destination,
+        &challenge_bond.to_account_info(),
+        amount,
+        Some(signer_seeds),
+    )
+}
+
+fn close_empty_bond_vault<'info>(
+    base: &EconomicSettlementBase<'info>,
+    challenge_commit: &Account<'info, ChallengeCommit>,
+    challenge_bond: &Account<'info, ChallengeBond>,
+    bond_vault: &AccountInfo<'info>,
+    rent_recipient: &AccountInfo<'info>,
+) -> Result<()> {
+    let remaining = validate_token_vault(
+        bond_vault,
+        &base.economic_policy.payment_mint,
+        &challenge_bond.key(),
+    )?;
+    require!(remaining.amount == 0, FaultlineError::VaultBalanceMismatch);
+    let commit_key = challenge_commit.key();
+    let signer_seeds: &[&[u8]] = &[
+        CHALLENGE_BOND_SEED,
+        commit_key.as_ref(),
+        &[challenge_bond.bump],
+    ];
+    spl_token_close(
+        &base.token_program.to_account_info(),
+        bond_vault,
+        rent_recipient,
+        &challenge_bond.to_account_info(),
+        signer_seeds,
+    )
+}
+
+fn settle_full_bond_refund<'info>(
+    base: &mut EconomicSettlementBase<'info>,
+    challenge_commit: &Account<'info, ChallengeCommit>,
+    challenge_bond: &mut Account<'info, ChallengeBond>,
+    hunter_token_account: &AccountInfo<'info>,
+    bond_vault: &AccountInfo<'info>,
+    rent_recipient: &AccountInfo<'info>,
+    status: BondStatus,
+) -> Result<()> {
+    require!(
+        challenge_bond.status == BondStatus::Pending,
+        FaultlineError::BondNotPending
+    );
+    validate_canonical_ata(
+        hunter_token_account,
+        &challenge_bond.hunter,
+        &base.economic_policy.payment_mint,
+    )?;
+    let vault = validate_bond_vault(
+        challenge_bond,
+        bond_vault,
+        &base.economic_policy.payment_mint,
+    )?;
+    let new_unsettled = decrement_liability(
+        base.proposal_escrow.unsettled_bonds,
+        FaultlineError::UnsettledBondsUnderflow,
+    )?;
+    let amount = challenge_bond.amount;
+    transfer_from_challenge_bond(
+        base,
+        challenge_commit,
+        challenge_bond,
+        bond_vault,
+        hunter_token_account,
+        vault.amount,
+    )?;
+    close_empty_bond_vault(
+        base,
+        challenge_commit,
+        challenge_bond,
+        bond_vault,
+        rent_recipient,
+    )?;
+    settle_bond_tombstone(challenge_bond, status, amount, 0, Clock::get()?.slot);
+    base.proposal_escrow.unsettled_bonds = new_unsettled;
     Ok(())
 }
 
@@ -3872,6 +4708,30 @@ pub enum FaultlineError {
     WrongChallengeBond,
     #[msg("Proposal escrow binding is incorrect")]
     WrongProposalEscrow,
+    #[msg("Round economic state is already closed")]
+    RoundEconomicsAlreadyClosed,
+    #[msg("Verification round has not been finalized")]
+    RoundNotFinalized,
+    #[msg("Verification round is already finalized")]
+    RoundAlreadyFinalized,
+    #[msg("Unclosed-round liability counter underflow")]
+    UnclosedRoundsUnderflow,
+    #[msg("Unsettled-bond liability counter underflow")]
+    UnsettledBondsUnderflow,
+    #[msg("Verification round is not the canonical winning violation")]
+    WrongWinningRound,
+    #[msg("A canonical winning violation was already selected")]
+    WinningRoundAlreadySelected,
+    #[msg("Round economic state has the wrong status")]
+    WrongRoundEconomicStatus,
+    #[msg("Proposal bounty was already settled")]
+    BountyAlreadySettled,
+    #[msg("The reveal window is still active")]
+    RevealWindowStillActive,
+    #[msg("Calculated settlement amount must be non-zero")]
+    ZeroSettlementAmount,
+    #[msg("Revealed unopened challenge is not yet eligible for recovery")]
+    RevealedUnopenedNotEligible,
 }
 
 #[cfg(test)]
@@ -4278,6 +5138,196 @@ mod tests {
         assert_eq!(first, 140);
         assert_eq!(overlapping, 180);
         assert_eq!(earlier_round_close, 180);
+    }
+
+    #[test]
+    fn pass_three_a_settlement_amounts_are_exact() {
+        assert_eq!(hold_bond_split(101).unwrap(), (25, 76));
+        assert_eq!(hold_bond_split(4).unwrap(), (1, 3));
+        assert!(hold_bond_split(3).is_err());
+        assert_eq!(
+            penalty_amount(101, HUNTER_NON_REVEAL_SLASH_BPS).unwrap(),
+            101
+        );
+        assert_eq!(accepted_settlement_amounts(700, 300), (700, 300));
+        assert_eq!(configured_bounty_payout(700, 700).unwrap(), 700);
+        assert_eq!(configured_bounty_payout(701, 700).unwrap(), 700);
+        assert!(configured_bounty_payout(699, 700).is_err());
+    }
+
+    #[test]
+    fn canonical_winner_is_selected_once() {
+        let round = Pubkey::new_from_array([21; 32]);
+        let trace = Pubkey::new_from_array([22; 32]);
+        assert_eq!(
+            canonical_winner(None, None, Some(round), round, trace).unwrap(),
+            (round, trace)
+        );
+        assert!(canonical_winner(Some(round), Some(trace), Some(round), round, trace).is_err());
+        assert!(canonical_winner(
+            None,
+            None,
+            Some(Pubkey::new_from_array([23; 32])),
+            round,
+            trace
+        )
+        .is_err());
+        assert!(require_canonical_accepted_winner(
+            true,
+            Some(round),
+            Some(round),
+            Some(trace),
+            round,
+            trace,
+        )
+        .is_ok());
+        assert!(require_canonical_accepted_winner(
+            false,
+            Some(round),
+            Some(round),
+            Some(trace),
+            round,
+            trace,
+        )
+        .is_err());
+        let sibling = Pubkey::new_from_array([24; 32]);
+        assert!(require_canonical_accepted_winner(
+            true,
+            Some(round),
+            Some(round),
+            Some(trace),
+            sibling,
+            trace,
+        )
+        .is_err());
+        assert!(require_canonical_accepted_winner(
+            true,
+            Some(round),
+            Some(round),
+            Some(trace),
+            round,
+            Pubkey::new_from_array([25; 32]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn economic_round_closure_and_liability_replay_guards_are_exact() {
+        assert!(require_open_round_economics(RoundEconomicStatus::Open).is_ok());
+        assert!(require_open_round_economics(RoundEconomicStatus::FinalizedHold).is_err());
+        assert!(require_open_round_economics(RoundEconomicStatus::FinalizedViolation).is_err());
+        assert_eq!(
+            decrement_liability(1, FaultlineError::UnclosedRoundsUnderflow).unwrap(),
+            0
+        );
+        assert!(decrement_liability(0, FaultlineError::UnclosedRoundsUnderflow).is_err());
+        assert_eq!(
+            decrement_liability(1, FaultlineError::UnsettledBondsUnderflow).unwrap(),
+            0
+        );
+        assert!(decrement_liability(0, FaultlineError::UnsettledBondsUnderflow).is_err());
+    }
+
+    #[test]
+    fn timed_out_and_aborted_classification_is_objective() {
+        let current = Pubkey::new_from_array([31; 32]);
+        let winner = Pubkey::new_from_array([32; 32]);
+        assert!(
+            unfinalized_round_economic_status(ProposalState::Approved, false, None, current)
+                .unwrap()
+                == RoundEconomicStatus::TimedOut
+        );
+        assert!(
+            unfinalized_round_economic_status(ProposalState::Rejected, true, Some(winner), current)
+                .unwrap()
+                == RoundEconomicStatus::Aborted
+        );
+        assert!(unfinalized_round_economic_status(
+            ProposalState::Rejected,
+            true,
+            Some(current),
+            current
+        )
+        .is_err());
+        assert!(unfinalized_round_economic_status(
+            ProposalState::Approved,
+            true,
+            Some(winner),
+            current
+        )
+        .is_err());
+        assert!(!strictly_after_deadline(99, 100));
+        assert!(!strictly_after_deadline(100, 100));
+        assert!(strictly_after_deadline(101, 100));
+    }
+
+    #[test]
+    fn revealed_unopened_deadline_and_tombstone_prevent_replay() {
+        assert!(!revealed_unopened_eligible(
+            ProposalState::ChallengeActive,
+            100,
+            100
+        ));
+        assert!(revealed_unopened_eligible(
+            ProposalState::ChallengeActive,
+            101,
+            100
+        ));
+        assert!(revealed_unopened_eligible(ProposalState::Rejected, 50, 100));
+        assert!(revealed_unopened_eligible(ProposalState::Expired, 50, 100));
+        assert!(revealed_unopened_eligible(ProposalState::Executed, 50, 100));
+        assert!(!revealed_unopened_eligible(ProposalState::Draft, 50, 100));
+        assert!(!revealed_unopened_eligible(
+            ProposalState::Approved,
+            50,
+            100
+        ));
+        for status in [
+            BondStatus::AcceptedReturned,
+            BondStatus::HoldPenalized,
+            BondStatus::NonRevealPenalized,
+            BondStatus::TimeoutReturned,
+            BondStatus::AbortedReturned,
+            BondStatus::RevealedUnopenedReturned,
+        ] {
+            assert!(status != BondStatus::Pending);
+        }
+    }
+
+    #[test]
+    fn non_reveal_deadline_is_strict() {
+        assert!(!strictly_after_deadline(99, 100));
+        assert!(!strictly_after_deadline(100, 100));
+        assert!(strictly_after_deadline(101, 100));
+    }
+
+    #[test]
+    fn absent_round_account_classification_allows_only_system_owned_empty_data() {
+        assert!(canonical_account_absent_parts(
+            &solana_system_program::ID,
+            0,
+            0
+        ));
+        assert!(canonical_account_absent_parts(
+            &solana_system_program::ID,
+            0,
+            1_000_000
+        ));
+        assert!(!canonical_account_absent_parts(
+            &crate::ID,
+            RoundEconomicState::INIT_SPACE + 8,
+            1_000_000
+        ));
+        assert!(!canonical_account_absent_parts(
+            &Pubkey::new_from_array([77; 32]),
+            0,
+            1_000_000
+        ));
+        assert!(!canonical_account_absent_parts(
+            &solana_system_program::ID,
+            1,
+            1_000_000
+        ));
     }
 
     #[test]
