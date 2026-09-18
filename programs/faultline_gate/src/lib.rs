@@ -2,7 +2,9 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     bpf_loader_upgradeable::{self, UpgradeableLoaderState},
     hash::{hash, hashv},
-    program::invoke_signed,
+    instruction::{AccountMeta, Instruction},
+    program::{invoke, invoke_signed},
+    system_instruction, system_program as solana_system_program,
 };
 
 declare_id!("9PFPNC6TMNKBCVsm4RoCgVYmqTJJTwnHHuRcysosSCCe");
@@ -22,6 +24,20 @@ const PROPOSAL_VERIFICATION_GATE_SEED: &[u8] = b"proposal-verification-gate";
 const VERIFICATION_ROUND_SEED: &[u8] = b"verification-round";
 const REPLAY_RESULT_SEED: &[u8] = b"replay-result";
 const VERIFIER_ATTESTATION_SEED: &[u8] = b"verifier-attestation";
+pub const ECONOMIC_POLICY_REGISTRY_SEED: &[u8] = b"economic-policy-registry";
+pub const ECONOMIC_POLICY_SEED: &[u8] = b"economic-policy";
+pub const PROPOSAL_ESCROW_SEED: &[u8] = b"proposal-escrow";
+pub const BOUNTY_VAULT_SEED: &[u8] = b"bounty-vault";
+pub const FEE_VAULT_SEED: &[u8] = b"fee-vault";
+pub const PENALTY_VAULT_SEED: &[u8] = b"penalty-vault";
+pub const CHALLENGE_BOND_SEED: &[u8] = b"challenge-bond";
+pub const BOND_VAULT_SEED: &[u8] = b"bond-vault";
+pub const VERIFIER_STAKE_SEED: &[u8] = b"verifier-stake";
+pub const STAKE_VAULT_SEED: &[u8] = b"stake-vault";
+pub const VERIFIER_EPOCH_ECONOMICS_SEED: &[u8] = b"verifier-epoch-economics";
+pub const ROUND_ECONOMICS_SEED: &[u8] = b"round-economics";
+pub const VERIFIER_FEE_CLAIM_SEED: &[u8] = b"verifier-fee-claim";
+pub const VERIFIER_SLASH_SEED: &[u8] = b"verifier-slash";
 const CHALLENGE_DOMAIN: &[u8] = b"FAULTLINE_CHALLENGE_V1";
 const REPLAY_DOMAIN: &[u8] = b"FAULTLINE_REPLAY_V1";
 const VERIFIER_SET_DOMAIN: &[u8] = b"FAULTLINE_VERIFIER_SET_V1";
@@ -30,6 +46,28 @@ const MAX_REVEAL_HORIZON_SLOTS: u64 = 8;
 const MIN_VERIFICATION_REMAINING_SLOTS: u64 = 2;
 const MAX_VERIFIERS: usize = 8;
 const AUTOMATIC_VIOLATION_REASON_CODE: u16 = 0x5001;
+pub const ECONOMIC_POLICY_FIRST_CONFIG_ID: u64 = 0;
+pub const ECONOMIC_ENFORCEMENT_DELAY_SLOTS: u64 = 32;
+pub const MAX_BONDED_CHALLENGES: u8 = 8;
+pub const BPS_DENOMINATOR: u16 = 10_000;
+pub const HOLD_BOND_SLASH_BPS: u16 = 2_500;
+pub const HUNTER_NON_REVEAL_SLASH_BPS: u16 = 10_000;
+pub const MIN_FEE_CLAIM_GRACE_SLOTS: u64 = 1;
+pub const MAX_FEE_CLAIM_GRACE_SLOTS: u64 = 216_000;
+pub const MIN_SLASH_CLAIM_GRACE_SLOTS: u64 = 1;
+pub const MAX_SLASH_CLAIM_GRACE_SLOTS: u64 = 216_000;
+pub const MIN_STAKE_WITHDRAW_COOLDOWN_SLOTS: u64 = 1;
+pub const MAX_STAKE_WITHDRAW_COOLDOWN_SLOTS: u64 = 1_296_000;
+const TOKEN_PROGRAM_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const TOKEN_ACCOUNT_LEN: usize = 165;
+const MINT_LEN: usize = 82;
+const TOKEN_ACCOUNT_INITIALIZED: u8 = 1;
+const SPL_TOKEN_TRANSFER_TAG: u8 = 3;
+const SPL_TOKEN_CLOSE_ACCOUNT_TAG: u8 = 9;
+const SPL_TOKEN_INITIALIZE_ACCOUNT3_TAG: u8 = 18;
 
 #[program]
 pub mod faultline_gate {
@@ -117,6 +155,491 @@ pub mod faultline_gate {
             slot: Clock::get()?.slot,
             old_status,
             new_status: status
+        });
+        Ok(())
+    }
+
+    pub fn initialize_economic_policy_registry(
+        ctx: Context<InitializeEconomicPolicyRegistry>,
+    ) -> Result<()> {
+        let slot = Clock::get()?.slot;
+        let enforcement_slot = slot
+            .checked_add(ECONOMIC_ENFORCEMENT_DELAY_SLOTS)
+            .ok_or(FaultlineError::ArithmeticOverflow)?;
+        let registry = &mut ctx.accounts.economic_policy_registry;
+        registry.safety_policy = ctx.accounts.policy.key();
+        registry.governance = ctx.accounts.governance.key();
+        registry.next_config_id = ECONOMIC_POLICY_FIRST_CONFIG_ID;
+        registry.economic_enforcement_slot = enforcement_slot;
+        registry.created_at_slot = slot;
+        registry.bump = ctx.bumps.economic_policy_registry;
+        emit!(EconomicPolicyRegistryInitialized {
+            safety_policy: registry.safety_policy,
+            economic_policy_registry: registry.key(),
+            governance: registry.governance,
+            economic_enforcement_slot: enforcement_slot,
+            slot,
+        });
+        Ok(())
+    }
+
+    pub fn initialize_economic_policy(
+        ctx: Context<InitializeEconomicPolicy>,
+        config_id: u64,
+        parameters: EconomicPolicyParameters,
+    ) -> Result<()> {
+        let advanced_config_id = next_config_id(
+            ctx.accounts.economic_policy_registry.next_config_id,
+            config_id,
+        )?;
+        validate_economic_policy_parameters(&parameters)?;
+        let mint = parse_mint(&ctx.accounts.payment_mint.to_account_info())?;
+        require!(
+            !mint.has_freeze_authority,
+            FaultlineError::MintHasFreezeAuthority
+        );
+        let fee_reserve = maximum_fee_reserve(
+            parameters.verifier_fee_amount,
+            parameters.max_bonded_challenges,
+        )?;
+        require!(fee_reserve > 0, FaultlineError::ZeroVerifierFee);
+
+        let slot = Clock::get()?.slot;
+        let economic_policy = &mut ctx.accounts.economic_policy;
+        economic_policy.economic_policy_registry = ctx.accounts.economic_policy_registry.key();
+        economic_policy.safety_policy = ctx.accounts.policy.key();
+        economic_policy.governance = ctx.accounts.governance.key();
+        economic_policy.payment_mint = ctx.accounts.payment_mint.key();
+        economic_policy.token_program = TOKEN_PROGRAM_ID;
+        economic_policy.config_id = config_id;
+        economic_policy.payment_mint_decimals = mint.decimals;
+        economic_policy.bounty_amount = parameters.bounty_amount;
+        economic_policy.challenger_bond_amount = parameters.challenger_bond_amount;
+        economic_policy.verifier_fee_amount = parameters.verifier_fee_amount;
+        economic_policy.minimum_verifier_stake = parameters.minimum_verifier_stake;
+        economic_policy.verifier_non_reveal_slash_amount =
+            parameters.verifier_non_reveal_slash_amount;
+        economic_policy.max_bonded_challenges = parameters.max_bonded_challenges;
+        economic_policy.fee_claim_grace_slots = parameters.fee_claim_grace_slots;
+        economic_policy.slash_claim_grace_slots = parameters.slash_claim_grace_slots;
+        economic_policy.stake_withdraw_cooldown_slots = parameters.stake_withdraw_cooldown_slots;
+        economic_policy.created_at_slot = slot;
+        economic_policy.bump = ctx.bumps.economic_policy;
+
+        ctx.accounts.economic_policy_registry.next_config_id = advanced_config_id;
+        emit!(EconomicPolicyInitialized {
+            safety_policy: ctx.accounts.policy.key(),
+            economic_policy_registry: ctx.accounts.economic_policy_registry.key(),
+            economic_policy: economic_policy.key(),
+            config_id,
+            payment_mint: economic_policy.payment_mint,
+            governance: ctx.accounts.governance.key(),
+            slot,
+        });
+        Ok(())
+    }
+
+    pub fn initialize_verifier_stake(
+        ctx: Context<InitializeVerifierStake>,
+        amount: u64,
+    ) -> Result<()> {
+        require!(amount > 0, FaultlineError::ZeroStakeAmount);
+        require!(
+            amount >= ctx.accounts.economic_policy.minimum_verifier_stake,
+            FaultlineError::StakeBelowMinimum
+        );
+        validate_canonical_ata(
+            &ctx.accounts.verifier_token_account.to_account_info(),
+            &ctx.accounts.verifier.key(),
+            &ctx.accounts.economic_policy.payment_mint,
+        )?;
+        create_token_vault(
+            &ctx.accounts.verifier.to_account_info(),
+            &ctx.accounts.stake_vault.to_account_info(),
+            &ctx.accounts.payment_mint.to_account_info(),
+            &ctx.accounts.verifier_stake.key(),
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.token_program.to_account_info(),
+            &[
+                STAKE_VAULT_SEED,
+                ctx.accounts.economic_policy.key().as_ref(),
+                ctx.accounts.verifier.key().as_ref(),
+                &[ctx.bumps.stake_vault],
+            ],
+        )?;
+        spl_token_transfer(
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.verifier_token_account.to_account_info(),
+            &ctx.accounts.stake_vault.to_account_info(),
+            &ctx.accounts.verifier.to_account_info(),
+            amount,
+            None,
+        )?;
+        let stake = &mut ctx.accounts.verifier_stake;
+        stake.economic_policy = ctx.accounts.economic_policy.key();
+        stake.verifier = ctx.accounts.verifier.key();
+        stake.stake_vault = ctx.accounts.stake_vault.key();
+        stake.payment_mint = ctx.accounts.payment_mint.key();
+        stake.rent_recipient = ctx.accounts.verifier.key();
+        stake.amount = amount;
+        stake.slash_lock_until_slot = 0;
+        stake.withdrawal_requested_slot = None;
+        stake.withdrawal_available_slot = None;
+        stake.total_slashed = 0;
+        stake.status = StakeStatus::Active;
+        stake.bump = ctx.bumps.verifier_stake;
+        emit!(VerifierStakeInitialized {
+            economic_policy: stake.economic_policy,
+            verifier_stake: stake.key(),
+            verifier: stake.verifier,
+            stake_vault: stake.stake_vault,
+            amount,
+            slot: Clock::get()?.slot,
+        });
+        Ok(())
+    }
+
+    pub fn top_up_verifier_stake(ctx: Context<TopUpVerifierStake>, amount: u64) -> Result<()> {
+        require!(amount > 0, FaultlineError::ZeroStakeAmount);
+        require!(
+            ctx.accounts.verifier_stake.status == StakeStatus::Active,
+            FaultlineError::StakeWithdrawalPending
+        );
+        validate_canonical_ata(
+            &ctx.accounts.verifier_token_account.to_account_info(),
+            &ctx.accounts.verifier.key(),
+            &ctx.accounts.economic_policy.payment_mint,
+        )?;
+        validate_token_vault(
+            &ctx.accounts.stake_vault.to_account_info(),
+            &ctx.accounts.economic_policy.payment_mint,
+            &ctx.accounts.verifier_stake.key(),
+        )?;
+        spl_token_transfer(
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.verifier_token_account.to_account_info(),
+            &ctx.accounts.stake_vault.to_account_info(),
+            &ctx.accounts.verifier.to_account_info(),
+            amount,
+            None,
+        )?;
+        ctx.accounts.verifier_stake.amount = ctx
+            .accounts
+            .verifier_stake
+            .amount
+            .checked_add(amount)
+            .ok_or(FaultlineError::ArithmeticOverflow)?;
+        emit!(VerifierStakeToppedUp {
+            economic_policy: ctx.accounts.economic_policy.key(),
+            verifier_stake: ctx.accounts.verifier_stake.key(),
+            verifier: ctx.accounts.verifier.key(),
+            amount,
+            new_amount: ctx.accounts.verifier_stake.amount,
+            slot: Clock::get()?.slot,
+        });
+        Ok(())
+    }
+
+    pub fn request_verifier_stake_withdrawal(ctx: Context<ManageVerifierStake>) -> Result<()> {
+        let stake = &mut ctx.accounts.verifier_stake;
+        require!(
+            stake.status == StakeStatus::Active,
+            FaultlineError::StakeWithdrawalPending
+        );
+        let slot = Clock::get()?.slot;
+        let base = core::cmp::max(slot, stake.slash_lock_until_slot);
+        let available = withdrawal_available_slot(
+            slot,
+            stake.slash_lock_until_slot,
+            ctx.accounts.economic_policy.stake_withdraw_cooldown_slots,
+        )?;
+        debug_assert_eq!(
+            base.checked_add(ctx.accounts.economic_policy.stake_withdraw_cooldown_slots),
+            Some(available)
+        );
+        stake.status = StakeStatus::WithdrawalPending;
+        stake.withdrawal_requested_slot = Some(slot);
+        stake.withdrawal_available_slot = Some(available);
+        emit!(VerifierStakeWithdrawalRequested {
+            economic_policy: ctx.accounts.economic_policy.key(),
+            verifier_stake: stake.key(),
+            verifier: ctx.accounts.verifier.key(),
+            requested_slot: slot,
+            available_slot: available,
+        });
+        Ok(())
+    }
+
+    pub fn cancel_verifier_stake_withdrawal(ctx: Context<ManageVerifierStake>) -> Result<()> {
+        let stake = &mut ctx.accounts.verifier_stake;
+        require!(
+            stake.status == StakeStatus::WithdrawalPending,
+            FaultlineError::WithdrawalNotRequested
+        );
+        stake.status = StakeStatus::Active;
+        stake.withdrawal_requested_slot = None;
+        stake.withdrawal_available_slot = None;
+        emit!(VerifierStakeWithdrawalCancelled {
+            economic_policy: ctx.accounts.economic_policy.key(),
+            verifier_stake: stake.key(),
+            verifier: ctx.accounts.verifier.key(),
+            slot: Clock::get()?.slot,
+        });
+        Ok(())
+    }
+
+    pub fn withdraw_verifier_stake(ctx: Context<WithdrawVerifierStake>) -> Result<()> {
+        let stake = &ctx.accounts.verifier_stake;
+        require!(
+            stake.status == StakeStatus::WithdrawalPending,
+            FaultlineError::WithdrawalNotRequested
+        );
+        let available = stake
+            .withdrawal_available_slot
+            .ok_or(FaultlineError::WithdrawalNotRequested)?;
+        let slot = Clock::get()?.slot;
+        require!(slot >= available, FaultlineError::WithdrawalCooldownActive);
+        require!(
+            slot > stake.slash_lock_until_slot,
+            FaultlineError::StakeStillLocked
+        );
+        validate_canonical_ata(
+            &ctx.accounts.verifier_token_account.to_account_info(),
+            &ctx.accounts.verifier.key(),
+            &ctx.accounts.economic_policy.payment_mint,
+        )?;
+        let vault = validate_token_vault(
+            &ctx.accounts.stake_vault.to_account_info(),
+            &ctx.accounts.economic_policy.payment_mint,
+            &ctx.accounts.verifier_stake.key(),
+        )?;
+        require!(
+            vault.amount >= stake.amount,
+            FaultlineError::VaultBalanceMismatch
+        );
+        let policy_key = ctx.accounts.economic_policy.key();
+        let verifier_key = ctx.accounts.verifier.key();
+        let signer_seeds: &[&[u8]] = &[
+            VERIFIER_STAKE_SEED,
+            policy_key.as_ref(),
+            verifier_key.as_ref(),
+            &[stake.bump],
+        ];
+        spl_token_transfer(
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.stake_vault.to_account_info(),
+            &ctx.accounts.verifier_token_account.to_account_info(),
+            &ctx.accounts.verifier_stake.to_account_info(),
+            vault.amount,
+            Some(signer_seeds),
+        )?;
+        spl_token_close(
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.stake_vault.to_account_info(),
+            &ctx.accounts.rent_recipient.to_account_info(),
+            &ctx.accounts.verifier_stake.to_account_info(),
+            signer_seeds,
+        )?;
+        emit!(VerifierStakeWithdrawn {
+            economic_policy: ctx.accounts.economic_policy.key(),
+            verifier_stake: ctx.accounts.verifier_stake.key(),
+            verifier: ctx.accounts.verifier.key(),
+            amount: vault.amount,
+            slot,
+        });
+        Ok(())
+    }
+
+    pub fn activate_verifier_epoch_economics<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ActivateVerifierEpochEconomics<'info>>,
+    ) -> Result<()> {
+        let verifiers = &ctx.accounts.verifier_epoch.verifiers;
+        require!(
+            ctx.remaining_accounts.len() == verifiers.len(),
+            FaultlineError::WrongRemainingAccountCount
+        );
+        for (expected_verifier, stake_info) in verifiers.iter().zip(ctx.remaining_accounts.iter()) {
+            require_keys_eq!(
+                *stake_info.owner,
+                crate::ID,
+                FaultlineError::WrongAccountOwner
+            );
+            let (expected_stake, _) = Pubkey::find_program_address(
+                &[
+                    VERIFIER_STAKE_SEED,
+                    ctx.accounts.economic_policy.key().as_ref(),
+                    expected_verifier.as_ref(),
+                ],
+                &crate::ID,
+            );
+            require_keys_eq!(
+                expected_stake,
+                *stake_info.key,
+                FaultlineError::WrongVerifierStake
+            );
+            let stake = Account::<VerifierStake>::try_from(stake_info)?;
+            require_keys_eq!(
+                stake.economic_policy,
+                ctx.accounts.economic_policy.key(),
+                FaultlineError::WrongEconomicPolicy
+            );
+            require_keys_eq!(
+                stake.verifier,
+                *expected_verifier,
+                FaultlineError::WrongVerifierStake
+            );
+            require_keys_eq!(
+                stake.payment_mint,
+                ctx.accounts.economic_policy.payment_mint,
+                FaultlineError::WrongPaymentMint
+            );
+            require!(
+                stake.status == StakeStatus::Active,
+                FaultlineError::StakeWithdrawalPending
+            );
+            require!(
+                stake.amount >= ctx.accounts.economic_policy.minimum_verifier_stake,
+                FaultlineError::StakeBelowMinimum
+            );
+        }
+        let binding = &mut ctx.accounts.verifier_epoch_economics;
+        binding.verifier_epoch = ctx.accounts.verifier_epoch.key();
+        binding.economic_policy = ctx.accounts.economic_policy.key();
+        binding.verifier_registry = ctx.accounts.verifier_registry.key();
+        binding.activated_at_slot = Clock::get()?.slot;
+        binding.bump = ctx.bumps.verifier_epoch_economics;
+        emit!(VerifierEpochEconomicsActivated {
+            verifier_epoch: binding.verifier_epoch,
+            economic_policy: binding.economic_policy,
+            verifier_epoch_economics: binding.key(),
+            verifier_count: verifiers.len() as u8,
+            actor: ctx.accounts.governance.key(),
+            slot: binding.activated_at_slot,
+        });
+        Ok(())
+    }
+
+    pub fn fund_proposal_escrow(ctx: Context<FundProposalEscrow>) -> Result<()> {
+        let funder = ctx.accounts.funder.key();
+        require!(
+            ctx.accounts.policy.status == PolicyStatus::Active,
+            FaultlineError::PolicyPaused
+        );
+        require!(
+            ctx.accounts.proposal.state == ProposalState::Draft,
+            FaultlineError::InvalidProposalTransition
+        );
+        require!(
+            funder == ctx.accounts.proposal.proposer
+                || funder == ctx.accounts.policy.governance_authority,
+            FaultlineError::UnauthorizedEconomicFunder
+        );
+        require!(
+            ctx.accounts.proposal.created_at_slot
+                >= ctx
+                    .accounts
+                    .economic_policy_registry
+                    .economic_enforcement_slot,
+            FaultlineError::HistoricalProposalCannotUseEconomics
+        );
+        validate_canonical_ata(
+            &ctx.accounts.funder_token_account.to_account_info(),
+            &funder,
+            &ctx.accounts.economic_policy.payment_mint,
+        )?;
+        let fee_reserve = maximum_fee_reserve(
+            ctx.accounts.economic_policy.verifier_fee_amount,
+            ctx.accounts.economic_policy.max_bonded_challenges,
+        )?;
+        let proposal_key = ctx.accounts.proposal.key();
+        let escrow_key = ctx.accounts.proposal_escrow.key();
+        create_token_vault(
+            &ctx.accounts.funder.to_account_info(),
+            &ctx.accounts.bounty_vault.to_account_info(),
+            &ctx.accounts.payment_mint.to_account_info(),
+            &escrow_key,
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.token_program.to_account_info(),
+            &[
+                BOUNTY_VAULT_SEED,
+                proposal_key.as_ref(),
+                &[ctx.bumps.bounty_vault],
+            ],
+        )?;
+        create_token_vault(
+            &ctx.accounts.funder.to_account_info(),
+            &ctx.accounts.fee_vault.to_account_info(),
+            &ctx.accounts.payment_mint.to_account_info(),
+            &escrow_key,
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.token_program.to_account_info(),
+            &[
+                FEE_VAULT_SEED,
+                proposal_key.as_ref(),
+                &[ctx.bumps.fee_vault],
+            ],
+        )?;
+        create_token_vault(
+            &ctx.accounts.funder.to_account_info(),
+            &ctx.accounts.penalty_vault.to_account_info(),
+            &ctx.accounts.payment_mint.to_account_info(),
+            &escrow_key,
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.token_program.to_account_info(),
+            &[
+                PENALTY_VAULT_SEED,
+                proposal_key.as_ref(),
+                &[ctx.bumps.penalty_vault],
+            ],
+        )?;
+        spl_token_transfer(
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.funder_token_account.to_account_info(),
+            &ctx.accounts.bounty_vault.to_account_info(),
+            &ctx.accounts.funder.to_account_info(),
+            ctx.accounts.economic_policy.bounty_amount,
+            None,
+        )?;
+        spl_token_transfer(
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.funder_token_account.to_account_info(),
+            &ctx.accounts.fee_vault.to_account_info(),
+            &ctx.accounts.funder.to_account_info(),
+            fee_reserve,
+            None,
+        )?;
+        let escrow = &mut ctx.accounts.proposal_escrow;
+        escrow.proposal = proposal_key;
+        escrow.economic_policy = ctx.accounts.economic_policy.key();
+        escrow.funder = funder;
+        escrow.payment_mint = ctx.accounts.payment_mint.key();
+        escrow.bounty_vault = ctx.accounts.bounty_vault.key();
+        escrow.fee_vault = ctx.accounts.fee_vault.key();
+        escrow.penalty_vault = ctx.accounts.penalty_vault.key();
+        escrow.bounty_amount = ctx.accounts.economic_policy.bounty_amount;
+        escrow.fee_reserve_amount = fee_reserve;
+        escrow.max_bonded_challenges = ctx.accounts.economic_policy.max_bonded_challenges;
+        escrow.committed_challenge_count = 0;
+        escrow.unsettled_bonds = 0;
+        escrow.unclosed_rounds = 0;
+        escrow.bounty_status = BountyStatus::Pending;
+        escrow.winning_round = None;
+        escrow.winning_trace_claim = None;
+        escrow.funded_at_slot = Clock::get()?.slot;
+        escrow.refund_eligible_slot = None;
+        escrow.bounty_settled_at_slot = None;
+        escrow.bounty_paid = 0;
+        escrow.fees_claimed = 0;
+        escrow.refunds_paid = 0;
+        escrow.bump = ctx.bumps.proposal_escrow;
+        emit!(ProposalEscrowFunded {
+            proposal: proposal_key,
+            proposal_escrow: escrow.key(),
+            economic_policy: escrow.economic_policy,
+            funder,
+            bounty_amount: escrow.bounty_amount,
+            fee_reserve_amount: fee_reserve,
+            slot: escrow.funded_at_slot,
         });
         Ok(())
     }
@@ -932,6 +1455,160 @@ pub mod faultline_gate {
 }
 
 #[derive(Accounts)]
+pub struct InitializeEconomicPolicyRegistry<'info> {
+    #[account(mut)]
+    pub governance: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump, constraint = policy.governance_authority == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(init, payer = governance, space = 8 + EconomicPolicyRegistry::INIT_SPACE, seeds = [ECONOMIC_POLICY_REGISTRY_SEED, policy.key().as_ref()], bump)]
+    pub economic_policy_registry: Account<'info, EconomicPolicyRegistry>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(config_id: u64)]
+pub struct InitializeEconomicPolicy<'info> {
+    #[account(mut)]
+    pub governance: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump, constraint = policy.governance_authority == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(mut, seeds = [ECONOMIC_POLICY_REGISTRY_SEED, policy.key().as_ref()], bump = economic_policy_registry.bump, constraint = economic_policy_registry.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding, constraint = economic_policy_registry.governance == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub economic_policy_registry: Account<'info, EconomicPolicyRegistry>,
+    /// CHECK: exact legacy Mint layout and owner are validated in the handler.
+    pub payment_mint: UncheckedAccount<'info>,
+    #[account(init, payer = governance, space = 8 + EconomicPolicy::INIT_SPACE, seeds = [ECONOMIC_POLICY_SEED, economic_policy_registry.key().as_ref(), &config_id.to_le_bytes()], bump)]
+    pub economic_policy: Box<Account<'info, EconomicPolicy>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeVerifierStake<'info> {
+    #[account(mut)]
+    pub verifier: Signer<'info>,
+    #[account(seeds = [ECONOMIC_POLICY_SEED, economic_policy.economic_policy_registry.as_ref(), &economic_policy.config_id.to_le_bytes()], bump = economic_policy.bump, constraint = economic_policy.token_program == TOKEN_PROGRAM_ID @ FaultlineError::UnsupportedEconomicTokenProgram)]
+    pub economic_policy: Box<Account<'info, EconomicPolicy>>,
+    /// CHECK: key, owner, mint, state and token owner are validated in the handler.
+    #[account(mut)]
+    pub verifier_token_account: UncheckedAccount<'info>,
+    /// CHECK: exact legacy Mint is bound by EconomicPolicy and validated here.
+    #[account(address = economic_policy.payment_mint @ FaultlineError::WrongPaymentMint)]
+    pub payment_mint: UncheckedAccount<'info>,
+    #[account(init, payer = verifier, space = 8 + VerifierStake::INIT_SPACE, seeds = [VERIFIER_STAKE_SEED, economic_policy.key().as_ref(), verifier.key().as_ref()], bump)]
+    pub verifier_stake: Box<Account<'info, VerifierStake>>,
+    /// CHECK: created and initialized as a Tokenkeg account by the handler.
+    #[account(mut, seeds = [STAKE_VAULT_SEED, economic_policy.key().as_ref(), verifier.key().as_ref()], bump)]
+    pub stake_vault: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: fixed legacy SPL Token program.
+    #[account(address = TOKEN_PROGRAM_ID @ FaultlineError::UnsupportedEconomicTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct TopUpVerifierStake<'info> {
+    #[account(mut)]
+    pub verifier: Signer<'info>,
+    #[account(seeds = [ECONOMIC_POLICY_SEED, economic_policy.economic_policy_registry.as_ref(), &economic_policy.config_id.to_le_bytes()], bump = economic_policy.bump, constraint = economic_policy.token_program == TOKEN_PROGRAM_ID @ FaultlineError::UnsupportedEconomicTokenProgram)]
+    pub economic_policy: Box<Account<'info, EconomicPolicy>>,
+    #[account(mut, seeds = [VERIFIER_STAKE_SEED, economic_policy.key().as_ref(), verifier.key().as_ref()], bump = verifier_stake.bump, constraint = verifier_stake.economic_policy == economic_policy.key() @ FaultlineError::WrongEconomicPolicy, constraint = verifier_stake.verifier == verifier.key() @ FaultlineError::WrongVerifierStake)]
+    pub verifier_stake: Box<Account<'info, VerifierStake>>,
+    /// CHECK: validated as the verifier's canonical ATA.
+    #[account(mut)]
+    pub verifier_token_account: UncheckedAccount<'info>,
+    /// CHECK: validated legacy vault.
+    #[account(mut, address = verifier_stake.stake_vault @ FaultlineError::WrongVault)]
+    pub stake_vault: UncheckedAccount<'info>,
+    /// CHECK: fixed legacy SPL Token program.
+    #[account(address = TOKEN_PROGRAM_ID @ FaultlineError::UnsupportedEconomicTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ManageVerifierStake<'info> {
+    pub verifier: Signer<'info>,
+    #[account(seeds = [ECONOMIC_POLICY_SEED, economic_policy.economic_policy_registry.as_ref(), &economic_policy.config_id.to_le_bytes()], bump = economic_policy.bump, constraint = economic_policy.token_program == TOKEN_PROGRAM_ID @ FaultlineError::UnsupportedEconomicTokenProgram)]
+    pub economic_policy: Box<Account<'info, EconomicPolicy>>,
+    #[account(mut, seeds = [VERIFIER_STAKE_SEED, economic_policy.key().as_ref(), verifier.key().as_ref()], bump = verifier_stake.bump, constraint = verifier_stake.economic_policy == economic_policy.key() @ FaultlineError::WrongEconomicPolicy, constraint = verifier_stake.verifier == verifier.key() @ FaultlineError::WrongVerifierStake)]
+    pub verifier_stake: Box<Account<'info, VerifierStake>>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawVerifierStake<'info> {
+    #[account(mut)]
+    pub verifier: Signer<'info>,
+    #[account(seeds = [ECONOMIC_POLICY_SEED, economic_policy.economic_policy_registry.as_ref(), &economic_policy.config_id.to_le_bytes()], bump = economic_policy.bump, constraint = economic_policy.token_program == TOKEN_PROGRAM_ID @ FaultlineError::UnsupportedEconomicTokenProgram)]
+    pub economic_policy: Box<Account<'info, EconomicPolicy>>,
+    #[account(mut, close = rent_recipient, seeds = [VERIFIER_STAKE_SEED, economic_policy.key().as_ref(), verifier.key().as_ref()], bump = verifier_stake.bump, constraint = verifier_stake.economic_policy == economic_policy.key() @ FaultlineError::WrongEconomicPolicy, constraint = verifier_stake.verifier == verifier.key() @ FaultlineError::WrongVerifierStake)]
+    pub verifier_stake: Box<Account<'info, VerifierStake>>,
+    /// CHECK: validated as verifier's canonical ATA.
+    #[account(mut)]
+    pub verifier_token_account: UncheckedAccount<'info>,
+    /// CHECK: validated legacy Tokenkeg vault.
+    #[account(mut, address = verifier_stake.stake_vault @ FaultlineError::WrongVault)]
+    pub stake_vault: UncheckedAccount<'info>,
+    /// CHECK: immutable fixed recipient stored at stake initialization.
+    #[account(mut, address = verifier_stake.rent_recipient @ FaultlineError::WrongRentRecipient)]
+    pub rent_recipient: UncheckedAccount<'info>,
+    /// CHECK: fixed legacy SPL Token program.
+    #[account(address = TOKEN_PROGRAM_ID @ FaultlineError::UnsupportedEconomicTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ActivateVerifierEpochEconomics<'info> {
+    #[account(mut)]
+    pub governance: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump, constraint = policy.governance_authority == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(seeds = [ECONOMIC_POLICY_REGISTRY_SEED, policy.key().as_ref()], bump = economic_policy_registry.bump, constraint = economic_policy_registry.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub economic_policy_registry: Account<'info, EconomicPolicyRegistry>,
+    #[account(seeds = [ECONOMIC_POLICY_SEED, economic_policy_registry.key().as_ref(), &economic_policy.config_id.to_le_bytes()], bump = economic_policy.bump, constraint = economic_policy.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub economic_policy: Box<Account<'info, EconomicPolicy>>,
+    #[account(seeds = [VERIFIER_REGISTRY_SEED, policy.key().as_ref()], bump = verifier_registry.bump, constraint = verifier_registry.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verifier_registry.governance == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub verifier_registry: Account<'info, VerifierRegistry>,
+    #[account(seeds = [VERIFIER_EPOCH_SEED, verifier_registry.key().as_ref(), &verifier_epoch.epoch_id.to_le_bytes()], bump = verifier_epoch.bump, constraint = verifier_epoch.verifier_registry == verifier_registry.key() @ FaultlineError::WrongVerifierEpoch, constraint = verifier_epoch.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub verifier_epoch: Box<Account<'info, VerifierEpoch>>,
+    #[account(init, payer = governance, space = 8 + VerifierEpochEconomics::INIT_SPACE, seeds = [VERIFIER_EPOCH_ECONOMICS_SEED, verifier_epoch.key().as_ref(), economic_policy.key().as_ref()], bump)]
+    pub verifier_epoch_economics: Account<'info, VerifierEpochEconomics>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FundProposalEscrow<'info> {
+    #[account(mut)]
+    pub funder: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(seeds = [ECONOMIC_POLICY_REGISTRY_SEED, policy.key().as_ref()], bump = economic_policy_registry.bump, constraint = economic_policy_registry.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub economic_policy_registry: Account<'info, EconomicPolicyRegistry>,
+    #[account(seeds = [ECONOMIC_POLICY_SEED, economic_policy_registry.key().as_ref(), &economic_policy.config_id.to_le_bytes()], bump = economic_policy.bump, constraint = economic_policy.safety_policy == policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub economic_policy: Box<Account<'info, EconomicPolicy>>,
+    #[account(seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
+    pub proposal: Box<Account<'info, UpgradeProposal>>,
+    /// CHECK: validated as funder's canonical ATA.
+    #[account(mut)]
+    pub funder_token_account: UncheckedAccount<'info>,
+    /// CHECK: exact legacy Mint bound by EconomicPolicy.
+    #[account(address = economic_policy.payment_mint @ FaultlineError::WrongPaymentMint)]
+    pub payment_mint: UncheckedAccount<'info>,
+    #[account(init, payer = funder, space = 8 + ProposalEscrow::INIT_SPACE, seeds = [PROPOSAL_ESCROW_SEED, proposal.key().as_ref()], bump)]
+    pub proposal_escrow: Box<Account<'info, ProposalEscrow>>,
+    /// CHECK: created and initialized as a Tokenkeg account by the handler.
+    #[account(mut, seeds = [BOUNTY_VAULT_SEED, proposal.key().as_ref()], bump)]
+    pub bounty_vault: UncheckedAccount<'info>,
+    /// CHECK: created and initialized as a Tokenkeg account by the handler.
+    #[account(mut, seeds = [FEE_VAULT_SEED, proposal.key().as_ref()], bump)]
+    pub fee_vault: UncheckedAccount<'info>,
+    /// CHECK: created and initialized as a Tokenkeg account by the handler.
+    #[account(mut, seeds = [PENALTY_VAULT_SEED, proposal.key().as_ref()], bump)]
+    pub penalty_vault: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: fixed legacy SPL Token program.
+    #[account(address = TOKEN_PROGRAM_ID @ FaultlineError::UnsupportedEconomicTokenProgram)]
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeGuard<'info> {
     #[account(mut)]
     pub governance: Signer<'info>,
@@ -1363,6 +2040,196 @@ pub struct VerifierAttestation {
     pub attested_slot: u64,
     pub bump: u8,
 }
+
+#[account]
+#[derive(InitSpace)]
+pub struct EconomicPolicyRegistry {
+    pub safety_policy: Pubkey,
+    pub governance: Pubkey,
+    pub next_config_id: u64,
+    pub economic_enforcement_slot: u64,
+    pub created_at_slot: u64,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct EconomicPolicy {
+    pub economic_policy_registry: Pubkey,
+    pub safety_policy: Pubkey,
+    pub governance: Pubkey,
+    pub payment_mint: Pubkey,
+    pub token_program: Pubkey,
+    pub config_id: u64,
+    pub payment_mint_decimals: u8,
+    pub bounty_amount: u64,
+    pub challenger_bond_amount: u64,
+    pub verifier_fee_amount: u64,
+    pub minimum_verifier_stake: u64,
+    pub verifier_non_reveal_slash_amount: u64,
+    pub max_bonded_challenges: u8,
+    pub fee_claim_grace_slots: u64,
+    pub slash_claim_grace_slots: u64,
+    pub stake_withdraw_cooldown_slots: u64,
+    pub created_at_slot: u64,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct ProposalEscrow {
+    pub proposal: Pubkey,
+    pub economic_policy: Pubkey,
+    pub funder: Pubkey,
+    pub payment_mint: Pubkey,
+    pub bounty_vault: Pubkey,
+    pub fee_vault: Pubkey,
+    pub penalty_vault: Pubkey,
+    pub bounty_amount: u64,
+    pub fee_reserve_amount: u64,
+    pub max_bonded_challenges: u8,
+    pub committed_challenge_count: u8,
+    pub unsettled_bonds: u8,
+    pub unclosed_rounds: u8,
+    pub bounty_status: BountyStatus,
+    pub winning_round: Option<Pubkey>,
+    pub winning_trace_claim: Option<Pubkey>,
+    pub funded_at_slot: u64,
+    pub refund_eligible_slot: Option<u64>,
+    pub bounty_settled_at_slot: Option<u64>,
+    pub bounty_paid: u64,
+    pub fees_claimed: u64,
+    pub refunds_paid: u64,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct ChallengeBond {
+    pub challenge_commit: Pubkey,
+    pub proposal_escrow: Pubkey,
+    pub hunter: Pubkey,
+    pub bond_vault: Pubkey,
+    pub rent_recipient: Pubkey,
+    pub amount: u64,
+    pub status: BondStatus,
+    pub funded_at_slot: u64,
+    pub settled_at_slot: Option<u64>,
+    pub refunded_amount: u64,
+    pub forfeited_amount: u64,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct VerifierStake {
+    pub economic_policy: Pubkey,
+    pub verifier: Pubkey,
+    pub stake_vault: Pubkey,
+    pub payment_mint: Pubkey,
+    pub rent_recipient: Pubkey,
+    pub amount: u64,
+    pub slash_lock_until_slot: u64,
+    pub withdrawal_requested_slot: Option<u64>,
+    pub withdrawal_available_slot: Option<u64>,
+    pub total_slashed: u64,
+    pub status: StakeStatus,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct VerifierEpochEconomics {
+    pub verifier_epoch: Pubkey,
+    pub economic_policy: Pubkey,
+    pub verifier_registry: Pubkey,
+    pub activated_at_slot: u64,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct RoundEconomicState {
+    pub verification_round: Pubkey,
+    pub proposal_escrow: Pubkey,
+    pub verifier_epoch_economics: Pubkey,
+    pub status: RoundEconomicStatus,
+    pub fee_claim_deadline_slot: u64,
+    pub slash_claim_deadline_slot: u64,
+    pub opened_at_slot: u64,
+    pub closed_at_slot: Option<u64>,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct VerifierFeeClaim {
+    pub verification_round: Pubkey,
+    pub verifier: Pubkey,
+    pub attestation: Pubkey,
+    pub proposal_escrow: Pubkey,
+    pub amount: u64,
+    pub claimed_at_slot: u64,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct VerifierSlashReceipt {
+    pub verification_round: Pubkey,
+    pub verifier_stake: Pubkey,
+    pub verifier: Pubkey,
+    pub proposal_escrow: Pubkey,
+    pub amount: u64,
+    pub slashed_at_slot: u64,
+    pub bump: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub struct EconomicPolicyParameters {
+    pub bounty_amount: u64,
+    pub challenger_bond_amount: u64,
+    pub verifier_fee_amount: u64,
+    pub minimum_verifier_stake: u64,
+    pub verifier_non_reveal_slash_amount: u64,
+    pub max_bonded_challenges: u8,
+    pub fee_claim_grace_slots: u64,
+    pub slash_claim_grace_slots: u64,
+    pub stake_withdraw_cooldown_slots: u64,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
+pub enum BountyStatus {
+    Pending,
+    PaidToHunter,
+    RefundedToFunder,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
+pub enum BondStatus {
+    Pending,
+    AcceptedReturned,
+    HoldPenalized,
+    NonRevealPenalized,
+    TimeoutReturned,
+    AbortedReturned,
+    RevealedUnopenedReturned,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
+pub enum StakeStatus {
+    Active,
+    WithdrawalPending,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
+pub enum RoundEconomicStatus {
+    Open,
+    FinalizedHold,
+    FinalizedViolation,
+    TimedOut,
+    Aborted,
+}
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
 pub enum PolicyStatus {
     Active,
@@ -1402,6 +2269,84 @@ pub enum ReplayVerdict {
     InvariantViolated,
 }
 
+#[event]
+pub struct EconomicPolicyRegistryInitialized {
+    pub safety_policy: Pubkey,
+    pub economic_policy_registry: Pubkey,
+    pub governance: Pubkey,
+    pub economic_enforcement_slot: u64,
+    pub slot: u64,
+}
+#[event]
+pub struct EconomicPolicyInitialized {
+    pub safety_policy: Pubkey,
+    pub economic_policy_registry: Pubkey,
+    pub economic_policy: Pubkey,
+    pub config_id: u64,
+    pub payment_mint: Pubkey,
+    pub governance: Pubkey,
+    pub slot: u64,
+}
+#[event]
+pub struct VerifierStakeInitialized {
+    pub economic_policy: Pubkey,
+    pub verifier_stake: Pubkey,
+    pub verifier: Pubkey,
+    pub stake_vault: Pubkey,
+    pub amount: u64,
+    pub slot: u64,
+}
+#[event]
+pub struct VerifierStakeToppedUp {
+    pub economic_policy: Pubkey,
+    pub verifier_stake: Pubkey,
+    pub verifier: Pubkey,
+    pub amount: u64,
+    pub new_amount: u64,
+    pub slot: u64,
+}
+#[event]
+pub struct VerifierStakeWithdrawalRequested {
+    pub economic_policy: Pubkey,
+    pub verifier_stake: Pubkey,
+    pub verifier: Pubkey,
+    pub requested_slot: u64,
+    pub available_slot: u64,
+}
+#[event]
+pub struct VerifierStakeWithdrawalCancelled {
+    pub economic_policy: Pubkey,
+    pub verifier_stake: Pubkey,
+    pub verifier: Pubkey,
+    pub slot: u64,
+}
+#[event]
+pub struct VerifierStakeWithdrawn {
+    pub economic_policy: Pubkey,
+    pub verifier_stake: Pubkey,
+    pub verifier: Pubkey,
+    pub amount: u64,
+    pub slot: u64,
+}
+#[event]
+pub struct VerifierEpochEconomicsActivated {
+    pub verifier_epoch: Pubkey,
+    pub economic_policy: Pubkey,
+    pub verifier_epoch_economics: Pubkey,
+    pub verifier_count: u8,
+    pub actor: Pubkey,
+    pub slot: u64,
+}
+#[event]
+pub struct ProposalEscrowFunded {
+    pub proposal: Pubkey,
+    pub proposal_escrow: Pubkey,
+    pub economic_policy: Pubkey,
+    pub funder: Pubkey,
+    pub bounty_amount: u64,
+    pub fee_reserve_amount: u64,
+    pub slot: u64,
+}
 #[event]
 pub struct SafetyPolicyInitialized {
     pub policy: Pubkey,
@@ -1735,6 +2680,377 @@ fn program_data_address(program: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[program.as_ref()], &bpf_loader_upgradeable::id()).0
 }
 
+struct MintView {
+    decimals: u8,
+    has_freeze_authority: bool,
+}
+
+struct TokenAccountView {
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+}
+
+fn parse_mint(account: &AccountInfo) -> Result<MintView> {
+    require_keys_eq!(
+        *account.owner,
+        TOKEN_PROGRAM_ID,
+        FaultlineError::UnsupportedEconomicTokenProgram
+    );
+    let data = account.try_borrow_data()?;
+    require!(data.len() == MINT_LEN, FaultlineError::InvalidEconomicMint);
+    require!(data[45] == 1, FaultlineError::InvalidEconomicMint);
+    let freeze_tag = u32::from_le_bytes(
+        data[46..50]
+            .try_into()
+            .map_err(|_| error!(FaultlineError::InvalidEconomicMint))?,
+    );
+    require!(freeze_tag <= 1, FaultlineError::InvalidEconomicMint);
+    Ok(MintView {
+        decimals: data[44],
+        has_freeze_authority: freeze_tag == 1,
+    })
+}
+
+fn parse_token_account(account: &AccountInfo) -> Result<TokenAccountView> {
+    require_keys_eq!(
+        *account.owner,
+        TOKEN_PROGRAM_ID,
+        FaultlineError::UnsupportedEconomicTokenProgram
+    );
+    let data = account.try_borrow_data()?;
+    require!(
+        data.len() == TOKEN_ACCOUNT_LEN,
+        FaultlineError::InvalidEconomicTokenAccount
+    );
+    require!(
+        data[108] == TOKEN_ACCOUNT_INITIALIZED,
+        FaultlineError::InvalidEconomicTokenAccount
+    );
+    Ok(TokenAccountView {
+        mint: Pubkey::new_from_array(
+            data[0..32]
+                .try_into()
+                .map_err(|_| error!(FaultlineError::InvalidEconomicTokenAccount))?,
+        ),
+        owner: Pubkey::new_from_array(
+            data[32..64]
+                .try_into()
+                .map_err(|_| error!(FaultlineError::InvalidEconomicTokenAccount))?,
+        ),
+        amount: u64::from_le_bytes(
+            data[64..72]
+                .try_into()
+                .map_err(|_| error!(FaultlineError::InvalidEconomicTokenAccount))?,
+        ),
+    })
+}
+
+fn canonical_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[owner.as_ref(), TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0
+}
+
+fn validate_canonical_ata(account: &AccountInfo, owner: &Pubkey, mint: &Pubkey) -> Result<()> {
+    require_keys_eq!(
+        canonical_ata(owner, mint),
+        *account.key,
+        FaultlineError::NonCanonicalTokenAccount
+    );
+    let token_account = parse_token_account(account)?;
+    require_keys_eq!(token_account.owner, *owner, FaultlineError::WrongTokenOwner);
+    require_keys_eq!(token_account.mint, *mint, FaultlineError::WrongPaymentMint);
+    Ok(())
+}
+
+fn validate_token_vault(
+    account: &AccountInfo,
+    mint: &Pubkey,
+    authority: &Pubkey,
+) -> Result<TokenAccountView> {
+    let token_account = parse_token_account(account)?;
+    require_keys_eq!(token_account.mint, *mint, FaultlineError::WrongPaymentMint);
+    require_keys_eq!(
+        token_account.owner,
+        *authority,
+        FaultlineError::WrongVaultAuthority
+    );
+    Ok(token_account)
+}
+
+fn create_token_vault<'info>(
+    payer: &AccountInfo<'info>,
+    vault: &AccountInfo<'info>,
+    mint: &AccountInfo<'info>,
+    authority: &Pubkey,
+    system_program: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
+    signer_seeds: &[&[u8]],
+) -> Result<()> {
+    require_keys_eq!(
+        *token_program.key,
+        TOKEN_PROGRAM_ID,
+        FaultlineError::UnsupportedEconomicTokenProgram
+    );
+    require_keys_eq!(
+        *mint.owner,
+        TOKEN_PROGRAM_ID,
+        FaultlineError::UnsupportedEconomicTokenProgram
+    );
+    let lamports = Rent::get()?.minimum_balance(TOKEN_ACCOUNT_LEN);
+    if vault.lamports() == 0 {
+        require!(
+            vault.data_is_empty(),
+            FaultlineError::VaultAlreadyInitialized
+        );
+        invoke_signed(
+            &system_instruction::create_account(
+                payer.key,
+                vault.key,
+                lamports,
+                TOKEN_ACCOUNT_LEN as u64,
+                &TOKEN_PROGRAM_ID,
+            ),
+            &[payer.clone(), vault.clone(), system_program.clone()],
+            &[signer_seeds],
+        )?;
+    } else {
+        require_keys_eq!(
+            *vault.owner,
+            solana_system_program::ID,
+            FaultlineError::VaultAlreadyInitialized
+        );
+        require!(
+            vault.data_is_empty(),
+            FaultlineError::VaultAlreadyInitialized
+        );
+        match vault.lamports().cmp(&lamports) {
+            core::cmp::Ordering::Less => invoke(
+                &system_instruction::transfer(payer.key, vault.key, lamports - vault.lamports()),
+                &[payer.clone(), vault.clone(), system_program.clone()],
+            )?,
+            core::cmp::Ordering::Greater => invoke_signed(
+                &system_instruction::transfer(vault.key, payer.key, vault.lamports() - lamports),
+                &[vault.clone(), payer.clone(), system_program.clone()],
+                &[signer_seeds],
+            )?,
+            core::cmp::Ordering::Equal => {}
+        }
+        invoke_signed(
+            &system_instruction::allocate(vault.key, TOKEN_ACCOUNT_LEN as u64),
+            &[vault.clone(), system_program.clone()],
+            &[signer_seeds],
+        )?;
+        invoke_signed(
+            &system_instruction::assign(vault.key, &TOKEN_PROGRAM_ID),
+            &[vault.clone(), system_program.clone()],
+            &[signer_seeds],
+        )?;
+    }
+    let mut data = Vec::with_capacity(33);
+    data.push(SPL_TOKEN_INITIALIZE_ACCOUNT3_TAG);
+    data.extend_from_slice(authority.as_ref());
+    let initialize = Instruction {
+        program_id: TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*vault.key, false),
+            AccountMeta::new_readonly(*mint.key, false),
+        ],
+        data,
+    };
+    invoke(
+        &initialize,
+        &[vault.clone(), mint.clone(), token_program.clone()],
+    )?;
+    let initialized = validate_token_vault(vault, mint.key, authority)?;
+    require!(initialized.amount == 0, FaultlineError::VaultMustStartEmpty);
+    Ok(())
+}
+
+fn spl_token_transfer<'info>(
+    token_program: &AccountInfo<'info>,
+    source: &AccountInfo<'info>,
+    destination: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    amount: u64,
+    signer_seeds: Option<&[&[u8]]>,
+) -> Result<()> {
+    require_keys_eq!(
+        *token_program.key,
+        TOKEN_PROGRAM_ID,
+        FaultlineError::UnsupportedEconomicTokenProgram
+    );
+    let mut data = Vec::with_capacity(9);
+    data.push(SPL_TOKEN_TRANSFER_TAG);
+    data.extend_from_slice(&amount.to_le_bytes());
+    let instruction = Instruction {
+        program_id: TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*source.key, false),
+            AccountMeta::new(*destination.key, false),
+            AccountMeta::new_readonly(*authority.key, true),
+        ],
+        data,
+    };
+    let infos = [
+        source.clone(),
+        destination.clone(),
+        authority.clone(),
+        token_program.clone(),
+    ];
+    match signer_seeds {
+        Some(seeds) => invoke_signed(&instruction, &infos, &[seeds])?,
+        None => invoke(&instruction, &infos)?,
+    }
+    Ok(())
+}
+
+fn spl_token_close<'info>(
+    token_program: &AccountInfo<'info>,
+    account: &AccountInfo<'info>,
+    rent_recipient: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    signer_seeds: &[&[u8]],
+) -> Result<()> {
+    require_keys_eq!(
+        *token_program.key,
+        TOKEN_PROGRAM_ID,
+        FaultlineError::UnsupportedEconomicTokenProgram
+    );
+    let instruction = Instruction {
+        program_id: TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*account.key, false),
+            AccountMeta::new(*rent_recipient.key, false),
+            AccountMeta::new_readonly(*authority.key, true),
+        ],
+        data: vec![SPL_TOKEN_CLOSE_ACCOUNT_TAG],
+    };
+    invoke_signed(
+        &instruction,
+        &[
+            account.clone(),
+            rent_recipient.clone(),
+            authority.clone(),
+            token_program.clone(),
+        ],
+        &[signer_seeds],
+    )?;
+    Ok(())
+}
+
+fn validate_economic_policy_parameters(parameters: &EconomicPolicyParameters) -> Result<()> {
+    require!(
+        parameters.bounty_amount > 0,
+        FaultlineError::ZeroBountyAmount
+    );
+    require!(
+        parameters.challenger_bond_amount > 0,
+        FaultlineError::ZeroBondAmount
+    );
+    require!(
+        parameters.verifier_fee_amount > 0,
+        FaultlineError::ZeroVerifierFee
+    );
+    require!(
+        parameters.minimum_verifier_stake > 0,
+        FaultlineError::ZeroMinimumStake
+    );
+    require!(
+        parameters.verifier_non_reveal_slash_amount > 0,
+        FaultlineError::ZeroSlashAmount
+    );
+    require!(
+        parameters.verifier_non_reveal_slash_amount <= parameters.minimum_verifier_stake,
+        FaultlineError::SlashExceedsMinimumStake
+    );
+    require!(
+        (1..=MAX_BONDED_CHALLENGES).contains(&parameters.max_bonded_challenges),
+        FaultlineError::InvalidChallengeLimit
+    );
+    validate_delay(
+        parameters.fee_claim_grace_slots,
+        MIN_FEE_CLAIM_GRACE_SLOTS,
+        MAX_FEE_CLAIM_GRACE_SLOTS,
+    )?;
+    validate_delay(
+        parameters.slash_claim_grace_slots,
+        MIN_SLASH_CLAIM_GRACE_SLOTS,
+        MAX_SLASH_CLAIM_GRACE_SLOTS,
+    )?;
+    validate_delay(
+        parameters.stake_withdraw_cooldown_slots,
+        MIN_STAKE_WITHDRAW_COOLDOWN_SLOTS,
+        MAX_STAKE_WITHDRAW_COOLDOWN_SLOTS,
+    )?;
+    maximum_fee_reserve(
+        parameters.verifier_fee_amount,
+        parameters.max_bonded_challenges,
+    )?;
+    Ok(())
+}
+
+fn validate_delay(value: u64, minimum: u64, maximum: u64) -> Result<()> {
+    require!(
+        value >= minimum && value <= maximum,
+        FaultlineError::InvalidEconomicDelay
+    );
+    Ok(())
+}
+
+pub fn maximum_fee_reserve(verifier_fee: u64, max_challenges: u8) -> Result<u64> {
+    verifier_fee
+        .checked_mul(MAX_VERIFIERS as u64)
+        .and_then(|value| value.checked_mul(max_challenges as u64))
+        .ok_or_else(|| error!(FaultlineError::FeeReserveOverflow))
+}
+
+pub fn penalty_amount(amount: u64, basis_points: u16) -> Result<u64> {
+    require!(
+        basis_points <= BPS_DENOMINATOR,
+        FaultlineError::InvalidPenaltyBasisPoints
+    );
+    let penalty = (amount as u128)
+        .checked_mul(basis_points as u128)
+        .ok_or(FaultlineError::ArithmeticOverflow)?
+        .checked_div(BPS_DENOMINATOR as u128)
+        .ok_or(FaultlineError::ArithmeticOverflow)?;
+    u64::try_from(penalty).map_err(|_| error!(FaultlineError::ArithmeticOverflow))
+}
+
+pub fn withdrawal_available_slot(
+    request_slot: u64,
+    slash_lock_until_slot: u64,
+    cooldown_slots: u64,
+) -> Result<u64> {
+    core::cmp::max(request_slot, slash_lock_until_slot)
+        .checked_add(cooldown_slots)
+        .ok_or_else(|| error!(FaultlineError::ArithmeticOverflow))
+}
+
+pub fn extended_slash_lock(current_lock: u64, new_deadline: u64) -> u64 {
+    core::cmp::max(current_lock, new_deadline)
+}
+
+fn next_config_id(current: u64, requested: u64) -> Result<u64> {
+    require!(
+        current == requested,
+        FaultlineError::InvalidEconomicConfigId
+    );
+    current
+        .checked_add(1)
+        .ok_or_else(|| error!(FaultlineError::ArithmeticOverflow))
+}
+
+#[cfg(test)]
+fn legacy_transaction_serialized_size(explicit_accounts: usize, data_bytes: usize) -> usize {
+    // One signature, one instruction, one-byte compact lengths, and one program key.
+    105 + (explicit_accounts + 1) * 32 + explicit_accounts + data_bytes
+}
+
 #[error_code]
 pub enum FaultlineError {
     #[msg("Arithmetic overflow")]
@@ -1871,11 +3187,82 @@ pub enum FaultlineError {
     CommitmentMismatch,
     #[msg("Trace has already been claimed for this proposal")]
     TraceAlreadyClaimed,
+    #[msg("Economic policy config id is not the next sequential id")]
+    InvalidEconomicConfigId,
+    #[msg("Unsupported economic token program")]
+    UnsupportedEconomicTokenProgram,
+    #[msg("Economic mint account is invalid")]
+    InvalidEconomicMint,
+    #[msg("Economic mint must not have a freeze authority")]
+    MintHasFreezeAuthority,
+    #[msg("Economic token account is invalid")]
+    InvalidEconomicTokenAccount,
+    #[msg("Token account is not the canonical associated token account")]
+    NonCanonicalTokenAccount,
+    #[msg("Token account has the wrong owner")]
+    WrongTokenOwner,
+    #[msg("Payment mint binding is incorrect")]
+    WrongPaymentMint,
+    #[msg("Economic policy binding is incorrect")]
+    WrongEconomicPolicy,
+    #[msg("Bounty amount must be non-zero")]
+    ZeroBountyAmount,
+    #[msg("Bond amount must be non-zero")]
+    ZeroBondAmount,
+    #[msg("Verifier fee must be non-zero")]
+    ZeroVerifierFee,
+    #[msg("Minimum verifier stake must be non-zero")]
+    ZeroMinimumStake,
+    #[msg("Stake amount must be non-zero")]
+    ZeroStakeAmount,
+    #[msg("Verifier slash amount must be non-zero")]
+    ZeroSlashAmount,
+    #[msg("Verifier slash amount exceeds minimum stake")]
+    SlashExceedsMinimumStake,
+    #[msg("Bonded challenge limit is invalid")]
+    InvalidChallengeLimit,
+    #[msg("Economic timing delay is outside protocol bounds")]
+    InvalidEconomicDelay,
+    #[msg("Maximum verifier fee reserve overflows")]
+    FeeReserveOverflow,
+    #[msg("Penalty basis points are invalid")]
+    InvalidPenaltyBasisPoints,
+    #[msg("Verifier stake is below the policy minimum")]
+    StakeBelowMinimum,
+    #[msg("Verifier stake withdrawal is pending")]
+    StakeWithdrawalPending,
+    #[msg("Verifier stake binding is incorrect")]
+    WrongVerifierStake,
+    #[msg("Remaining account count is incorrect")]
+    WrongRemainingAccountCount,
+    #[msg("Stake withdrawal was not requested")]
+    WithdrawalNotRequested,
+    #[msg("Stake withdrawal cooldown remains active")]
+    WithdrawalCooldownActive,
+    #[msg("Verifier stake remains slash-locked")]
+    StakeStillLocked,
+    #[msg("Vault binding is incorrect")]
+    WrongVault,
+    #[msg("Vault authority is incorrect")]
+    WrongVaultAuthority,
+    #[msg("Vault must begin empty")]
+    VaultMustStartEmpty,
+    #[msg("Vault account is already initialized")]
+    VaultAlreadyInitialized,
+    #[msg("Vault balance differs from recorded liability")]
+    VaultBalanceMismatch,
+    #[msg("Rent recipient is incorrect")]
+    WrongRentRecipient,
+    #[msg("Only the proposer or SafetyPolicy governance may fund proposal escrow")]
+    UnauthorizedEconomicFunder,
+    #[msg("Historical proposals cannot opt into Milestone 6 economics")]
+    HistoricalProposalCannotUseEconomics,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anchor_lang::Discriminator;
 
     #[test]
     fn challenge_commitment_vector_is_stable() {
@@ -1922,5 +3309,347 @@ mod tests {
         assert_eq!(8 + VerificationRound::INIT_SPACE, 317);
         assert_eq!(8 + ReplayResult::INIT_SPACE, 115);
         assert_eq!(8 + VerifierAttestation::INIT_SPACE, 177);
+    }
+
+    #[test]
+    fn milestone_six_foundation_account_sizes_are_stable() {
+        assert_eq!(8 + EconomicPolicyRegistry::INIT_SPACE, 97);
+        assert_eq!(8 + EconomicPolicy::INIT_SPACE, 251);
+        assert_eq!(8 + ProposalEscrow::INIT_SPACE, 370);
+        assert_eq!(8 + ChallengeBond::INIT_SPACE, 211);
+        assert_eq!(8 + VerifierStake::INIT_SPACE, 212);
+        assert_eq!(8 + VerifierEpochEconomics::INIT_SPACE, 113);
+        assert_eq!(8 + RoundEconomicState::INIT_SPACE, 139);
+        assert_eq!(8 + VerifierFeeClaim::INIT_SPACE, 153);
+        assert_eq!(8 + VerifierSlashReceipt::INIT_SPACE, 153);
+    }
+
+    #[test]
+    fn milestone_six_foundation_discriminators_are_stable() {
+        assert_eq!(
+            EconomicPolicyRegistry::DISCRIMINATOR,
+            [0xb7, 0x6f, 0x19, 0xea, 0xbb, 0x28, 0x65, 0x99]
+        );
+        assert_eq!(
+            EconomicPolicy::DISCRIMINATOR,
+            [0x9a, 0xe6, 0x27, 0xaa, 0xee, 0x39, 0xe1, 0xe8]
+        );
+        assert_eq!(
+            ProposalEscrow::DISCRIMINATOR,
+            [0x8b, 0x7f, 0x61, 0x7d, 0x11, 0xa0, 0x4d, 0x25]
+        );
+        assert_eq!(
+            ChallengeBond::DISCRIMINATOR,
+            [0x5b, 0x4c, 0x2e, 0x8a, 0x24, 0x40, 0x06, 0xee]
+        );
+        assert_eq!(
+            VerifierStake::DISCRIMINATOR,
+            [0x2f, 0xaa, 0x0c, 0x2b, 0xb7, 0xd5, 0xad, 0x7b]
+        );
+        assert_eq!(
+            VerifierEpochEconomics::DISCRIMINATOR,
+            [0xdd, 0x77, 0x98, 0xcd, 0x6a, 0xe8, 0x71, 0xe2]
+        );
+        assert_eq!(
+            RoundEconomicState::DISCRIMINATOR,
+            [0x21, 0xad, 0xea, 0xb2, 0xae, 0x0f, 0x7c, 0x3e]
+        );
+        assert_eq!(
+            VerifierFeeClaim::DISCRIMINATOR,
+            [0xf4, 0x05, 0x8d, 0x39, 0xe2, 0x10, 0xf2, 0xbf]
+        );
+        assert_eq!(
+            VerifierSlashReceipt::DISCRIMINATOR,
+            [0xe4, 0xd0, 0x83, 0xcf, 0x68, 0x1f, 0xdb, 0x7e]
+        );
+    }
+
+    #[test]
+    fn milestone_six_pda_vectors_are_stable() {
+        use std::str::FromStr;
+        let key = |byte| Pubkey::new_from_array([byte; 32]);
+        let vectors: Vec<(&str, Pubkey, u8)> = vec![
+            (
+                "registry",
+                Pubkey::find_program_address(
+                    &[ECONOMIC_POLICY_REGISTRY_SEED, key(1).as_ref()],
+                    &crate::ID,
+                )
+                .0,
+                252,
+            ),
+            (
+                "policy",
+                Pubkey::find_program_address(
+                    &[ECONOMIC_POLICY_SEED, key(2).as_ref(), &0u64.to_le_bytes()],
+                    &crate::ID,
+                )
+                .0,
+                255,
+            ),
+            (
+                "escrow",
+                Pubkey::find_program_address(&[PROPOSAL_ESCROW_SEED, key(3).as_ref()], &crate::ID)
+                    .0,
+                254,
+            ),
+            (
+                "bounty",
+                Pubkey::find_program_address(&[BOUNTY_VAULT_SEED, key(3).as_ref()], &crate::ID).0,
+                254,
+            ),
+            (
+                "fee",
+                Pubkey::find_program_address(&[FEE_VAULT_SEED, key(3).as_ref()], &crate::ID).0,
+                255,
+            ),
+            (
+                "penalty",
+                Pubkey::find_program_address(&[PENALTY_VAULT_SEED, key(3).as_ref()], &crate::ID).0,
+                255,
+            ),
+            (
+                "bond",
+                Pubkey::find_program_address(&[CHALLENGE_BOND_SEED, key(4).as_ref()], &crate::ID).0,
+                254,
+            ),
+            (
+                "bond-vault",
+                Pubkey::find_program_address(&[BOND_VAULT_SEED, key(4).as_ref()], &crate::ID).0,
+                254,
+            ),
+            (
+                "stake",
+                Pubkey::find_program_address(
+                    &[VERIFIER_STAKE_SEED, key(5).as_ref(), key(6).as_ref()],
+                    &crate::ID,
+                )
+                .0,
+                255,
+            ),
+            (
+                "stake-vault",
+                Pubkey::find_program_address(
+                    &[STAKE_VAULT_SEED, key(5).as_ref(), key(6).as_ref()],
+                    &crate::ID,
+                )
+                .0,
+                255,
+            ),
+            (
+                "epoch-economics",
+                Pubkey::find_program_address(
+                    &[
+                        VERIFIER_EPOCH_ECONOMICS_SEED,
+                        key(7).as_ref(),
+                        key(5).as_ref(),
+                    ],
+                    &crate::ID,
+                )
+                .0,
+                255,
+            ),
+            (
+                "round-economics",
+                Pubkey::find_program_address(&[ROUND_ECONOMICS_SEED, key(8).as_ref()], &crate::ID)
+                    .0,
+                254,
+            ),
+            (
+                "fee-claim",
+                Pubkey::find_program_address(
+                    &[VERIFIER_FEE_CLAIM_SEED, key(8).as_ref(), key(6).as_ref()],
+                    &crate::ID,
+                )
+                .0,
+                254,
+            ),
+            (
+                "slash",
+                Pubkey::find_program_address(
+                    &[VERIFIER_SLASH_SEED, key(8).as_ref(), key(6).as_ref()],
+                    &crate::ID,
+                )
+                .0,
+                254,
+            ),
+        ];
+        let expected = [
+            "9u3NWMs4rdqKZ1VbJD8EeRbGvpvsUbTPwZCbXp4aNoEe",
+            "5EXY7mfdpfHrTJ4DxAULebhKcTrdNqaPenMDVTGxSYvh",
+            "FqHf62Yy9CLpoPTCfatKppGN5U5hJwssizEhC7AzqAeG",
+            "CNnK6wYYGePekn8mpCdNdgEmsdZ5jEq1UyxbjzTPCBNm",
+            "EEDDQyutPCAJAdFTSCyq37iNjnJAWtKTxE5w3aYnKA55",
+            "EdfWAHzN3DqMrzvq3Un1oM7e7gfZ8H3uLybQktpFhM1C",
+            "DfesiCDmJLhuZJyVb7F8Mpx8qe3VksweoqcNJd5gXgu8",
+            "BTsp3RfaJjHcLWBXcNk7UHWgNxv7dGC8y3FDcfwYRW5t",
+            "7xAnha5oBd142Cjjn5HKZZVN8GQbsSQYPS7Ko6rkbFof",
+            "25jN5qJuGizSZ2iktCtPZcMqpx5rKH4yFqs9aZ3UVFtd",
+            "CSuV2NFDMwb5mwLLXaa8SKYxFvu9H6YD9zrqMNtDS62h",
+            "DrTHx8dMvhBoi2RTTutAzvuRG6q4zeUbsVcDDnkTY8F",
+            "EWWEZjrZSadFyZWms9U441ToxydxuVCSgX6tmaDGTu6H",
+            "7G1CdNWszmMdmc5bBTp2VXqfC5mka8qCvP2e1qX1EnuD",
+        ];
+        for ((name, actual, bump), expected_address) in vectors.iter().zip(expected.iter()) {
+            assert_eq!(
+                *actual,
+                Pubkey::from_str(expected_address).unwrap(),
+                "{name}"
+            );
+            let seeds_bump = match *name {
+                "registry" => {
+                    Pubkey::find_program_address(
+                        &[ECONOMIC_POLICY_REGISTRY_SEED, key(1).as_ref()],
+                        &crate::ID,
+                    )
+                    .1
+                }
+                "policy" => {
+                    Pubkey::find_program_address(
+                        &[ECONOMIC_POLICY_SEED, key(2).as_ref(), &0u64.to_le_bytes()],
+                        &crate::ID,
+                    )
+                    .1
+                }
+                "escrow" => {
+                    Pubkey::find_program_address(
+                        &[PROPOSAL_ESCROW_SEED, key(3).as_ref()],
+                        &crate::ID,
+                    )
+                    .1
+                }
+                "bounty" => {
+                    Pubkey::find_program_address(&[BOUNTY_VAULT_SEED, key(3).as_ref()], &crate::ID)
+                        .1
+                }
+                "fee" => {
+                    Pubkey::find_program_address(&[FEE_VAULT_SEED, key(3).as_ref()], &crate::ID).1
+                }
+                "penalty" => {
+                    Pubkey::find_program_address(&[PENALTY_VAULT_SEED, key(3).as_ref()], &crate::ID)
+                        .1
+                }
+                "bond" => {
+                    Pubkey::find_program_address(
+                        &[CHALLENGE_BOND_SEED, key(4).as_ref()],
+                        &crate::ID,
+                    )
+                    .1
+                }
+                "bond-vault" => {
+                    Pubkey::find_program_address(&[BOND_VAULT_SEED, key(4).as_ref()], &crate::ID).1
+                }
+                "stake" => {
+                    Pubkey::find_program_address(
+                        &[VERIFIER_STAKE_SEED, key(5).as_ref(), key(6).as_ref()],
+                        &crate::ID,
+                    )
+                    .1
+                }
+                "stake-vault" => {
+                    Pubkey::find_program_address(
+                        &[STAKE_VAULT_SEED, key(5).as_ref(), key(6).as_ref()],
+                        &crate::ID,
+                    )
+                    .1
+                }
+                "epoch-economics" => {
+                    Pubkey::find_program_address(
+                        &[
+                            VERIFIER_EPOCH_ECONOMICS_SEED,
+                            key(7).as_ref(),
+                            key(5).as_ref(),
+                        ],
+                        &crate::ID,
+                    )
+                    .1
+                }
+                "round-economics" => {
+                    Pubkey::find_program_address(
+                        &[ROUND_ECONOMICS_SEED, key(8).as_ref()],
+                        &crate::ID,
+                    )
+                    .1
+                }
+                "fee-claim" => {
+                    Pubkey::find_program_address(
+                        &[VERIFIER_FEE_CLAIM_SEED, key(8).as_ref(), key(6).as_ref()],
+                        &crate::ID,
+                    )
+                    .1
+                }
+                "slash" => {
+                    Pubkey::find_program_address(
+                        &[VERIFIER_SLASH_SEED, key(8).as_ref(), key(6).as_ref()],
+                        &crate::ID,
+                    )
+                    .1
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(*bump, seeds_bump, "{name} bump");
+        }
+    }
+
+    #[test]
+    fn economic_policy_versioning_is_atomic() {
+        let mut next = ECONOMIC_POLICY_FIRST_CONFIG_ID;
+        assert!(next_config_id(next, 1).is_err());
+        assert_eq!(next, 0, "failed creation consumed a config id");
+        next = next_config_id(next, 0).unwrap();
+        assert_eq!(next, 1);
+        assert!(next_config_id(next, 0).is_err());
+    }
+
+    #[test]
+    fn fee_reserve_and_penalty_math_are_checked() {
+        assert_eq!(maximum_fee_reserve(10, 8).unwrap(), 640);
+        assert!(maximum_fee_reserve(u64::MAX, 8).is_err());
+        assert_eq!(penalty_amount(101, HOLD_BOND_SLASH_BPS).unwrap(), 25);
+        assert_eq!(
+            penalty_amount(101, HUNTER_NON_REVEAL_SLASH_BPS).unwrap(),
+            101
+        );
+        assert!(penalty_amount(1, BPS_DENOMINATOR + 1).is_err());
+    }
+
+    #[test]
+    fn economic_timing_bounds_are_exact() {
+        assert!(validate_delay(0, 1, 10).is_err());
+        assert!(validate_delay(1, 1, 10).is_ok());
+        assert!(validate_delay(10, 1, 10).is_ok());
+        assert!(validate_delay(11, 1, 10).is_err());
+        assert_eq!(withdrawal_available_slot(100, 120, 5).unwrap(), 125);
+        assert_eq!(withdrawal_available_slot(130, 120, 5).unwrap(), 135);
+        assert!(withdrawal_available_slot(u64::MAX, 0, 1).is_err());
+        assert_eq!(extended_slash_lock(120, 100), 120);
+        assert_eq!(extended_slash_lock(120, 140), 140);
+    }
+
+    #[test]
+    fn verifier_stake_derivation_is_policy_specific() {
+        let verifier = Pubkey::new_from_array([9; 32]);
+        let policy_a = Pubkey::new_from_array([10; 32]);
+        let policy_b = Pubkey::new_from_array([11; 32]);
+        let stake_a = Pubkey::find_program_address(
+            &[VERIFIER_STAKE_SEED, policy_a.as_ref(), verifier.as_ref()],
+            &crate::ID,
+        )
+        .0;
+        let stake_b = Pubkey::find_program_address(
+            &[VERIFIER_STAKE_SEED, policy_b.as_ref(), verifier.as_ref()],
+            &crate::ID,
+        )
+        .0;
+        assert_ne!(stake_a, stake_b);
+    }
+
+    #[test]
+    fn eight_verifier_legacy_transaction_budget_is_bounded() {
+        assert_eq!(legacy_transaction_serialized_size(16, 8), 673);
+        assert_eq!(legacy_transaction_serialized_size(25, 8), 970);
+        assert_eq!(legacy_transaction_serialized_size(6, 8), 343);
+        assert_eq!(legacy_transaction_serialized_size(13, 8), 574);
+        assert!(legacy_transaction_serialized_size(25, 8) < 1_232);
     }
 }
