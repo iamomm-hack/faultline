@@ -363,7 +363,8 @@ function temporaryDecision(id: bigint, state: 2 | 3): TransactionInstruction {
     [
       { pubkey: governance.publicKey, isSigner: true, isWritable: false },
       { pubkey: policy, isSigner: false, isWritable: false },
-      { pubkey: proposalAddress(id), isSigner: false, isWritable: true }
+      { pubkey: proposalAddress(id), isSigner: false, isWritable: true },
+      { pubkey: verificationGateAddress(proposalAddress(id)), isSigner: false, isWritable: false }
     ],
     Buffer.from([state, 0, 0])
   );
