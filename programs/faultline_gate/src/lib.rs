@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     bpf_loader_upgradeable::{self, UpgradeableLoaderState},
-    hash::hash,
+    hash::{hash, hashv},
     program::invoke_signed,
 };
 
@@ -13,6 +13,12 @@ const GUARD_SEED: &[u8] = b"guard";
 const BUFFER_SEED: &[u8] = b"buffer";
 const SAFETY_POLICY_SEED: &[u8] = b"safety-policy";
 const UPGRADE_PROPOSAL_SEED: &[u8] = b"upgrade-proposal";
+const INVARIANT_SEED: &[u8] = b"invariant";
+const CHALLENGE_COMMIT_SEED: &[u8] = b"challenge-commit";
+const TRACE_CLAIM_SEED: &[u8] = b"trace-claim";
+const CHALLENGE_DOMAIN: &[u8] = b"FAULTLINE_CHALLENGE_V1";
+const MIN_REVEAL_DELAY_SLOTS: u64 = 1;
+const MAX_REVEAL_HORIZON_SLOTS: u64 = 8;
 
 #[program]
 pub mod faultline_gate {
@@ -100,6 +106,61 @@ pub mod faultline_gate {
             slot: Clock::get()?.slot,
             old_status,
             new_status: status
+        });
+        Ok(())
+    }
+
+    pub fn initialize_invariant(
+        ctx: Context<InitializeInvariant>,
+        invariant_id: u64,
+        invariant_kind: InvariantKind,
+        name_hash: [u8; 32],
+        specification_hash: [u8; 32],
+    ) -> Result<()> {
+        require!(!is_zero_hash(&name_hash), FaultlineError::ZeroNameHash);
+        require!(
+            !is_zero_hash(&specification_hash),
+            FaultlineError::ZeroSpecificationHash
+        );
+        let slot = Clock::get()?.slot;
+        let invariant = &mut ctx.accounts.invariant;
+        invariant.safety_policy = ctx.accounts.policy.key();
+        invariant.invariant_id = invariant_id;
+        invariant.invariant_kind = invariant_kind;
+        invariant.name_hash = name_hash;
+        invariant.specification_hash = specification_hash;
+        invariant.enabled = true;
+        invariant.created_by = ctx.accounts.governance.key();
+        invariant.created_at_slot = slot;
+        invariant.disabled_at_slot = None;
+        invariant.bump = ctx.bumps.invariant;
+        emit!(InvariantInitialized {
+            policy: invariant.safety_policy,
+            invariant: invariant.key(),
+            invariant_id,
+            invariant_kind,
+            actor: invariant.created_by,
+            slot,
+        });
+        Ok(())
+    }
+
+    pub fn set_invariant_enabled(ctx: Context<SetInvariantEnabled>, enabled: bool) -> Result<()> {
+        let invariant = &mut ctx.accounts.invariant;
+        require!(
+            invariant.enabled != enabled,
+            FaultlineError::RepeatedInvariantStatus
+        );
+        let slot = Clock::get()?.slot;
+        invariant.enabled = enabled;
+        invariant.disabled_at_slot = if enabled { None } else { Some(slot) };
+        emit!(InvariantStatusChanged {
+            policy: ctx.accounts.policy.key(),
+            invariant: invariant.key(),
+            invariant_id: invariant.invariant_id,
+            actor: ctx.accounts.governance.key(),
+            slot,
+            enabled,
         });
         Ok(())
     }
@@ -213,6 +274,134 @@ pub mod faultline_gate {
             start_slot: start,
             end_slot: end,
             state: proposal.state
+        });
+        Ok(())
+    }
+
+    pub fn commit_challenge(
+        ctx: Context<CommitChallenge>,
+        commitment_hash: [u8; 32],
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.policy.status == PolicyStatus::Active,
+            FaultlineError::PolicyPaused
+        );
+        require!(
+            ctx.accounts.proposal.state == ProposalState::ChallengeActive,
+            FaultlineError::ChallengeNotActive
+        );
+        require!(
+            ctx.accounts.invariant.enabled,
+            FaultlineError::InvariantDisabled
+        );
+        require!(
+            !is_zero_hash(&commitment_hash),
+            FaultlineError::ZeroCommitmentHash
+        );
+        let start = ctx
+            .accounts
+            .proposal
+            .challenge_start_slot
+            .ok_or(FaultlineError::MissingChallengeWindow)?;
+        let end = ctx
+            .accounts
+            .proposal
+            .challenge_end_slot
+            .ok_or(FaultlineError::MissingChallengeWindow)?;
+        let slot = Clock::get()?.slot;
+        require!(slot >= start, FaultlineError::ChallengeWindowNotStarted);
+        require!(slot <= end, FaultlineError::ChallengeWindowEnded);
+        let earliest_reveal_slot = slot
+            .checked_add(MIN_REVEAL_DELAY_SLOTS)
+            .ok_or(FaultlineError::ArithmeticOverflow)?;
+        require!(
+            earliest_reveal_slot <= end,
+            FaultlineError::InsufficientRevealWindow
+        );
+        let horizon = slot
+            .checked_add(MAX_REVEAL_HORIZON_SLOTS)
+            .ok_or(FaultlineError::ArithmeticOverflow)?;
+        let latest_reveal_slot = core::cmp::min(horizon, end);
+        let challenge_commit = &mut ctx.accounts.challenge_commit;
+        challenge_commit.proposal = ctx.accounts.proposal.key();
+        challenge_commit.invariant = ctx.accounts.invariant.key();
+        challenge_commit.hunter = ctx.accounts.hunter.key();
+        challenge_commit.commitment_hash = commitment_hash;
+        challenge_commit.committed_at_slot = slot;
+        challenge_commit.earliest_reveal_slot = earliest_reveal_slot;
+        challenge_commit.latest_reveal_slot = latest_reveal_slot;
+        challenge_commit.status = ChallengeCommitStatus::Committed;
+        challenge_commit.revealed_trace_hash = None;
+        challenge_commit.revealed_at_slot = None;
+        challenge_commit.bump = ctx.bumps.challenge_commit;
+        emit!(ChallengeCommitted {
+            policy: ctx.accounts.policy.key(),
+            proposal: challenge_commit.proposal,
+            invariant: challenge_commit.invariant,
+            challenge_commit: challenge_commit.key(),
+            hunter: challenge_commit.hunter,
+            commitment_hash,
+            committed_at_slot: slot,
+            earliest_reveal_slot,
+            latest_reveal_slot,
+        });
+        Ok(())
+    }
+
+    pub fn reveal_challenge(
+        ctx: Context<RevealChallenge>,
+        trace_hash: [u8; 32],
+        salt: [u8; 32],
+    ) -> Result<()> {
+        let challenge_commit = &mut ctx.accounts.challenge_commit;
+        require!(
+            challenge_commit.status == ChallengeCommitStatus::Committed,
+            FaultlineError::ChallengeAlreadyRevealed
+        );
+        let slot = Clock::get()?.slot;
+        require!(
+            slot >= challenge_commit.earliest_reveal_slot,
+            FaultlineError::RevealTooEarly
+        );
+        require!(
+            slot <= challenge_commit.latest_reveal_slot,
+            FaultlineError::RevealWindowEnded
+        );
+        let expected = challenge_commitment(
+            &challenge_commit.proposal,
+            &challenge_commit.invariant,
+            &challenge_commit.hunter,
+            &trace_hash,
+            &salt,
+        );
+        require!(
+            expected == challenge_commit.commitment_hash,
+            FaultlineError::CommitmentMismatch
+        );
+        let trace_claim = &mut ctx.accounts.trace_claim;
+        require!(
+            trace_claim.proposal == Pubkey::default(),
+            FaultlineError::TraceAlreadyClaimed
+        );
+        trace_claim.proposal = ctx.accounts.proposal.key();
+        trace_claim.invariant = ctx.accounts.invariant.key();
+        trace_claim.challenge_commit = challenge_commit.key();
+        trace_claim.trace_hash = trace_hash;
+        trace_claim.hunter = ctx.accounts.hunter.key();
+        trace_claim.revealed_at_slot = slot;
+        trace_claim.bump = ctx.bumps.trace_claim;
+        challenge_commit.status = ChallengeCommitStatus::Revealed;
+        challenge_commit.revealed_trace_hash = Some(trace_hash);
+        challenge_commit.revealed_at_slot = Some(slot);
+        emit!(ChallengeRevealed {
+            policy: ctx.accounts.policy.key(),
+            proposal: ctx.accounts.proposal.key(),
+            invariant: ctx.accounts.invariant.key(),
+            challenge_commit: challenge_commit.key(),
+            trace_claim: trace_claim.key(),
+            hunter: ctx.accounts.hunter.key(),
+            trace_hash,
+            slot,
         });
         Ok(())
     }
@@ -398,6 +587,25 @@ pub struct SetSafetyPolicyStatus<'info> {
     pub policy: Account<'info, SafetyPolicy>,
 }
 #[derive(Accounts)]
+#[instruction(invariant_id: u64)]
+pub struct InitializeInvariant<'info> {
+    #[account(mut)]
+    pub governance: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump, constraint = policy.governance_authority == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(init, payer = governance, space = 8 + InvariantDefinition::INIT_SPACE, seeds = [INVARIANT_SEED, policy.key().as_ref(), &invariant_id.to_le_bytes()], bump)]
+    pub invariant: Account<'info, InvariantDefinition>,
+    pub system_program: Program<'info, System>,
+}
+#[derive(Accounts)]
+pub struct SetInvariantEnabled<'info> {
+    pub governance: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump, constraint = policy.governance_authority == governance.key() @ FaultlineError::UnauthorizedGovernance)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(mut, seeds = [INVARIANT_SEED, policy.key().as_ref(), &invariant.invariant_id.to_le_bytes()], bump = invariant.bump, constraint = invariant.safety_policy == policy.key() @ FaultlineError::WrongInvariantPolicy)]
+    pub invariant: Account<'info, InvariantDefinition>,
+}
+#[derive(Accounts)]
 #[instruction(proposal_id: u64)]
 pub struct CreateUpgradeProposal<'info> {
     #[account(mut)]
@@ -426,6 +634,38 @@ pub struct StartChallenge<'info> {
     pub policy: Account<'info, SafetyPolicy>,
     #[account(mut, seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
     pub proposal: Account<'info, UpgradeProposal>,
+}
+#[derive(Accounts)]
+#[instruction(commitment_hash: [u8; 32])]
+pub struct CommitChallenge<'info> {
+    #[account(mut)]
+    pub hunter: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
+    pub proposal: Account<'info, UpgradeProposal>,
+    #[account(seeds = [INVARIANT_SEED, policy.key().as_ref(), &invariant.invariant_id.to_le_bytes()], bump = invariant.bump, constraint = invariant.safety_policy == policy.key() @ FaultlineError::WrongInvariantPolicy)]
+    pub invariant: Account<'info, InvariantDefinition>,
+    #[account(init, payer = hunter, space = 8 + ChallengeCommit::INIT_SPACE, seeds = [CHALLENGE_COMMIT_SEED, proposal.key().as_ref(), hunter.key().as_ref(), commitment_hash.as_ref()], bump)]
+    pub challenge_commit: Account<'info, ChallengeCommit>,
+    pub system_program: Program<'info, System>,
+}
+#[derive(Accounts)]
+#[instruction(trace_hash: [u8; 32])]
+pub struct RevealChallenge<'info> {
+    #[account(mut)]
+    pub hunter: Signer<'info>,
+    #[account(seeds = [SAFETY_POLICY_SEED, policy.target_program.as_ref()], bump = policy.bump)]
+    pub policy: Account<'info, SafetyPolicy>,
+    #[account(seeds = [UPGRADE_PROPOSAL_SEED, policy.key().as_ref(), &proposal.proposal_id.to_le_bytes()], bump = proposal.bump, has_one = policy)]
+    pub proposal: Account<'info, UpgradeProposal>,
+    #[account(seeds = [INVARIANT_SEED, policy.key().as_ref(), &invariant.invariant_id.to_le_bytes()], bump = invariant.bump, constraint = invariant.safety_policy == policy.key() @ FaultlineError::WrongInvariantPolicy)]
+    pub invariant: Account<'info, InvariantDefinition>,
+    #[account(mut, seeds = [CHALLENGE_COMMIT_SEED, proposal.key().as_ref(), challenge_commit.hunter.as_ref(), challenge_commit.commitment_hash.as_ref()], bump = challenge_commit.bump, constraint = challenge_commit.proposal == proposal.key() @ FaultlineError::WrongChallengeProposal, constraint = challenge_commit.invariant == invariant.key() @ FaultlineError::WrongChallengeInvariant, constraint = challenge_commit.hunter == hunter.key() @ FaultlineError::UnauthorizedHunter)]
+    pub challenge_commit: Account<'info, ChallengeCommit>,
+    #[account(init_if_needed, payer = hunter, space = 8 + TraceClaim::INIT_SPACE, seeds = [TRACE_CLAIM_SEED, proposal.key().as_ref(), trace_hash.as_ref()], bump)]
+    pub trace_claim: Account<'info, TraceClaim>,
+    pub system_program: Program<'info, System>,
 }
 #[derive(Accounts)]
 pub struct ExpireProposal<'info> {
@@ -524,6 +764,46 @@ pub struct BufferClaim {
     pub candidate_buffer: Pubkey,
     pub bump: u8,
 }
+#[account]
+#[derive(InitSpace)]
+pub struct InvariantDefinition {
+    pub safety_policy: Pubkey,
+    pub invariant_id: u64,
+    pub invariant_kind: InvariantKind,
+    pub name_hash: [u8; 32],
+    pub specification_hash: [u8; 32],
+    pub enabled: bool,
+    pub created_by: Pubkey,
+    pub created_at_slot: u64,
+    pub disabled_at_slot: Option<u64>,
+    pub bump: u8,
+}
+#[account]
+#[derive(InitSpace)]
+pub struct ChallengeCommit {
+    pub proposal: Pubkey,
+    pub invariant: Pubkey,
+    pub hunter: Pubkey,
+    pub commitment_hash: [u8; 32],
+    pub committed_at_slot: u64,
+    pub earliest_reveal_slot: u64,
+    pub latest_reveal_slot: u64,
+    pub status: ChallengeCommitStatus,
+    pub revealed_trace_hash: Option<[u8; 32]>,
+    pub revealed_at_slot: Option<u64>,
+    pub bump: u8,
+}
+#[account]
+#[derive(InitSpace)]
+pub struct TraceClaim {
+    pub proposal: Pubkey,
+    pub invariant: Pubkey,
+    pub challenge_commit: Pubkey,
+    pub trace_hash: [u8; 32],
+    pub hunter: Pubkey,
+    pub revealed_at_slot: u64,
+    pub bump: u8,
+}
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
 pub enum PolicyStatus {
     Active,
@@ -537,6 +817,19 @@ pub enum ProposalState {
     Rejected,
     Expired,
     Executed,
+}
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
+pub enum InvariantKind {
+    Authorization,
+    AssetConservation,
+    BalancePreservation,
+    Solvency,
+    PrivilegeBoundary,
+}
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, PartialEq, Eq)]
+pub enum ChallengeCommitStatus {
+    Committed,
+    Revealed,
 }
 
 #[event]
@@ -555,6 +848,24 @@ pub struct SafetyPolicyStatusChanged {
     pub slot: u64,
     pub old_status: PolicyStatus,
     pub new_status: PolicyStatus,
+}
+#[event]
+pub struct InvariantInitialized {
+    pub policy: Pubkey,
+    pub invariant: Pubkey,
+    pub invariant_id: u64,
+    pub invariant_kind: InvariantKind,
+    pub actor: Pubkey,
+    pub slot: u64,
+}
+#[event]
+pub struct InvariantStatusChanged {
+    pub policy: Pubkey,
+    pub invariant: Pubkey,
+    pub invariant_id: u64,
+    pub actor: Pubkey,
+    pub slot: u64,
+    pub enabled: bool,
 }
 #[event]
 pub struct UpgradeProposalCreated {
@@ -576,6 +887,29 @@ pub struct ChallengeStarted {
     pub start_slot: u64,
     pub end_slot: u64,
     pub state: ProposalState,
+}
+#[event]
+pub struct ChallengeCommitted {
+    pub policy: Pubkey,
+    pub proposal: Pubkey,
+    pub invariant: Pubkey,
+    pub challenge_commit: Pubkey,
+    pub hunter: Pubkey,
+    pub commitment_hash: [u8; 32],
+    pub committed_at_slot: u64,
+    pub earliest_reveal_slot: u64,
+    pub latest_reveal_slot: u64,
+}
+#[event]
+pub struct ChallengeRevealed {
+    pub policy: Pubkey,
+    pub proposal: Pubkey,
+    pub invariant: Pubkey,
+    pub challenge_commit: Pubkey,
+    pub trace_claim: Pubkey,
+    pub hunter: Pubkey,
+    pub trace_hash: [u8; 32],
+    pub slot: u64,
 }
 #[event]
 pub struct TemporaryDecisionRecorded {
@@ -682,6 +1016,26 @@ fn candidate_buffer_hash(buffer: &AccountInfo) -> Result<[u8; 32]> {
     buffer_authority(buffer)?;
     Ok(hash(&buffer.try_borrow_data()?).to_bytes())
 }
+pub fn challenge_commitment(
+    proposal: &Pubkey,
+    invariant: &Pubkey,
+    hunter: &Pubkey,
+    trace_hash: &[u8; 32],
+    salt: &[u8; 32],
+) -> [u8; 32] {
+    hashv(&[
+        CHALLENGE_DOMAIN,
+        proposal.as_ref(),
+        invariant.as_ref(),
+        hunter.as_ref(),
+        trace_hash,
+        salt,
+    ])
+    .to_bytes()
+}
+fn is_zero_hash(value: &[u8; 32]) -> bool {
+    value.iter().all(|byte| *byte == 0)
+}
 fn loader_state(account: &AccountInfo) -> Result<UpgradeableLoaderState> {
     bincode::deserialize(&account.try_borrow_data()?)
         .map_err(|_| error!(FaultlineError::InvalidLoaderState))
@@ -694,6 +1048,10 @@ fn program_data_address(program: &Pubkey) -> Pubkey {
 pub enum FaultlineError {
     #[msg("Arithmetic overflow")]
     ArithmeticOverflow,
+    #[msg("Challenge commitment was already revealed")]
+    ChallengeAlreadyRevealed,
+    #[msg("Proposal is not in an active challenge state")]
+    ChallengeNotActive,
     #[msg("Candidate buffer hash does not match the proposal commitment")]
     CandidateHashMismatch,
     #[msg("Candidate buffer is not locked to the Guard PDA")]
@@ -704,6 +1062,8 @@ pub enum FaultlineError {
     ChallengeDurationTooShort,
     #[msg("Challenge window has ended")]
     ChallengeWindowEnded,
+    #[msg("Challenge window has not started")]
+    ChallengeWindowNotStarted,
     #[msg("Challenge window is still active")]
     ChallengeWindowStillActive,
     #[msg("A decision was already recorded")]
@@ -716,6 +1076,10 @@ pub enum FaultlineError {
     InvalidProposalTransition,
     #[msg("Temporary decision must be Approved or Rejected")]
     InvalidTemporaryDecision,
+    #[msg("Invariant is disabled")]
+    InvariantDisabled,
+    #[msg("Insufficient challenge-window time remains for a reveal")]
+    InsufficientRevealWindow,
     #[msg("Challenge window has not been started")]
     MissingChallengeWindow,
     #[msg("Policy is paused")]
@@ -724,24 +1088,69 @@ pub enum FaultlineError {
     ProposalNotApproved,
     #[msg("Program is immutable")]
     ProgramImmutable,
+    #[msg("Repeated invariant status change")]
+    RepeatedInvariantStatus,
+    #[msg("Reveal window has ended")]
+    RevealWindowEnded,
+    #[msg("Reveal is before the earliest allowed slot")]
+    RevealTooEarly,
     #[msg("Repeated policy status change")]
     RepeatedPolicyStatus,
     #[msg("Target program is not executable")]
     TargetNotExecutable,
     #[msg("Only configured governance may perform this action")]
     UnauthorizedGovernance,
+    #[msg("Only the hunter that created this commitment may reveal it")]
+    UnauthorizedHunter,
     #[msg("Only the proposer or governance may start a challenge")]
     UnauthorizedChallengeStarter,
     #[msg("Only the policy authority may initialize this policy")]
     UnauthorizedPolicyAuthority,
     #[msg("Account is not owned by loader-v3")]
     WrongAccountOwner,
+    #[msg("Challenge commitment is bound to another invariant")]
+    WrongChallengeInvariant,
+    #[msg("Challenge commitment is bound to another proposal")]
+    WrongChallengeProposal,
+    #[msg("Invariant belongs to another SafetyPolicy")]
+    WrongInvariantPolicy,
     #[msg("Incorrect ProgramData account")]
     WrongProgramData,
     #[msg("Incorrect target program")]
     WrongTargetProgram,
     #[msg("Challenge duration must be non-zero")]
     ZeroChallengeDuration,
+    #[msg("Commitment hash must be non-zero")]
+    ZeroCommitmentHash,
+    #[msg("Invariant name hash must be non-zero")]
+    ZeroNameHash,
+    #[msg("Invariant specification hash must be non-zero")]
+    ZeroSpecificationHash,
     #[msg("Verifier quorum configuration must be non-zero")]
     ZeroVerifierQuorum,
+    #[msg("Revealed trace does not match the commitment")]
+    CommitmentMismatch,
+    #[msg("Trace has already been claimed for this proposal")]
+    TraceAlreadyClaimed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn challenge_commitment_vector_is_stable() {
+        let proposal = Pubkey::new_from_array([1; 32]);
+        let invariant = Pubkey::new_from_array([2; 32]);
+        let hunter = Pubkey::new_from_array([3; 32]);
+        let actual = challenge_commitment(&proposal, &invariant, &hunter, &[4; 32], &[5; 32]);
+        assert_eq!(
+            actual,
+            [
+                0x2d, 0xcc, 0x93, 0x3f, 0x33, 0x07, 0x28, 0x68, 0x60, 0x90, 0x0d, 0xcd, 0xf1, 0x22,
+                0x56, 0x59, 0xb4, 0xfc, 0xfc, 0xc4, 0xdc, 0xad, 0x16, 0xd6, 0x59, 0xc9, 0x07, 0xf2,
+                0x0c, 0x41, 0x74, 0xf0,
+            ]
+        );
+    }
 }

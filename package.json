@@ -12,6 +12,7 @@
     "demo:patch-v3": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-treasury-demo.ps1 -Scenario v3",
     "demo:proposal": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-treasury-demo.ps1 -Scenario v3",
     "test:proposal-state-machine": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-proposal-state-machine-tests.ps1",
+    "test:challenge-commit-reveal": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-challenge-commit-reveal-tests.ps1",
     "test": "npm run demo:guard",
     "test:guard": "npm run demo:guard",
     "test:treasury-versions": "npm run demo:exploit-v2 && npm run demo:patch-v3",
