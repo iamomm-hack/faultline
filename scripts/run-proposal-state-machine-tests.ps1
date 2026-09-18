@@ -10,6 +10,8 @@ $localRoot = [IO.Path]::GetFullPath((Join-Path $root '.localnet'))
 $evidence = Join-Path $localRoot 'proposal-state-machine-evidence.log'
 $ids = Get-Content -Raw (Join-Path $localRoot 'ids.json') | ConvertFrom-Json
 $validatorExe = (Get-Command solana-test-validator.exe -ErrorAction Stop).Source
+$singleShardRequested = $PSBoundParameters.ContainsKey('Shard')
+$requestedShardName = $Shard
 if (Get-NetTCPConnection -LocalPort 8899 -State Listen -ErrorAction SilentlyContinue) {
   throw 'Port 8899 is LISTENING. Refusing to connect to or stop an unowned validator.'
 }
@@ -83,8 +85,9 @@ foreach ($shard in $shards) {
     }
   }
 }
-if ($Shard) {
-  Write-Output "Proposal state-machine shard passed: $Shard"
+if ($singleShardRequested) {
+  Write-Output "Proposal state-machine shard passed: $requestedShardName"
 } else {
+  Write-Output 'Proposal state-machine shards passed: policy, terminal, authority'
   Write-Output 'ALL MILESTONE-3 ASSERTIONS 1-39 PASSED'
 }

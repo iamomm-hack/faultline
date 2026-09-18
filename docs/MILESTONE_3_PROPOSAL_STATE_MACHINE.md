@@ -52,17 +52,45 @@ Events: `SafetyPolicyInitialized`, `SafetyPolicyStatusChanged`, `UpgradeProposal
 npm.cmd run demo:guard
 npm.cmd run test:treasury-versions
 npm.cmd run demo:proposal
+npm.cmd run test:proposal-state-machine
 ```
 
 `demo:proposal` prints policy, Draft proposal, challenge slots, early-execution rejection, temporary decision, slot progression, the real Guard loader CPI, version check, and repeated-execution rejection.
 
 The lifecycle demonstration uses transaction-driven slot advancement, never wall-clock sleeping. The expanded negative-case matrix remains the acceptance gate for declaring this milestone complete.
 
+## Localnet acceptance proof
+
+The dedicated runner creates independent `.localnet/proposal-policy`, `.localnet/proposal-terminal`, and `.localnet/proposal-authority` ledgers. For each shard it records one validator PID, deploys an immutable Gate and upgradeable treasury v1 through the proven post-genesis loader-v3 flow, runs one assertion group, and stops only that owned validator in `finally`.
+
+Solana 1.18.10 on Windows attempts a slot-100 snapshot using an unavailable symlink privilege. The supported `--ticks-per-slot 1024` setting keeps each deterministic shard below that boundary while preserving genuine transactions and slot-driven challenge progression. The passing run completed policy at slot 26, terminal at slot 37, and authority at slot 32.
+
+| Shard | Assertions | Proven behavior |
+| --- | --- | --- |
+| policy | 1–14 | Policy initialization and uniqueness; governance status authorization; paused submission; Guard/target seed binding; exact candidate hash; unlocked-buffer rejection and rollback; duplicate proposal; minimum window; Draft execution rejection; challenge and decision authorization; early execution rejection |
+| terminal | 15–23 | Late-decision and early-expiry rejection; Expired and Rejected terminal states; one real Guard loader-v3 upgrade; treasury v2 behavior; retained execution metadata; all repeated Executed transitions rejected |
+| authority | 24–39 | Direct-loader rejection; Guard and buffer locking; BufferClaim reuse; missing claim (29a); initialized foreign candidate plus claim substitution (29b); immutable commitment; policy/proposal/target/ProgramData/loader/buffer/Guard substitution; real guarded execution |
+
+Candidate integrity is enforced by SHA-256 over exact loader-v3 Buffer account data, transfer of buffer authority to the Guard before proposal creation, and a `BufferClaim` that binds one buffer to one proposal. Execution rechecks the stored buffer address and hash before the Guard PDA signs the loader-v3 CPI.
+
+Confirmed failed on-chain transactions:
+
+- Assertion 24, original deployer: `4atp15X8waRUFnaYhGo1MUwq39xvbkBhb4A5unrFs7fLpNTvU1NA4zk8sEi9WogfmykRMZaGAjFp9SC8Uo2dHTqZ` — `IncorrectAuthority`.
+- Assertion 25, random wallet: `TBcuGp14VkQ4LdfyWC15V5gTq9eVYVGpcuFqpx6mvDrRkL9q2LduWsWnLbR35ui1DkCVAAfirqFzPMaan65Sj5h` — `IncorrectAuthority`.
+- Assertion 27, previous buffer authority write: `iN7363QacjMFxHWKUFzzhL4EFGe9Ri1FhGdp1Gvi13fbhkdjxvjP2HXEaPDH38WywQvsrx2a4SpVwdjThgvaKau` — `IncorrectAuthority`.
+
+Successful guarded upgrades:
+
+- Terminal shard: `2PUy55yfnzAHHG5HQbK2BZbAHaRnuV98G9AXw7GdrNugc9tdSSKpRfgqEH89kPjs7faSjsa76ii7gQxWTAPvcbR1`.
+- Authority shard: `2Dj6zb4biNYm14sZTheXuzvpZD6GotibfdaLtzS5naY1oqPu5dBicKKrPzUJpUJBX5zjJTsSkmFzWrt6R5PFxBnv`.
+
+Both guarded paths used the genuine loader-v3 ProgramData and Guard-PDA CPI. Treasury reported version 2 after execution.
+
 ## Limitations
 
 - Governance makes temporary decisions in this milestone; this is not decentralized verification.
-- There is no independent verifier quorum yet.
-- There is no challenge submission/reveal yet.
-- There is no deterministic generic trace replay yet.
+- Permissionless challenge submission/reveal remains a future milestone.
+- Independent deterministic replay and verifier quorum remain future milestones.
+- Bounty settlement remains a future milestone.
 - Passing this workflow does not prove a program is generally secure.
-- Bounty settlement, indexer/API, frontend integration, and emergency bypass remain deferred.
+- Indexer/API, frontend integration, and emergency bypass remain deferred.
