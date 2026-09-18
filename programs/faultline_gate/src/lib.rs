@@ -414,7 +414,7 @@ pub mod faultline_gate {
             &ctx.accounts.verifier_stake.key(),
         )?;
         require!(
-            vault.amount >= stake.amount,
+            vault.amount == stake.amount,
             FaultlineError::VaultBalanceMismatch
         );
         let policy_key = ctx.accounts.economic_policy.key();
@@ -425,14 +425,16 @@ pub mod faultline_gate {
             verifier_key.as_ref(),
             &[stake.bump],
         ];
-        spl_token_transfer(
-            &ctx.accounts.token_program.to_account_info(),
-            &ctx.accounts.stake_vault.to_account_info(),
-            &ctx.accounts.verifier_token_account.to_account_info(),
-            &ctx.accounts.verifier_stake.to_account_info(),
-            vault.amount,
-            Some(signer_seeds),
-        )?;
+        if stake.amount > 0 {
+            spl_token_transfer(
+                &ctx.accounts.token_program.to_account_info(),
+                &ctx.accounts.stake_vault.to_account_info(),
+                &ctx.accounts.verifier_token_account.to_account_info(),
+                &ctx.accounts.verifier_stake.to_account_info(),
+                stake.amount,
+                Some(signer_seeds),
+            )?;
+        }
         spl_token_close(
             &ctx.accounts.token_program.to_account_info(),
             &ctx.accounts.stake_vault.to_account_info(),
@@ -444,7 +446,7 @@ pub mod faultline_gate {
             economic_policy: ctx.accounts.economic_policy.key(),
             verifier_stake: ctx.accounts.verifier_stake.key(),
             verifier: ctx.accounts.verifier.key(),
-            amount: vault.amount,
+            amount: stake.amount,
             slot,
         });
         Ok(())
@@ -1839,6 +1841,278 @@ pub mod faultline_gate {
         )
     }
 
+    pub fn claim_verifier_fee(ctx: Context<ClaimVerifierFee>) -> Result<()> {
+        validate_settlement_base(&ctx.accounts.base)?;
+        require_keys_eq!(
+            ctx.accounts.round_economic_state.verifier_epoch_economics,
+            verifier_epoch_economics_address(
+                &ctx.accounts.verifier_epoch.key(),
+                &ctx.accounts.base.economic_policy.key(),
+            ),
+            FaultlineError::WrongVerifierEpochEconomics
+        );
+        require_finalized_economic_result(
+            ctx.accounts.verification_round.status,
+            ctx.accounts.round_economic_state.status,
+            ctx.accounts.replay_result.verdict,
+        )?;
+        require!(
+            ctx.accounts.verification_round.winning_replay_result
+                == Some(ctx.accounts.replay_result.key()),
+            FaultlineError::WrongResultBinding
+        );
+        require!(
+            ctx.accounts
+                .verifier_epoch
+                .verifiers
+                .contains(&ctx.accounts.verifier.key()),
+            FaultlineError::UnauthorizedVerifier
+        );
+        require!(
+            attestation_matches_winner(
+                &ctx.accounts.verifier_attestation,
+                ctx.accounts.verification_round.key(),
+                ctx.accounts.verifier.key(),
+                ctx.accounts.verifier_epoch.key(),
+                ctx.accounts.replay_result.key(),
+                ctx.accounts.replay_result.result_hash,
+            ),
+            FaultlineError::WrongAttestationBinding
+        );
+        require!(
+            ctx.accounts.verifier_attestation.attested_slot
+                <= ctx
+                    .accounts
+                    .verification_round
+                    .finalized_slot
+                    .ok_or(FaultlineError::RoundNotFinalized)?,
+            FaultlineError::AttestationAfterFinalization
+        );
+        let slot = Clock::get()?.slot;
+        require!(
+            fee_claim_is_timely(
+                slot,
+                ctx.accounts.round_economic_state.fee_claim_deadline_slot
+            ),
+            FaultlineError::FeeClaimDeadlinePassed
+        );
+        require!(
+            ctx.accounts.verifier_fee_claim.verification_round == Pubkey::default(),
+            FaultlineError::VerifierFeeAlreadyClaimed
+        );
+        validate_canonical_ata(
+            &ctx.accounts.verifier_token_account.to_account_info(),
+            &ctx.accounts.verifier.key(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+        )?;
+        let fee_vault = validate_token_vault(
+            &ctx.accounts.fee_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+            &ctx.accounts.base.proposal_escrow.key(),
+        )?;
+        let fee_amount = ctx.accounts.base.economic_policy.verifier_fee_amount;
+        require!(
+            fee_vault.amount >= fee_amount,
+            FaultlineError::VaultBalanceMismatch
+        );
+        let new_fees_claimed = checked_fee_claim_total(
+            ctx.accounts.base.proposal_escrow.fees_claimed,
+            fee_amount,
+            ctx.accounts.base.proposal_escrow.fee_reserve_amount,
+        )?;
+        transfer_from_proposal_escrow(
+            &ctx.accounts.base,
+            &ctx.accounts.fee_vault.to_account_info(),
+            &ctx.accounts.verifier_token_account.to_account_info(),
+            fee_amount,
+        )?;
+        let claim = &mut ctx.accounts.verifier_fee_claim;
+        claim.verification_round = ctx.accounts.verification_round.key();
+        claim.verifier = ctx.accounts.verifier.key();
+        claim.attestation = ctx.accounts.verifier_attestation.key();
+        claim.proposal_escrow = ctx.accounts.base.proposal_escrow.key();
+        claim.amount = fee_amount;
+        claim.claimed_at_slot = slot;
+        claim.bump = ctx.bumps.verifier_fee_claim;
+        ctx.accounts.base.proposal_escrow.fees_claimed = new_fees_claimed;
+        Ok(())
+    }
+
+    pub fn slash_verifier_non_reveal(ctx: Context<SlashVerifierNonReveal>) -> Result<()> {
+        validate_settlement_base(&ctx.accounts.base)?;
+        require!(
+            ctx.accounts
+                .verifier_epoch
+                .verifiers
+                .contains(&ctx.accounts.verifier.key()),
+            FaultlineError::UnauthorizedVerifier
+        );
+        require_keys_eq!(
+            ctx.accounts.round_economic_state.verifier_epoch_economics,
+            verifier_epoch_economics_address(
+                &ctx.accounts.verifier_epoch.key(),
+                &ctx.accounts.base.economic_policy.key(),
+            ),
+            FaultlineError::WrongVerifierEpochEconomics
+        );
+        require!(
+            ctx.accounts.verifier_stake.slash_lock_until_slot
+                >= ctx.accounts.round_economic_state.slash_claim_deadline_slot,
+            FaultlineError::StakeSlashLockTooShort
+        );
+        let end = ctx
+            .accounts
+            .base
+            .proposal
+            .challenge_end_slot
+            .ok_or(FaultlineError::MissingChallengeWindow)?;
+        let slot = Clock::get()?.slot;
+        objective_slash_is_allowed(
+            ctx.accounts.base.proposal.state,
+            ctx.accounts.verification_round.status,
+            ctx.accounts.round_economic_state.status,
+            slot,
+            end,
+            ctx.accounts.round_economic_state.slash_claim_deadline_slot,
+            canonical_account_absent(&ctx.accounts.verifier_attestation.to_account_info()),
+        )?;
+        require!(
+            stake_status_is_slashable(ctx.accounts.verifier_stake.status),
+            FaultlineError::WrongStakeStatus
+        );
+        require!(
+            ctx.accounts.verifier_slash_receipt.verification_round == Pubkey::default(),
+            FaultlineError::VerifierAlreadySlashed
+        );
+        let stake_vault = validate_token_vault(
+            &ctx.accounts.stake_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+            &ctx.accounts.verifier_stake.key(),
+        )?;
+        require!(
+            stake_vault.amount == ctx.accounts.verifier_stake.amount,
+            FaultlineError::VaultBalanceMismatch
+        );
+        validate_token_vault(
+            &ctx.accounts.penalty_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+            &ctx.accounts.base.proposal_escrow.key(),
+        )?;
+        let slash_amount = objective_slash_amount(
+            ctx.accounts
+                .base
+                .economic_policy
+                .verifier_non_reveal_slash_amount,
+            ctx.accounts.verifier_stake.amount,
+        )?;
+        let remaining_stake = ctx
+            .accounts
+            .verifier_stake
+            .amount
+            .checked_sub(slash_amount)
+            .ok_or(FaultlineError::ArithmeticOverflow)?;
+        let total_slashed = ctx
+            .accounts
+            .verifier_stake
+            .total_slashed
+            .checked_add(slash_amount)
+            .ok_or(FaultlineError::ArithmeticOverflow)?;
+        transfer_from_verifier_stake(
+            &ctx.accounts.base,
+            &ctx.accounts.verifier,
+            &ctx.accounts.verifier_stake,
+            &ctx.accounts.stake_vault.to_account_info(),
+            &ctx.accounts.penalty_vault.to_account_info(),
+            slash_amount,
+        )?;
+        ctx.accounts.verifier_stake.amount = remaining_stake;
+        ctx.accounts.verifier_stake.total_slashed = total_slashed;
+        let receipt = &mut ctx.accounts.verifier_slash_receipt;
+        receipt.verification_round = ctx.accounts.verification_round.key();
+        receipt.verifier_stake = ctx.accounts.verifier_stake.key();
+        receipt.verifier = ctx.accounts.verifier.key();
+        receipt.proposal_escrow = ctx.accounts.base.proposal_escrow.key();
+        receipt.amount = slash_amount;
+        receipt.slashed_at_slot = slot;
+        receipt.bump = ctx.bumps.verifier_slash_receipt;
+        Ok(())
+    }
+
+    pub fn refund_proposal_escrow(ctx: Context<RefundProposalEscrow>) -> Result<()> {
+        validate_settlement_base(&ctx.accounts.base)?;
+        require!(
+            proposal_is_terminal_for_refund(ctx.accounts.base.proposal.state),
+            FaultlineError::ProposalNotTerminal
+        );
+        let refund_slot = ctx
+            .accounts
+            .base
+            .proposal_escrow
+            .refund_eligible_slot
+            .ok_or(FaultlineError::RefundNotAvailable)?;
+        require!(
+            refund_is_timely(Clock::get()?.slot, refund_slot),
+            FaultlineError::RefundDeadlineNotReached
+        );
+        require_refund_liabilities_clear(
+            ctx.accounts.base.proposal_escrow.unsettled_bonds,
+            ctx.accounts.base.proposal_escrow.unclosed_rounds,
+        )?;
+        let post_refund_bounty_status =
+            bounty_status_after_refund(ctx.accounts.base.proposal_escrow.bounty_status)?;
+        validate_canonical_ata(
+            &ctx.accounts.funder_token_account.to_account_info(),
+            &ctx.accounts.base.proposal_escrow.funder,
+            &ctx.accounts.base.economic_policy.payment_mint,
+        )?;
+        let bounty = validate_token_vault(
+            &ctx.accounts.bounty_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+            &ctx.accounts.base.proposal_escrow.key(),
+        )?;
+        let fee = validate_token_vault(
+            &ctx.accounts.fee_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+            &ctx.accounts.base.proposal_escrow.key(),
+        )?;
+        let penalty = validate_token_vault(
+            &ctx.accounts.penalty_vault.to_account_info(),
+            &ctx.accounts.base.economic_policy.payment_mint,
+            &ctx.accounts.base.proposal_escrow.key(),
+        )?;
+        let refund_total = checked_refund_total(bounty.amount, fee.amount, penalty.amount)?;
+        transfer_and_close_proposal_vault(
+            &ctx.accounts.base,
+            &ctx.accounts.bounty_vault.to_account_info(),
+            &ctx.accounts.funder_token_account.to_account_info(),
+            &ctx.accounts.rent_recipient.to_account_info(),
+            bounty.amount,
+        )?;
+        transfer_and_close_proposal_vault(
+            &ctx.accounts.base,
+            &ctx.accounts.fee_vault.to_account_info(),
+            &ctx.accounts.funder_token_account.to_account_info(),
+            &ctx.accounts.rent_recipient.to_account_info(),
+            fee.amount,
+        )?;
+        transfer_and_close_proposal_vault(
+            &ctx.accounts.base,
+            &ctx.accounts.penalty_vault.to_account_info(),
+            &ctx.accounts.funder_token_account.to_account_info(),
+            &ctx.accounts.rent_recipient.to_account_info(),
+            penalty.amount,
+        )?;
+        ctx.accounts.base.proposal_escrow.bounty_status = post_refund_bounty_status;
+        ctx.accounts.base.proposal_escrow.refunds_paid = ctx
+            .accounts
+            .base
+            .proposal_escrow
+            .refunds_paid
+            .checked_add(refund_total)
+            .ok_or(FaultlineError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
     pub fn create_replay_result(
         ctx: Context<CreateReplayResult>,
         result_hash: [u8; 32],
@@ -2809,6 +3083,84 @@ pub struct SettleRevealedUnopenedChallenge<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ClaimVerifierFee<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+    pub base: EconomicSettlementBase<'info>,
+    /// CHECK: immutable verifier identity; membership and attestation bindings are validated.
+    pub verifier: UncheckedAccount<'info>,
+    #[account(seeds = [VERIFIER_EPOCH_SEED, verifier_epoch.verifier_registry.as_ref(), &verifier_epoch.epoch_id.to_le_bytes()], bump = verifier_epoch.bump, address = verification_round.verifier_epoch @ FaultlineError::WrongVerifierEpoch, constraint = verifier_epoch.safety_policy == base.policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub verifier_epoch: Box<Account<'info, VerifierEpoch>>,
+    #[account(seeds = [VERIFICATION_ROUND_SEED, verification_round.trace_claim.as_ref()], bump = verification_round.bump, constraint = verification_round.policy == base.policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verification_round.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    #[account(seeds = [ROUND_ECONOMICS_SEED, verification_round.key().as_ref()], bump = round_economic_state.bump, constraint = round_economic_state.verification_round == verification_round.key() @ FaultlineError::WrongRoundBinding, constraint = round_economic_state.proposal_escrow == base.proposal_escrow.key() @ FaultlineError::WrongProposalEscrow)]
+    pub round_economic_state: Box<Account<'info, RoundEconomicState>>,
+    #[account(seeds = [REPLAY_RESULT_SEED, verification_round.key().as_ref(), replay_result.result_hash.as_ref()], bump = replay_result.bump, constraint = replay_result.verification_round == verification_round.key() @ FaultlineError::WrongRoundBinding)]
+    pub replay_result: Box<Account<'info, ReplayResult>>,
+    #[account(seeds = [VERIFIER_ATTESTATION_SEED, verification_round.key().as_ref(), verifier.key().as_ref()], bump = verifier_attestation.bump)]
+    pub verifier_attestation: Box<Account<'info, VerifierAttestation>>,
+    #[account(init_if_needed, payer = caller, space = 8 + VerifierFeeClaim::INIT_SPACE, seeds = [VERIFIER_FEE_CLAIM_SEED, verification_round.key().as_ref(), verifier.key().as_ref()], bump)]
+    pub verifier_fee_claim: Box<Account<'info, VerifierFeeClaim>>,
+    /// CHECK: verifier's pre-existing canonical Tokenkeg ATA.
+    #[account(mut)]
+    pub verifier_token_account: UncheckedAccount<'info>,
+    /// CHECK: canonical ProposalEscrow-controlled FeeVault.
+    #[account(mut, seeds = [FEE_VAULT_SEED, base.proposal.key().as_ref()], bump, address = base.proposal_escrow.fee_vault @ FaultlineError::WrongVault)]
+    pub fee_vault: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SlashVerifierNonReveal<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+    pub base: EconomicSettlementBase<'info>,
+    /// CHECK: immutable assigned verifier identity; epoch membership is validated.
+    pub verifier: UncheckedAccount<'info>,
+    #[account(seeds = [VERIFIER_EPOCH_SEED, verifier_epoch.verifier_registry.as_ref(), &verifier_epoch.epoch_id.to_le_bytes()], bump = verifier_epoch.bump, address = verification_round.verifier_epoch @ FaultlineError::WrongVerifierEpoch, constraint = verifier_epoch.safety_policy == base.policy.key() @ FaultlineError::WrongPolicyBinding)]
+    pub verifier_epoch: Box<Account<'info, VerifierEpoch>>,
+    #[account(seeds = [VERIFICATION_ROUND_SEED, verification_round.trace_claim.as_ref()], bump = verification_round.bump, constraint = verification_round.policy == base.policy.key() @ FaultlineError::WrongPolicyBinding, constraint = verification_round.proposal == base.proposal.key() @ FaultlineError::WrongProposalBinding)]
+    pub verification_round: Box<Account<'info, VerificationRound>>,
+    #[account(seeds = [ROUND_ECONOMICS_SEED, verification_round.key().as_ref()], bump = round_economic_state.bump, constraint = round_economic_state.verification_round == verification_round.key() @ FaultlineError::WrongRoundBinding, constraint = round_economic_state.proposal_escrow == base.proposal_escrow.key() @ FaultlineError::WrongProposalEscrow)]
+    pub round_economic_state: Box<Account<'info, RoundEconomicState>>,
+    #[account(mut, seeds = [VERIFIER_STAKE_SEED, base.economic_policy.key().as_ref(), verifier.key().as_ref()], bump = verifier_stake.bump, constraint = verifier_stake.economic_policy == base.economic_policy.key() @ FaultlineError::WrongEconomicPolicy, constraint = verifier_stake.verifier == verifier.key() @ FaultlineError::WrongVerifierStake, constraint = verifier_stake.payment_mint == base.economic_policy.payment_mint @ FaultlineError::WrongPaymentMint)]
+    pub verifier_stake: Box<Account<'info, VerifierStake>>,
+    /// CHECK: canonical Tokenkeg StakeVault controlled by VerifierStake.
+    #[account(mut, seeds = [STAKE_VAULT_SEED, base.economic_policy.key().as_ref(), verifier.key().as_ref()], bump, address = verifier_stake.stake_vault @ FaultlineError::WrongVault)]
+    pub stake_vault: UncheckedAccount<'info>,
+    /// CHECK: canonical ProposalEscrow-controlled PenaltyVault.
+    #[account(mut, seeds = [PENALTY_VAULT_SEED, base.proposal.key().as_ref()], bump, address = base.proposal_escrow.penalty_vault @ FaultlineError::WrongVault)]
+    pub penalty_vault: UncheckedAccount<'info>,
+    /// CHECK: canonical PDA is accepted only as an empty system-owned absence proof.
+    #[account(seeds = [VERIFIER_ATTESTATION_SEED, verification_round.key().as_ref(), verifier.key().as_ref()], bump)]
+    pub verifier_attestation: UncheckedAccount<'info>,
+    #[account(init_if_needed, payer = caller, space = 8 + VerifierSlashReceipt::INIT_SPACE, seeds = [VERIFIER_SLASH_SEED, verification_round.key().as_ref(), verifier.key().as_ref()], bump)]
+    pub verifier_slash_receipt: Box<Account<'info, VerifierSlashReceipt>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RefundProposalEscrow<'info> {
+    pub caller: Signer<'info>,
+    pub base: EconomicSettlementBase<'info>,
+    /// CHECK: original funder's pre-existing canonical Tokenkeg ATA.
+    #[account(mut)]
+    pub funder_token_account: UncheckedAccount<'info>,
+    /// CHECK: canonical ProposalEscrow-controlled BountyVault.
+    #[account(mut, seeds = [BOUNTY_VAULT_SEED, base.proposal.key().as_ref()], bump, address = base.proposal_escrow.bounty_vault @ FaultlineError::WrongVault)]
+    pub bounty_vault: UncheckedAccount<'info>,
+    /// CHECK: canonical ProposalEscrow-controlled FeeVault.
+    #[account(mut, seeds = [FEE_VAULT_SEED, base.proposal.key().as_ref()], bump, address = base.proposal_escrow.fee_vault @ FaultlineError::WrongVault)]
+    pub fee_vault: UncheckedAccount<'info>,
+    /// CHECK: canonical ProposalEscrow-controlled PenaltyVault.
+    #[account(mut, seeds = [PENALTY_VAULT_SEED, base.proposal.key().as_ref()], bump, address = base.proposal_escrow.penalty_vault @ FaultlineError::WrongVault)]
+    pub penalty_vault: UncheckedAccount<'info>,
+    /// CHECK: immutable funder and vault-rent recipient recorded at funding.
+    #[account(mut, address = base.proposal_escrow.funder @ FaultlineError::WrongRentRecipient, constraint = *rent_recipient.owner == solana_system_program::ID @ FaultlineError::WrongAccountOwner)]
+    pub rent_recipient: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 #[instruction(result_hash: [u8; 32])]
 pub struct CreateReplayResult<'info> {
     #[account(mut)]
@@ -3750,11 +4102,7 @@ fn parse_token_account(account: &AccountInfo) -> Result<TokenAccountView> {
     );
     let data = account.try_borrow_data()?;
     require!(
-        data.len() == TOKEN_ACCOUNT_LEN,
-        FaultlineError::InvalidEconomicTokenAccount
-    );
-    require!(
-        data[108] == TOKEN_ACCOUNT_INITIALIZED,
+        token_account_layout_is_initialized(data.len(), data.get(108).copied()),
         FaultlineError::InvalidEconomicTokenAccount
     );
     Ok(TokenAccountView {
@@ -3774,6 +4122,10 @@ fn parse_token_account(account: &AccountInfo) -> Result<TokenAccountView> {
                 .map_err(|_| error!(FaultlineError::InvalidEconomicTokenAccount))?,
         ),
     })
+}
+
+pub fn token_account_layout_is_initialized(data_len: usize, state: Option<u8>) -> bool {
+    data_len == TOKEN_ACCOUNT_LEN && state == Some(TOKEN_ACCOUNT_INITIALIZED)
 }
 
 fn canonical_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
@@ -4245,6 +4597,152 @@ pub fn configured_bounty_payout(vault_balance: u64, configured_bounty: u64) -> R
     Ok(configured_bounty)
 }
 
+pub fn fee_claim_is_timely(current_slot: u64, deadline_slot: u64) -> bool {
+    current_slot <= deadline_slot
+}
+
+pub fn verifier_epoch_economics_address(epoch: &Pubkey, policy: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            VERIFIER_EPOCH_ECONOMICS_SEED,
+            epoch.as_ref(),
+            policy.as_ref(),
+        ],
+        &crate::ID,
+    )
+    .0
+}
+
+pub fn checked_fee_claim_total(current: u64, fee: u64, reserve: u64) -> Result<u64> {
+    let next = current
+        .checked_add(fee)
+        .ok_or(FaultlineError::ArithmeticOverflow)?;
+    require!(next <= reserve, FaultlineError::FeeReserveExceeded);
+    Ok(next)
+}
+
+pub fn attestation_matches_winner(
+    attestation: &VerifierAttestation,
+    round: Pubkey,
+    verifier: Pubkey,
+    epoch: Pubkey,
+    replay_result: Pubkey,
+    result_hash: [u8; 32],
+) -> bool {
+    attestation.verification_round == round
+        && attestation.verifier == verifier
+        && attestation.verifier_epoch == epoch
+        && attestation.replay_result == replay_result
+        && attestation.result_hash == result_hash
+}
+
+pub fn require_finalized_economic_result(
+    round_status: VerificationRoundStatus,
+    economic_status: RoundEconomicStatus,
+    verdict: ReplayVerdict,
+) -> Result<()> {
+    let matches = matches!(
+        (round_status, economic_status, verdict),
+        (
+            VerificationRoundStatus::InvariantHolds,
+            RoundEconomicStatus::FinalizedHold,
+            ReplayVerdict::InvariantHolds
+        ) | (
+            VerificationRoundStatus::InvariantViolated,
+            RoundEconomicStatus::FinalizedViolation,
+            ReplayVerdict::InvariantViolated
+        )
+    );
+    require!(matches, FaultlineError::WrongRoundEconomicStatus);
+    Ok(())
+}
+
+pub fn objective_slash_is_allowed(
+    proposal_state: ProposalState,
+    round_status: VerificationRoundStatus,
+    economic_status: RoundEconomicStatus,
+    current_slot: u64,
+    challenge_end_slot: u64,
+    slash_deadline_slot: u64,
+    attestation_absent: bool,
+) -> Result<()> {
+    require!(
+        round_status == VerificationRoundStatus::Open,
+        FaultlineError::RoundNotSlashable
+    );
+    require!(
+        matches!(
+            economic_status,
+            RoundEconomicStatus::Open | RoundEconomicStatus::TimedOut
+        ),
+        FaultlineError::RoundNotSlashable
+    );
+    if economic_status == RoundEconomicStatus::Open {
+        require!(
+            matches!(
+                proposal_state,
+                ProposalState::ChallengeActive | ProposalState::Expired
+            ),
+            FaultlineError::RoundNotSlashable
+        );
+    }
+    require!(
+        current_slot > challenge_end_slot,
+        FaultlineError::SlashWindowNotOpen
+    );
+    require!(
+        current_slot <= slash_deadline_slot,
+        FaultlineError::SlashClaimDeadlinePassed
+    );
+    require!(
+        attestation_absent,
+        FaultlineError::VerifierAttestationExists
+    );
+    Ok(())
+}
+
+pub fn objective_slash_amount(configured_amount: u64, remaining_stake: u64) -> Result<u64> {
+    let amount = core::cmp::min(configured_amount, remaining_stake);
+    require!(amount > 0, FaultlineError::ZeroSettlementAmount);
+    Ok(amount)
+}
+
+pub fn stake_status_is_slashable(status: StakeStatus) -> bool {
+    matches!(status, StakeStatus::Active | StakeStatus::WithdrawalPending)
+}
+
+pub fn proposal_is_terminal_for_refund(state: ProposalState) -> bool {
+    matches!(
+        state,
+        ProposalState::Rejected | ProposalState::Expired | ProposalState::Executed
+    )
+}
+
+pub fn refund_is_timely(current_slot: u64, refund_eligible_slot: u64) -> bool {
+    current_slot > refund_eligible_slot
+}
+
+pub fn require_refund_liabilities_clear(unsettled_bonds: u8, unclosed_rounds: u8) -> Result<()> {
+    require!(unsettled_bonds == 0, FaultlineError::UnsettledBondLiability);
+    require!(unclosed_rounds == 0, FaultlineError::UnclosedRoundLiability);
+    Ok(())
+}
+
+pub fn bounty_status_after_refund(status: BountyStatus) -> Result<BountyStatus> {
+    match status {
+        BountyStatus::Pending => Ok(BountyStatus::RefundedToFunder),
+        BountyStatus::PaidToHunter => Ok(BountyStatus::PaidToHunter),
+        BountyStatus::RefundedToFunder => err!(FaultlineError::EscrowAlreadyRefunded),
+    }
+}
+
+pub fn checked_refund_total(bounty: u64, fee: u64, penalty: u64) -> Result<u64> {
+    bounty
+        .checked_add(fee)
+        .and_then(|value| value.checked_add(penalty))
+        .ok_or_else(|| error!(FaultlineError::ArithmeticOverflow))
+}
+
 pub fn require_canonical_accepted_winner(
     confirmed_violation: bool,
     last_violation_round: Option<Pubkey>,
@@ -4367,6 +4865,63 @@ fn transfer_from_proposal_escrow<'info>(
         &base.proposal_escrow.to_account_info(),
         amount,
         Some(signer_seeds),
+    )
+}
+
+fn transfer_from_verifier_stake<'info>(
+    base: &EconomicSettlementBase<'info>,
+    verifier: &UncheckedAccount<'info>,
+    verifier_stake: &Account<'info, VerifierStake>,
+    source: &AccountInfo<'info>,
+    destination: &AccountInfo<'info>,
+    amount: u64,
+) -> Result<()> {
+    let policy_key = base.economic_policy.key();
+    let verifier_key = verifier.key();
+    let signer_seeds: &[&[u8]] = &[
+        VERIFIER_STAKE_SEED,
+        policy_key.as_ref(),
+        verifier_key.as_ref(),
+        &[verifier_stake.bump],
+    ];
+    spl_token_transfer(
+        &base.token_program.to_account_info(),
+        source,
+        destination,
+        &verifier_stake.to_account_info(),
+        amount,
+        Some(signer_seeds),
+    )
+}
+
+fn transfer_and_close_proposal_vault<'info>(
+    base: &EconomicSettlementBase<'info>,
+    vault: &AccountInfo<'info>,
+    funder_token_account: &AccountInfo<'info>,
+    rent_recipient: &AccountInfo<'info>,
+    amount: u64,
+) -> Result<()> {
+    if amount > 0 {
+        transfer_from_proposal_escrow(base, vault, funder_token_account, amount)?;
+    }
+    let remaining = validate_token_vault(
+        vault,
+        &base.economic_policy.payment_mint,
+        &base.proposal_escrow.key(),
+    )?;
+    require!(remaining.amount == 0, FaultlineError::VaultBalanceMismatch);
+    let proposal_key = base.proposal.key();
+    let signer_seeds: &[&[u8]] = &[
+        PROPOSAL_ESCROW_SEED,
+        proposal_key.as_ref(),
+        &[base.proposal_escrow.bump],
+    ];
+    spl_token_close(
+        &base.token_program.to_account_info(),
+        vault,
+        rent_recipient,
+        &base.proposal_escrow.to_account_info(),
+        signer_seeds,
     )
 }
 
@@ -4732,6 +5287,44 @@ pub enum FaultlineError {
     ZeroSettlementAmount,
     #[msg("Revealed unopened challenge is not yet eligible for recovery")]
     RevealedUnopenedNotEligible,
+    #[msg("Verifier attestation binding is incorrect")]
+    WrongAttestationBinding,
+    #[msg("Verifier attestation was recorded after round finalization")]
+    AttestationAfterFinalization,
+    #[msg("Verifier fee claim deadline has passed")]
+    FeeClaimDeadlinePassed,
+    #[msg("Verifier already claimed the fee for this round")]
+    VerifierFeeAlreadyClaimed,
+    #[msg("Aggregate verifier fees exceed the reserved amount")]
+    FeeReserveExceeded,
+    #[msg("Round is not eligible for objective non-reveal slashing")]
+    RoundNotSlashable,
+    #[msg("Verifier epoch economics binding is incorrect")]
+    WrongVerifierEpochEconomics,
+    #[msg("Verifier stake slash lock does not cover the round deadline")]
+    StakeSlashLockTooShort,
+    #[msg("Objective slash window has not opened")]
+    SlashWindowNotOpen,
+    #[msg("Objective slash claim deadline has passed")]
+    SlashClaimDeadlinePassed,
+    #[msg("A valid verifier attestation prevents non-reveal slashing")]
+    VerifierAttestationExists,
+    #[msg("Verifier was already slashed for this round")]
+    VerifierAlreadySlashed,
+    #[msg("Verifier stake has an invalid status")]
+    WrongStakeStatus,
+    #[msg("Proposal is not terminal for escrow refund")]
+    ProposalNotTerminal,
+    #[msg("Proposal escrow refund is not configured")]
+    RefundNotAvailable,
+    #[msg("Proposal escrow refund deadline has not passed")]
+    RefundDeadlineNotReached,
+    #[msg("Proposal escrow still has unsettled bond liabilities")]
+    UnsettledBondLiability,
+    #[msg("Proposal escrow still has unclosed round liabilities")]
+    UnclosedRoundLiability,
+    #[msg("Proposal escrow was already refunded")]
+    EscrowAlreadyRefunded,
 }
 
 #[cfg(test)]
@@ -5328,6 +5921,267 @@ mod tests {
             1,
             1_000_000
         ));
+    }
+
+    #[test]
+    fn attestation_dust_and_closed_token_vault_classification_are_safe() {
+        assert!(canonical_account_absent_parts(
+            &solana_system_program::ID,
+            0,
+            0
+        ));
+        assert!(canonical_account_absent_parts(
+            &solana_system_program::ID,
+            0,
+            999_999
+        ));
+        assert!(!canonical_account_absent_parts(
+            &crate::ID,
+            8 + VerifierAttestation::INIT_SPACE,
+            999_999
+        ));
+        assert!(!canonical_account_absent_parts(
+            &Pubkey::new_from_array([78; 32]),
+            0,
+            999_999
+        ));
+        assert!(token_account_layout_is_initialized(
+            TOKEN_ACCOUNT_LEN,
+            Some(TOKEN_ACCOUNT_INITIALIZED)
+        ));
+        assert!(!token_account_layout_is_initialized(
+            TOKEN_ACCOUNT_LEN,
+            Some(0)
+        ));
+        assert!(!token_account_layout_is_initialized(0, None));
+    }
+
+    #[test]
+    fn verifier_fee_deadline_and_reserve_bounds_are_exact() {
+        assert!(fee_claim_is_timely(99, 100));
+        assert!(fee_claim_is_timely(100, 100));
+        assert!(!fee_claim_is_timely(101, 100));
+        assert_eq!(checked_fee_claim_total(315, 5, 320).unwrap(), 320);
+        assert!(checked_fee_claim_total(320, 5, 320).is_err());
+        assert!(checked_fee_claim_total(u64::MAX, 1, u64::MAX).is_err());
+        assert_eq!(maximum_fee_reserve(5, MAX_BONDED_CHALLENGES).unwrap(), 320);
+    }
+
+    #[test]
+    fn only_an_attestation_for_the_winning_result_is_fee_eligible() {
+        let round = Pubkey::new_from_array([81; 32]);
+        let verifier = Pubkey::new_from_array([82; 32]);
+        let epoch = Pubkey::new_from_array([83; 32]);
+        let winner = Pubkey::new_from_array([84; 32]);
+        let winner_hash = [85; 32];
+        let attestation = VerifierAttestation {
+            verification_round: round,
+            verifier_epoch: epoch,
+            verifier,
+            replay_result: winner,
+            result_hash: winner_hash,
+            attested_slot: 10,
+            bump: 1,
+        };
+        assert!(attestation_matches_winner(
+            &attestation,
+            round,
+            verifier,
+            epoch,
+            winner,
+            winner_hash,
+        ));
+        assert!(!attestation_matches_winner(
+            &attestation,
+            round,
+            verifier,
+            epoch,
+            Pubkey::new_from_array([86; 32]),
+            [86; 32],
+        ));
+        assert!(require_finalized_economic_result(
+            VerificationRoundStatus::InvariantHolds,
+            RoundEconomicStatus::FinalizedHold,
+            ReplayVerdict::InvariantHolds,
+        )
+        .is_ok());
+        assert!(require_finalized_economic_result(
+            VerificationRoundStatus::InvariantHolds,
+            RoundEconomicStatus::FinalizedHold,
+            ReplayVerdict::InvariantViolated,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fee_claim_and_slash_receipt_identities_are_unique_per_round_and_verifier() {
+        let round = Pubkey::new_from_array([87; 32]);
+        let verifier = Pubkey::new_from_array([88; 32]);
+        let other = Pubkey::new_from_array([89; 32]);
+        let fee = Pubkey::find_program_address(
+            &[VERIFIER_FEE_CLAIM_SEED, round.as_ref(), verifier.as_ref()],
+            &crate::ID,
+        )
+        .0;
+        let duplicate_fee = Pubkey::find_program_address(
+            &[VERIFIER_FEE_CLAIM_SEED, round.as_ref(), verifier.as_ref()],
+            &crate::ID,
+        )
+        .0;
+        let other_fee = Pubkey::find_program_address(
+            &[VERIFIER_FEE_CLAIM_SEED, round.as_ref(), other.as_ref()],
+            &crate::ID,
+        )
+        .0;
+        assert_eq!(fee, duplicate_fee);
+        assert_ne!(fee, other_fee);
+        let slash = Pubkey::find_program_address(
+            &[VERIFIER_SLASH_SEED, round.as_ref(), verifier.as_ref()],
+            &crate::ID,
+        )
+        .0;
+        let duplicate_slash = Pubkey::find_program_address(
+            &[VERIFIER_SLASH_SEED, round.as_ref(), verifier.as_ref()],
+            &crate::ID,
+        )
+        .0;
+        assert_eq!(slash, duplicate_slash);
+    }
+
+    #[test]
+    fn objective_non_reveal_slash_predicate_is_strict() {
+        assert!(objective_slash_is_allowed(
+            ProposalState::ChallengeActive,
+            VerificationRoundStatus::Open,
+            RoundEconomicStatus::Open,
+            100,
+            100,
+            110,
+            true,
+        )
+        .is_err());
+        assert!(objective_slash_is_allowed(
+            ProposalState::ChallengeActive,
+            VerificationRoundStatus::Open,
+            RoundEconomicStatus::TimedOut,
+            110,
+            100,
+            110,
+            true,
+        )
+        .is_ok());
+        assert!(objective_slash_is_allowed(
+            ProposalState::ChallengeActive,
+            VerificationRoundStatus::Open,
+            RoundEconomicStatus::TimedOut,
+            111,
+            100,
+            110,
+            true,
+        )
+        .is_err());
+        assert!(objective_slash_is_allowed(
+            ProposalState::ChallengeActive,
+            VerificationRoundStatus::Open,
+            RoundEconomicStatus::TimedOut,
+            105,
+            100,
+            110,
+            false,
+        )
+        .is_err());
+        for status in [
+            RoundEconomicStatus::Aborted,
+            RoundEconomicStatus::FinalizedHold,
+            RoundEconomicStatus::FinalizedViolation,
+        ] {
+            assert!(objective_slash_is_allowed(
+                ProposalState::ChallengeActive,
+                VerificationRoundStatus::Open,
+                status,
+                105,
+                100,
+                110,
+                true,
+            )
+            .is_err());
+        }
+        assert!(objective_slash_is_allowed(
+            ProposalState::ChallengeActive,
+            VerificationRoundStatus::InvariantHolds,
+            RoundEconomicStatus::TimedOut,
+            105,
+            100,
+            110,
+            true,
+        )
+        .is_err());
+        assert!(objective_slash_is_allowed(
+            ProposalState::Rejected,
+            VerificationRoundStatus::Open,
+            RoundEconomicStatus::Open,
+            105,
+            100,
+            110,
+            true,
+        )
+        .is_err());
+        assert!(objective_slash_is_allowed(
+            ProposalState::Rejected,
+            VerificationRoundStatus::Open,
+            RoundEconomicStatus::TimedOut,
+            105,
+            100,
+            110,
+            true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn objective_slash_caps_at_remaining_stake_and_preserves_pending_withdrawal() {
+        assert_eq!(objective_slash_amount(40, 100).unwrap(), 40);
+        assert_eq!(objective_slash_amount(40, 25).unwrap(), 25);
+        assert!(objective_slash_amount(40, 0).is_err());
+        assert!(stake_status_is_slashable(StakeStatus::Active));
+        assert!(stake_status_is_slashable(StakeStatus::WithdrawalPending));
+    }
+
+    #[test]
+    fn final_escrow_refund_rules_and_replay_barriers_are_exact() {
+        for state in [
+            ProposalState::Rejected,
+            ProposalState::Expired,
+            ProposalState::Executed,
+        ] {
+            assert!(proposal_is_terminal_for_refund(state));
+        }
+        for state in [
+            ProposalState::Draft,
+            ProposalState::ChallengeActive,
+            ProposalState::Approved,
+        ] {
+            assert!(!proposal_is_terminal_for_refund(state));
+        }
+        assert!(!refund_is_timely(99, 100));
+        assert!(!refund_is_timely(100, 100));
+        assert!(refund_is_timely(101, 100));
+        assert!(require_refund_liabilities_clear(0, 0).is_ok());
+        assert!(require_refund_liabilities_clear(1, 0).is_err());
+        assert!(require_refund_liabilities_clear(0, 1).is_err());
+        assert!(
+            bounty_status_after_refund(BountyStatus::Pending).unwrap()
+                == BountyStatus::RefundedToFunder
+        );
+        assert!(
+            bounty_status_after_refund(BountyStatus::PaidToHunter).unwrap()
+                == BountyStatus::PaidToHunter
+        );
+        assert!(bounty_status_after_refund(BountyStatus::RefundedToFunder).is_err());
+        assert_eq!(checked_refund_total(0, 0, 0).unwrap(), 0);
+        assert_eq!(checked_refund_total(10, 20, 30).unwrap(), 60);
+        assert!(checked_refund_total(u64::MAX, 1, 0).is_err());
+        assert!(checked_refund_total(u64::MAX - 1, 1, 1).is_err());
     }
 
     #[test]
