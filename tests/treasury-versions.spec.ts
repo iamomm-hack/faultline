@@ -288,6 +288,7 @@ async function guardedUpgradeToScenario(): Promise<void> {
   await verifyGuardAuthority(connection, treasuryProgram, guardPda);
   await handoffSelectedBuffer();
   const [policy] = PublicKey.findProgramAddressSync([Buffer.from("safety-policy"), treasuryProgram.toBuffer()], gateProgram);
+  const [economicRegistry] = PublicKey.findProgramAddressSync([Buffer.from("economic-policy-registry"), policy.toBuffer()], gateProgram);
   const policyId = 2n;
   const minSlots = 2n;
   const invariantHash = createHash("sha256").update("AUTH-001").digest();
@@ -313,8 +314,13 @@ async function guardedUpgradeToScenario(): Promise<void> {
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
   ], Buffer.concat([u64(proposalNumber), candidateHash])), proposer)}`);
   console.log("[2] UpgradeProposal created in Draft");
+  await send(connection, anchorInstruction(gateProgram, "initialize_economic_policy_registry", [
+    { pubkey: governance.publicKey, isSigner: true, isWritable: true }, { pubkey: policy, isSigner: false, isWritable: false },
+    { pubkey: economicRegistry, isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+  ]), governance);
   console.log(`Start challenge: ${await send(connection, anchorInstruction(gateProgram, "start_challenge", [
-    { pubkey: proposer.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposal, isSigner: false, isWritable: true }
+    { pubkey: proposer.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false },
+    { pubkey: economicRegistry, isSigner: false, isWritable: false }, { pubkey: proposal, isSigner: false, isWritable: true }
   ], u64(minSlots)), proposer)}`);
   console.log("[3] Challenge started with start/end slots");
   const lifecycleExecute = () => anchorInstruction(gateProgram, "execute_guarded_upgrade", [

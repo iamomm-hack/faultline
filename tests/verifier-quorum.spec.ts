@@ -30,6 +30,7 @@ const treasury = new PublicKey(ids["faultline-treasury-program"]);
 const programData = programDataAddress(treasury);
 const [guard] = PublicKey.findProgramAddressSync([Buffer.from("faultline"), Buffer.from("guard"), treasury.toBuffer()], gate);
 const [policy] = PublicKey.findProgramAddressSync([Buffer.from("safety-policy"), treasury.toBuffer()], gate);
+const [economicRegistry] = PublicKey.findProgramAddressSync([Buffer.from("economic-policy-registry"), policy.toBuffer()], gate);
 const [registry] = PublicKey.findProgramAddressSync([Buffer.from("verifier-registry"), policy.toBuffer()], gate);
 const [version] = PublicKey.findProgramAddressSync([Buffer.from("version")], treasury);
 const REPLAY_DOMAIN = Buffer.from("FAULTLINE_REPLAY_V1", "ascii");
@@ -155,6 +156,10 @@ function initializePolicy(): TransactionInstruction { return anchorInstruction(g
   { pubkey: treasury, isSigner: false, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: true },
   { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
 ], Buffer.concat([u64(5n), Buffer.from([1, 0]), u64(8n), Buffer.from([2]), sha256(Buffer.from("AUTH-001")), governance.publicKey.toBuffer()])); }
+function initializeEconomicRegistry(): TransactionInstruction { return anchorInstruction(gate, "initialize_economic_policy_registry", [
+  { pubkey: governance.publicKey, isSigner: true, isWritable: true }, { pubkey: policy, isSigner: false, isWritable: false },
+  { pubkey: economicRegistry, isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+]); }
 function initializeRegistry(actor: PublicKey): TransactionInstruction { return anchorInstruction(gate, "initialize_verifier_registry", [
   { pubkey: actor, isSigner: true, isWritable: true }, { pubkey: policy, isSigner: false, isWritable: false },
   { pubkey: registry, isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
@@ -183,6 +188,7 @@ function createProposal(id: bigint, buffer: PublicKey, hash: Buffer): Transactio
 ], Buffer.concat([u64(id), hash])); }
 function startChallenge(id: bigint, duration = 40n): TransactionInstruction { return anchorInstruction(gate, "start_challenge", [
   { pubkey: proposer.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false },
+  { pubkey: economicRegistry, isSigner: false, isWritable: false },
   { pubkey: proposalAddress(id), isSigner: false, isWritable: true }
 ], u64(duration)); }
 function temporaryDecision(id: bigint, state: 2 | 3): TransactionInstruction { const proposal = proposalAddress(id); return anchorInstruction(gate, "record_temporary_decision", [
@@ -191,6 +197,7 @@ function temporaryDecision(id: bigint, state: 2 | 3): TransactionInstruction { c
 ], Buffer.from([state, 0x34, 0x12])); }
 function commitChallenge(proposal: PublicKey, invariant: PublicKey, trace: Buffer, salt: Buffer): TransactionInstruction { const commitment = challengeCommitment(proposal, invariant, hunter.publicKey, trace, salt); return anchorInstruction(gate, "commit_challenge", [
   { pubkey: hunter.publicKey, isSigner: true, isWritable: true }, { pubkey: policy, isSigner: false, isWritable: false },
+  { pubkey: economicRegistry, isSigner: false, isWritable: false },
   { pubkey: proposal, isSigner: false, isWritable: false }, { pubkey: invariant, isSigner: false, isWritable: false },
   { pubkey: commitAddress(proposal, hunter.publicKey, commitment), isSigner: false, isWritable: true },
   { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
@@ -207,12 +214,13 @@ async function commitAndReveal(proposal: PublicKey, invariant: PublicKey, trace:
   await send(revealChallenge(proposal, invariant, trace, salt), hunter);
   return traceAddress(proposal, trace);
 }
-type OpenOverrides = Partial<{ policy: PublicKey; proposal: PublicKey; gate: PublicKey; invariant: PublicKey; commit: PublicKey; traceClaim: PublicKey; registry: PublicKey; epoch: PublicKey; round: PublicKey }>;
+type OpenOverrides = Partial<{ policy: PublicKey; economicRegistry: PublicKey; proposal: PublicKey; gate: PublicKey; invariant: PublicKey; commit: PublicKey; traceClaim: PublicKey; registry: PublicKey; epoch: PublicKey; round: PublicKey }>;
 function openRound(proposal: PublicKey, invariant: PublicKey, trace: Buffer, salt: Buffer, epochId: bigint, overrides: OpenOverrides = {}): TransactionInstruction {
   const traceClaim = overrides.traceClaim ?? traceAddress(proposal, trace);
   const commitment = challengeCommitment(proposal, invariant, hunter.publicKey, trace, salt);
   return anchorInstruction(gate, "open_verification_round", [
     { pubkey: payer.publicKey, isSigner: true, isWritable: true }, { pubkey: overrides.policy ?? policy, isSigner: false, isWritable: false },
+    { pubkey: overrides.economicRegistry ?? economicRegistry, isSigner: false, isWritable: false },
     { pubkey: overrides.proposal ?? proposal, isSigner: false, isWritable: false }, { pubkey: overrides.gate ?? verificationGateAddress(proposal), isSigner: false, isWritable: true },
     { pubkey: overrides.invariant ?? invariant, isSigner: false, isWritable: false }, { pubkey: overrides.commit ?? commitAddress(proposal, hunter.publicKey, commitment), isSigner: false, isWritable: false },
     { pubkey: traceClaim, isSigner: false, isWritable: false }, { pubkey: overrides.registry ?? registry, isSigner: false, isWritable: false },
@@ -310,6 +318,7 @@ async function main(): Promise<void> {
     const holdsBuffer = await createLoaderBuffer(executable);
     const holdsCandidateHash = await lockBuffer(holdsBuffer.publicKey);
     await send(createProposal(1n, holdsBuffer.publicKey, holdsCandidateHash), proposer);
+    await send(initializeEconomicRegistry(), governance);
     const holdsProposal = proposalAddress(1n);
     await send(startChallenge(1n, 50n), proposer);
     const holdsTrace = sha256(Buffer.from("canonical safe treasury replay trace"));

@@ -49,6 +49,12 @@ const [policy] = PublicKey.findProgramAddressSync(
   [Buffer.from("safety-policy"), treasury.toBuffer()],
   gate
 );
+const economicRegistryAddress = (safetyPolicy: PublicKey) =>
+  PublicKey.findProgramAddressSync(
+    [Buffer.from("economic-policy-registry"), safetyPolicy.toBuffer()],
+    gate
+  )[0];
+const economicRegistry = economicRegistryAddress(policy);
 const [secondaryGuard] = PublicKey.findProgramAddressSync(
   [Buffer.from("faultline"), Buffer.from("guard"), gate.toBuffer()],
   gate
@@ -349,6 +355,7 @@ function startChallenge(id: bigint, duration: bigint): TransactionInstruction {
     [
       { pubkey: proposer.publicKey, isSigner: true, isWritable: false },
       { pubkey: policy, isSigner: false, isWritable: false },
+      { pubkey: economicRegistry, isSigner: false, isWritable: false },
       { pubkey: proposalAddress(id), isSigner: false, isWritable: true },
       { pubkey: verificationGateAddress(proposalAddress(id)), isSigner: false, isWritable: false }
     ],
@@ -411,12 +418,14 @@ function commitChallenge(
 ): TransactionInstruction {
   const actualProposal = overrides.proposal ?? proposal;
   const actualHunter = overrides.hunter ?? submitter;
+  const actualPolicy = overrides.policy ?? policy;
   return anchorInstruction(
     gate,
     "commit_challenge",
     [
       { pubkey: actualHunter, isSigner: true, isWritable: true },
-      { pubkey: overrides.policy ?? policy, isSigner: false, isWritable: false },
+      { pubkey: actualPolicy, isSigner: false, isWritable: false },
+      { pubkey: economicRegistryAddress(actualPolicy), isSigner: false, isWritable: false },
       { pubkey: actualProposal, isSigner: false, isWritable: false },
       { pubkey: overrides.invariant ?? invariant, isSigner: false, isWritable: false },
       {
@@ -660,6 +669,17 @@ async function main(): Promise<void> {
 
     // Main active proposal remains ChallengeActive throughout provenance assertions.
     await send(createProposal(1n, buffers[0], bufferHashes[0]), proposer);
+    for (const safetyPolicy of [policy, secondaryPolicy]) {
+      await send(
+        anchorInstruction(gate, "initialize_economic_policy_registry", [
+          { pubkey: governance.publicKey, isSigner: true, isWritable: true },
+          { pubkey: safetyPolicy, isSigner: false, isWritable: false },
+          { pubkey: economicRegistryAddress(safetyPolicy), isSigner: false, isWritable: true },
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+        ]),
+        governance
+      );
+    }
     await send(startChallenge(1n, 60n), proposer);
     const mainProposal = proposalAddress(1n);
 

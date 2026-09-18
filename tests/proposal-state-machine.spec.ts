@@ -20,6 +20,7 @@ const buffer = new PublicKey(ids["candidate-v2"]), substituteBuffer = new Public
 const connection = new Connection(RPC, COMMITMENT);
 const [guard] = PublicKey.findProgramAddressSync([Buffer.from("faultline"), Buffer.from("guard"), treasury.toBuffer()], gate);
 const [policy] = PublicKey.findProgramAddressSync([Buffer.from("safety-policy"), treasury.toBuffer()], gate);
+const [economicRegistry] = PublicKey.findProgramAddressSync([Buffer.from("economic-policy-registry"), policy.toBuffer()], gate);
 const [version] = PublicKey.findProgramAddressSync([Buffer.from("version")], treasury);
 const gateData = programDataAddress(gate);
 const [secondaryGuard] = PublicKey.findProgramAddressSync([Buffer.from("faultline"), Buffer.from("guard"), gate.toBuffer()], gate);
@@ -75,6 +76,10 @@ function initPolicy() { return anchorInstruction(gate, "initialize_safety_policy
   { pubkey: treasury, isSigner: false, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: true },
   { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
 ], Buffer.concat([u64(3n), Buffer.from([1, 0]), u64(4n), Buffer.from([1]), hash(Buffer.from("AUTH-001")), governance.publicKey.toBuffer()])); }
+function initEconomicRegistry() { return anchorInstruction(gate, "initialize_economic_policy_registry", [
+  { pubkey: governance.publicKey, isSigner: true, isWritable: true }, { pubkey: policy, isSigner: false, isWritable: false },
+  { pubkey: economicRegistry, isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+]); }
 function status(actor: PublicKey, paused: boolean) { return anchorInstruction(gate, "set_safety_policy_status", [{ pubkey: actor, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: true }], Buffer.from([paused ? 1 : 0])); }
 function create(id: bigint, candidate: PublicKey, expected: Buffer, target = treasury) { return anchorInstruction(gate, "create_upgrade_proposal", [
   { pubkey: proposer.publicKey, isSigner: true, isWritable: true }, { pubkey: guard, isSigner: false, isWritable: true }, { pubkey: policy, isSigner: false, isWritable: false },
@@ -82,7 +87,7 @@ function create(id: bigint, candidate: PublicKey, expected: Buffer, target = tre
   { pubkey: candidate, isSigner: false, isWritable: false }, { pubkey: proposalAddress(id), isSigner: false, isWritable: true }, { pubkey: verificationGateAddress(proposalAddress(id)), isSigner: false, isWritable: true }, { pubkey: claimAddress(candidate), isSigner: false, isWritable: true },
   { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
 ], Buffer.concat([u64(id), expected])); }
-function start(actor: PublicKey, id: bigint, duration: bigint) { return anchorInstruction(gate, "start_challenge", [{ pubkey: actor, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposalAddress(id), isSigner: false, isWritable: true }], u64(duration)); }
+function start(actor: PublicKey, id: bigint, duration: bigint) { return anchorInstruction(gate, "start_challenge", [{ pubkey: actor, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: economicRegistry, isSigner: false, isWritable: false }, { pubkey: proposalAddress(id), isSigner: false, isWritable: true }], u64(duration)); }
 function decision(actor: PublicKey, id: bigint, choice: number) { return anchorInstruction(gate, "record_temporary_decision", [{ pubkey: actor, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: proposalAddress(id), isSigner: false, isWritable: true }, { pubkey: verificationGateAddress(proposalAddress(id)), isSigner: false, isWritable: false }], Buffer.from([choice, 0, 0])); }
 function execute(id: bigint, candidate = buffer) { return anchorInstruction(gate, "execute_guarded_upgrade", [
   { pubkey: random.publicKey, isSigner: true, isWritable: false }, { pubkey: guard, isSigner: false, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false },
@@ -173,6 +178,7 @@ async function main() {
     const seedApprovedProposal = async () => {
       await send(connection, initPolicy(), governance);
       await send(connection, create(1n, buffer, good), proposer);
+      await send(connection, initEconomicRegistry(), governance);
       committedAtCreate = proposalSnapshot((await connection.getAccountInfo(proposalAddress(1n)))!.data);
       await send(connection, start(proposer.publicKey, 1n, 4n), proposer);
       await send(connection, decision(governance.publicKey, 1n, 2), governance);
@@ -209,6 +215,7 @@ async function main() {
     assert.equal(await connection.getAccountInfo(proposalAddress(1n)), null, "failed unlocked-buffer proposal persisted");
     assert.equal(await connection.getAccountInfo(claimAddress(uncommittedBuffer)), null, "failed unlocked-buffer claim persisted");
     await send(connection, create(1n, buffer, good), proposer); console.log("PASS proposal Draft created");
+    await send(connection, initEconomicRegistry(), governance);
     committedAtCreate = proposalSnapshot((await connection.getAccountInfo(proposalAddress(1n)))!.data);
     await fails("9 duplicate proposal PDA", /already in use|AccountAlreadyInitialized/, () => send(connection, create(1n, buffer, good), proposer));
     await fails("10 duration below minimum", /ChallengeDurationTooShort/, () => send(connection, start(proposer.publicKey, 1n, 3n), proposer));
