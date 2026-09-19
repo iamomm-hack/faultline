@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('policy-funding', 'stakes-withdrawal')]
+  [ValidateSet('policy-funding', 'stakes-withdrawal', 'bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')]
   [string]$Shard
 )
 
@@ -17,7 +17,7 @@ $nodeExe = (Get-Command node.exe -ErrorAction Stop).Source
 $processPathValue = [Environment]::GetEnvironmentVariable('Path', 'Process')
 [Environment]::SetEnvironmentVariable('PATH', $null, 'Process')
 [Environment]::SetEnvironmentVariable('Path', $processPathValue, 'Process')
-$shards = if ($Shard) { @($Shard) } else { @('policy-funding', 'stakes-withdrawal') }
+$shards = if ($Shard) { @($Shard) } else { @('violation-fees', 'bond-outcomes', 'objective-slashing') }
 
 function Test-TcpPortListening([int]$Port) {
   $client = [Net.Sockets.TcpClient]::new()
@@ -28,11 +28,16 @@ function Test-TcpPortListening([int]$Port) {
   } catch { return $false } finally { $client.Dispose() }
 }
 
-function Get-ValidatorSlot {
+function Get-ValidatorSlot([ValidateSet('confirmed', 'finalized')][string]$Commitment = 'finalized') {
   try {
-    $reply = Invoke-RestMethod -Uri 'http://127.0.0.1:8899' -Method Post -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' -TimeoutSec 2
+    $body = '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"' + $Commitment + '"}]}'
+    $reply = Invoke-RestMethod -Uri 'http://127.0.0.1:8899' -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 2
     return [string]$reply.result
   } catch { return "unavailable: $($_.Exception.Message)" }
+}
+
+function Get-SlotEvidence {
+  return "confirmed_slot=$(Get-ValidatorSlot 'confirmed') finalized_slot=$(Get-ValidatorSlot 'finalized')"
 }
 
 function Get-LogTail([string]$Path, [int]$Count = 50) {
@@ -63,7 +68,7 @@ function Invoke-OwnedProcess {
   )
   $quoted = $Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }
   $command = "$FilePath $($quoted -join ' ')"
-  Write-Stage $Evidence "STAGE START name=$Stage timeout_seconds=$TimeoutSeconds command=$command validator_slot=$(Get-ValidatorSlot)"
+  Write-Stage $Evidence "STAGE START name=$Stage timeout_seconds=$TimeoutSeconds command=$command $(Get-SlotEvidence)"
   $watch = [Diagnostics.Stopwatch]::StartNew()
   $startInfo = [Diagnostics.ProcessStartInfo]::new()
   $startInfo.FileName = $FilePath
@@ -92,10 +97,22 @@ function Invoke-OwnedProcess {
       if ($watch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
         Stop-Process -Id $process.Id -Force
         $process.WaitForExit()
+        Set-Content -LiteralPath $ProcessStdout -Value $stdoutTask.Result
+        Set-Content -LiteralPath $ProcessStderr -Value $stderrTask.Result
+        $diagnostic = @(
+          "DIAGNOSTIC stage=$Stage command=$command elapsed_ms=$($watch.ElapsedMilliseconds) owned_pid=$($process.Id) exit_code=timeout $(Get-SlotEvidence)",
+          '--- process stdout tail ---', (Get-LogTail $ProcessStdout),
+          '--- process stderr tail ---', (Get-LogTail $ProcessStderr),
+          '--- validator stdout tail ---', (Get-LogTail $ValidatorStdout),
+          '--- validator stderr tail ---', (Get-LogTail $ValidatorStderr),
+          '--- end diagnostic ---'
+        ) -join [Environment]::NewLine
+        Write-Output $diagnostic
+        Add-Content -LiteralPath $Evidence -Value $diagnostic
         throw "$Stage exceeded its $TimeoutSeconds second deadline; terminated owned PID $($process.Id)"
       }
       if ($watch.Elapsed.TotalSeconds -ge $nextHeartbeat) {
-        Write-Stage $Evidence "STAGE HEARTBEAT name=$Stage elapsed_seconds=$([math]::Floor($watch.Elapsed.TotalSeconds)) owned_pid=$($process.Id) validator_slot=$(Get-ValidatorSlot)"
+        Write-Stage $Evidence "STAGE HEARTBEAT name=$Stage elapsed_seconds=$([math]::Floor($watch.Elapsed.TotalSeconds)) owned_pid=$($process.Id) $(Get-SlotEvidence)"
         $nextHeartbeat += 30
       }
       [void]$process.WaitForExit(250)
@@ -105,7 +122,7 @@ function Invoke-OwnedProcess {
     Set-Content -LiteralPath $ProcessStderr -Value $stderrTask.Result
     if ($process.ExitCode -ne 0) {
       $diagnostic = @(
-        "DIAGNOSTIC stage=$Stage command=$command elapsed_ms=$($watch.ElapsedMilliseconds) owned_pid=$($process.Id) exit_code=$($process.ExitCode) validator_slot=$(Get-ValidatorSlot)",
+        "DIAGNOSTIC stage=$Stage command=$command elapsed_ms=$($watch.ElapsedMilliseconds) owned_pid=$($process.Id) exit_code=$($process.ExitCode) $(Get-SlotEvidence)",
         '--- process stdout tail ---', (Get-LogTail $ProcessStdout),
         '--- process stderr tail ---', (Get-LogTail $ProcessStderr),
         '--- validator stdout tail ---', (Get-LogTail $ValidatorStdout),
@@ -116,7 +133,7 @@ function Invoke-OwnedProcess {
       Add-Content -LiteralPath $Evidence -Value $diagnostic
       throw "$Stage failed with exit code $($process.ExitCode)"
     }
-    Write-Stage $Evidence "STAGE COMPLETE name=$Stage elapsed_ms=$($watch.ElapsedMilliseconds) exit_code=0 validator_slot=$(Get-ValidatorSlot)"
+    Write-Stage $Evidence "STAGE COMPLETE name=$Stage elapsed_ms=$($watch.ElapsedMilliseconds) exit_code=0 $(Get-SlotEvidence)"
     $stdout = Get-Content -LiteralPath $ProcessStdout -Raw -ErrorAction SilentlyContinue
     if ($stdout) { Write-Output $stdout.TrimEnd() }
     $stderr = Get-Content -LiteralPath $ProcessStderr -Raw -ErrorAction SilentlyContinue
@@ -147,7 +164,8 @@ foreach ($currentShard in $shards) {
     Remove-Item -LiteralPath $ledger -Recurse -Force
   }
   New-Item -ItemType Directory -Path $ledger | Out-Null
-  Set-Content -LiteralPath $evidence -Value "Milestone 6 Phase A shard=$currentShard"
+  $phase = if ($currentShard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } else { 'A' }
+  Set-Content -LiteralPath $evidence -Value "Milestone 6 Phase $phase shard=$currentShard"
   try {
     $flags = '--reset --rpc-port 8899 --faucet-port 9900 --ticks-per-slot 1024 --log'
     Write-Stage $evidence "STAGE START name=validator-readiness timeout_seconds=45 flags=$flags"
@@ -169,8 +187,9 @@ foreach ($currentShard in $shards) {
       if (-not $ready) { [void]$validator.WaitForExit(100) }
     } while (-not $ready -and $watch.Elapsed.TotalSeconds -lt 45)
     if (-not $ready) { throw "RPC health timeout for $currentShard. stderr=$(Get-LogTail $validatorStderr)" }
-    $initialSlot = Get-ValidatorSlot
-    Write-Stage $evidence "STAGE COMPLETE name=validator-readiness elapsed_ms=$($watch.ElapsedMilliseconds) owned_pid=$($validator.Id) initial_slot=$initialSlot"
+    $initialConfirmedSlot = Get-ValidatorSlot 'confirmed'
+    $initialFinalizedSlot = Get-ValidatorSlot 'finalized'
+    Write-Stage $evidence "STAGE COMPLETE name=validator-readiness elapsed_ms=$($watch.ElapsedMilliseconds) owned_pid=$($validator.Id) initial_confirmed_slot=$initialConfirmedSlot initial_finalized_slot=$initialFinalizedSlot"
 
     Invoke-OwnedProcess -Evidence $evidence -Stage 'gate-deployment' -FilePath $solanaExe -Arguments @(
       'program', 'deploy', 'artifacts\gate\faultline_gate.so', '--program-id', '.localnet\faultline-gate-program.json',
@@ -188,14 +207,17 @@ foreach ($currentShard in $shards) {
     $genesis = Invoke-RestMethod -Uri 'http://127.0.0.1:8899' -Method Post -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}' -TimeoutSec 2
     $env:FAULTLINE_ECONOMIC_GENESIS = $genesis.result
     $env:FAULTLINE_ECONOMIC_SHARD = $currentShard
-    Write-Stage $evidence "START shard=$currentShard PID=$($validator.Id) genesis=$($genesis.result) ledger=$ledger flags=$flags initial_slot=$initialSlot"
-    Write-Stage $evidence "STAGE START name=test-start timeout_seconds=15 validator_slot=$(Get-ValidatorSlot)"
+    Write-Stage $evidence "START shard=$currentShard PID=$($validator.Id) genesis=$($genesis.result) ledger=$ledger flags=$flags initial_confirmed_slot=$initialConfirmedSlot initial_finalized_slot=$initialFinalizedSlot"
+    Write-Stage $evidence "STAGE START name=test-start timeout_seconds=15 $(Get-SlotEvidence)"
     if (-not (Test-TcpPortListening 8899)) { throw "Validator stopped listening before test start for $currentShard" }
-    Write-Stage $evidence "STAGE COMPLETE name=test-start elapsed_ms=0 validator_slot=$(Get-ValidatorSlot)"
+    Write-Stage $evidence "STAGE COMPLETE name=test-start elapsed_ms=0 $(Get-SlotEvidence)"
     Invoke-OwnedProcess -Evidence $evidence -Stage "typescript-$currentShard" -FilePath $nodeExe -Arguments @(
       'node_modules/tsx/dist/cli.mjs', 'tests/economic-settlement.spec.ts', '--shard', $currentShard
     ) -TimeoutSeconds 2400 -ProcessStdout (Join-Path $localRoot "economic-settlement-$currentShard.test.stdout.log") -ProcessStderr (Join-Path $localRoot "economic-settlement-$currentShard.test.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
-    Write-Stage $evidence "SHARD COMPLETE name=$currentShard final_slot=$(Get-ValidatorSlot)"
+    $finalConfirmedSlot = Get-ValidatorSlot 'confirmed'
+    $finalFinalizedSlot = Get-ValidatorSlot 'finalized'
+    if ($phase -eq 'B' -and [int]$finalConfirmedSlot -ge 90) { throw "Phase B shard $currentShard exceeded confirmed-slot budget: $finalConfirmedSlot" }
+    Write-Stage $evidence "SHARD COMPLETE name=$currentShard confirmed_final_slot=$finalConfirmedSlot finalized_final_slot=$finalFinalizedSlot"
   } finally {
     Remove-Item Env:FAULTLINE_ECONOMIC_GENESIS -ErrorAction SilentlyContinue
     Remove-Item Env:FAULTLINE_ECONOMIC_SHARD -ErrorAction SilentlyContinue
@@ -219,7 +241,8 @@ foreach ($currentShard in $shards) {
 }
 
 if ($Shard) {
-  Write-Output "MILESTONE-6 PHASE-A SHARD PASSED: $Shard"
+  $reportedPhase = if ($Shard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } else { 'A' }
+  Write-Output "MILESTONE-6 PHASE-$reportedPhase SHARD PASSED: $Shard"
 } else {
-  Write-Output 'MILESTONE-6 PHASE-A ASSERTIONS 1-60 PASSED'
+  Write-Output 'MILESTONE-6 PHASE-B ASSERTIONS 61-104 PASSED'
 }

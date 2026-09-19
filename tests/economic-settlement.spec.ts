@@ -1,4 +1,4 @@
-/* Milestone 6 dedicated fresh-ledger validation, Phase A assertions 1-60. */
+/* Milestone 6 dedicated fresh-ledger validation, Phase A and B assertions. */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync } from "node:fs";
@@ -15,7 +15,7 @@ import {
   tokenAmount
 } from "../scripts/lib/spl-token-lite.js";
 
-type Shard = "policy-funding" | "stakes-withdrawal";
+type Shard = "policy-funding" | "stakes-withdrawal" | "bonds-hold" | "violation-fees" | "bond-outcomes" | "objective-slashing";
 type PolicyParameters = {
   bounty: bigint; bond: bigint; fee: bigint; minimumStake: bigint; slash: bigint;
   maxChallenges: number; feeGrace: bigint; slashGrace: bigint; cooldown: bigint;
@@ -72,6 +72,9 @@ const roundAddress = (trace: PublicKey) => PublicKey.findProgramAddressSync([Buf
 const roundEconomicsAddress = (round: PublicKey) => PublicKey.findProgramAddressSync([Buffer.from("round-economics"), round.toBuffer()], gate)[0];
 const attestationAddress = (round: PublicKey, verifier: PublicKey) => PublicKey.findProgramAddressSync([Buffer.from("verifier-attestation"), round.toBuffer(), verifier.toBuffer()], gate)[0];
 const slashReceiptAddress = (round: PublicKey, verifier: PublicKey) => PublicKey.findProgramAddressSync([Buffer.from("verifier-slash"), round.toBuffer(), verifier.toBuffer()], gate)[0];
+const replayResultAddress = (round: PublicKey, resultHash: Buffer) => PublicKey.findProgramAddressSync([Buffer.from("replay-result"), round.toBuffer(), resultHash], gate)[0];
+const feeClaimAddress = (round: PublicKey, verifier: PublicKey) => PublicKey.findProgramAddressSync([Buffer.from("verifier-fee-claim"), round.toBuffer(), verifier.toBuffer()], gate)[0];
+const REPLAY_DOMAIN = Buffer.from("FAULTLINE_REPLAY_V1", "ascii");
 
 let activeAssertion = 0;
 function pass(number: number, message: string, detail = ""): void {
@@ -96,7 +99,14 @@ async function sendMany(instructions: TransactionInstruction[], feePayer: Keypai
   const latest = await connection.getLatestBlockhash(COMMITMENT);
   const tx = new Transaction({ feePayer: feePayer.publicKey, recentBlockhash: latest.blockhash }).add(...instructions);
   tx.sign(feePayer, ...signers);
-  const signature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: COMMITMENT });
+  // This suite uses legacy transactions only.  Measure the actual signed wire
+  // representation before send; there is no ALT fallback in the local MVP.
+  const exactSize = 1 + (64 * tx.signatures.length) + tx.compileMessage().serialize().length;
+  assert(exactSize < 1_232, `legacy transaction exceeds 1,232 bytes: ${exactSize}`);
+  const wire = tx.serialize();
+  assert.equal(wire.length, exactSize, "signed transaction serialization changed unexpectedly");
+  console.log(`TX_SIZE bytes=${exactSize} instructions=${instructions.length}`);
+  const signature = await connection.sendRawTransaction(wire, { skipPreflight: false, preflightCommitment: COMMITMENT });
   const confirmation = await connection.confirmTransaction({ signature, ...latest }, COMMITMENT);
   if (confirmation.value.err) throw new Error(`transaction ${signature} failed: ${JSON.stringify(confirmation.value.err)}`);
   return signature;
@@ -113,12 +123,12 @@ async function advanceTo(target: bigint, label: string): Promise<void> {
 }
 async function advancePast(target: bigint, label: string): Promise<void> { await advanceTo(target + 1n, label); }
 
-async function createAta(payerKey: Keypair, owner: PublicKey, mint: PublicKey): Promise<PublicKey> {
+function createAtaInstruction(payerKey: PublicKey, owner: PublicKey, mint: PublicKey): TransactionInstruction {
   const ata = ataAddress(owner, mint);
-  const ix = new TransactionInstruction({
+  return new TransactionInstruction({
     programId: ASSOCIATED_TOKEN_PROGRAM_ID,
     keys: [
-      { pubkey: payerKey.publicKey, isSigner: true, isWritable: true },
+      { pubkey: payerKey, isSigner: true, isWritable: true },
       { pubkey: ata, isSigner: false, isWritable: true },
       { pubkey: owner, isSigner: false, isWritable: false },
       { pubkey: mint, isSigner: false, isWritable: false },
@@ -126,7 +136,10 @@ async function createAta(payerKey: Keypair, owner: PublicKey, mint: PublicKey): 
       { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }
     ], data: Buffer.alloc(0)
   });
-  await send(ix, payerKey);
+}
+async function createAta(payerKey: Keypair, owner: PublicKey, mint: PublicKey): Promise<PublicKey> {
+  const ata = ataAddress(owner, mint);
+  await send(createAtaInstruction(payerKey.publicKey, owner, mint), payerKey);
   return ata;
 }
 async function createMintWithFreeze(mint: Keypair, authority: PublicKey, freezeAuthority: PublicKey): Promise<void> {
@@ -147,12 +160,15 @@ async function createLegacyMint(mint: Keypair, authority: PublicKey, decimals: n
     new TransactionInstruction({ programId: TOKEN_PROGRAM_ID, keys: [{ pubkey: mint.publicKey, isSigner: false, isWritable: true }], data })
   ], payer, [mint]);
 }
-async function mintTokens(mint: PublicKey, destination: PublicKey, amount: bigint): Promise<string> {
+function mintTokensInstruction(mint: PublicKey, destination: PublicKey, amount: bigint): TransactionInstruction {
   const data = Buffer.alloc(9); data[0] = 7; data.writeBigUInt64LE(amount, 1);
-  return send(new TransactionInstruction({ programId: TOKEN_PROGRAM_ID, keys: [
+  return new TransactionInstruction({ programId: TOKEN_PROGRAM_ID, keys: [
     { pubkey: mint, isSigner: false, isWritable: true }, { pubkey: destination, isSigner: false, isWritable: true },
     { pubkey: payer.publicKey, isSigner: true, isWritable: false }
-  ], data }), payer);
+  ], data });
+}
+async function mintTokens(mint: PublicKey, destination: PublicKey, amount: bigint): Promise<string> {
+  return send(mintTokensInstruction(mint, destination, amount), payer);
 }
 async function createUninitializedMint(mint: Keypair): Promise<void> {
   const lamports = await connection.getMinimumBalanceForRentExemption(MINT_SIZE, COMMITMENT);
@@ -160,19 +176,21 @@ async function createUninitializedMint(mint: Keypair): Promise<void> {
 }
 function tokenView(raw: Buffer) { return { mint: new PublicKey(raw.subarray(0, 32)), owner: new PublicKey(raw.subarray(32, 64)), amount: raw.readBigUInt64LE(TOKEN_ACCOUNT_AMOUNT_OFFSET), state: raw[108] }; }
 
-async function createLoaderBuffer(seed: string): Promise<{ key: PublicKey; hash: Buffer }> {
+async function createLoaderBuffer(seed: string, batchAuthority = false): Promise<{ key: PublicKey; hash: Buffer }> {
   const keypair = Keypair.fromSeed(sha256(Buffer.from(seed)));
   const bytes = sha256(Buffer.from(`candidate:${seed}`));
   const space = 37 + bytes.length;
   const lamports = await connection.getMinimumBalanceForRentExemption(space, COMMITMENT);
   const init = Buffer.alloc(4); init.writeUInt32LE(0);
   const write = Buffer.alloc(16 + bytes.length); write.writeUInt32LE(1, 0); write.writeUInt32LE(0, 4); write.writeBigUInt64LE(BigInt(bytes.length), 8); bytes.copy(write, 16);
-  await sendMany([
+  const instructions = [
     SystemProgram.createAccount({ fromPubkey: payer.publicKey, newAccountPubkey: keypair.publicKey, lamports, space, programId: LOADER_V3 }),
     new TransactionInstruction({ programId: LOADER_V3, keys: [{ pubkey: keypair.publicKey, isSigner: false, isWritable: true }, { pubkey: proposer.publicKey, isSigner: false, isWritable: false }], data: init }),
     new TransactionInstruction({ programId: LOADER_V3, keys: [{ pubkey: keypair.publicKey, isSigner: false, isWritable: true }, { pubkey: proposer.publicKey, isSigner: true, isWritable: false }], data: write })
-  ], payer, [keypair, proposer]);
-  await send(setLoaderAuthorityInstruction(keypair.publicKey, proposer.publicKey, guard), payer, [proposer]);
+  ];
+  if (batchAuthority) instructions.push(setLoaderAuthorityInstruction(keypair.publicKey, proposer.publicKey, guard));
+  await sendMany(instructions, payer, [keypair, proposer]);
+  if (!batchAuthority) await send(setLoaderAuthorityInstruction(keypair.publicKey, proposer.publicKey, guard), payer, [proposer]);
   const info = await connection.getAccountInfo(keypair.publicKey, COMMITMENT); assert(info);
   return { key: keypair.publicKey, hash: sha256(info.data) };
 }
@@ -347,6 +365,15 @@ async function bootstrap(): Promise<void> {
   await send(initializeSafetyPolicy(), governance);
   await send(initializeInvariant(), governance);
 }
+async function bootstrapBatched(): Promise<void> {
+  await sendMany([
+    ...[governance, proposer, outsider, hunter].map(actor => SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: actor.publicKey, lamports: 8 * LAMPORTS_PER_SOL })),
+    initializeGuard(),
+    setLoaderAuthorityInstruction(treasuryData, payer.publicKey, guard),
+    initializeSafetyPolicy(),
+    initializeInvariant()
+  ], payer, [governance]);
+}
 function registryView(raw: Buffer) { return { safetyPolicy: new PublicKey(raw.subarray(8, 40)), governance: new PublicKey(raw.subarray(40, 72)), next: raw.readBigUInt64LE(72), enforcement: raw.readBigUInt64LE(80), created: raw.readBigUInt64LE(88), bump: raw[96] }; }
 function policyView(raw: Buffer) { return { registry: new PublicKey(raw.subarray(8, 40)), safetyPolicy: new PublicKey(raw.subarray(40, 72)), governance: new PublicKey(raw.subarray(72, 104)), mint: new PublicKey(raw.subarray(104, 136)), tokenProgram: new PublicKey(raw.subarray(136, 168)), config: raw.readBigUInt64LE(168), decimals: raw[176], bounty: raw.readBigUInt64LE(177), bond: raw.readBigUInt64LE(185), fee: raw.readBigUInt64LE(193), minimumStake: raw.readBigUInt64LE(201), slash: raw.readBigUInt64LE(209), maxChallenges: raw[217], feeGrace: raw.readBigUInt64LE(218), slashGrace: raw.readBigUInt64LE(226), cooldown: raw.readBigUInt64LE(234), created: raw.readBigUInt64LE(242), bump: raw[250] }; }
 function stakeView(raw: Buffer) {
@@ -368,6 +395,139 @@ function stakeView(raw: Buffer) {
 }
 function roundEconomicsView(raw: Buffer) { return { round: new PublicKey(raw.subarray(8, 40)), escrow: new PublicKey(raw.subarray(40, 72)), epochEconomics: new PublicKey(raw.subarray(72, 104)), status: raw[104], feeDeadline: raw.readBigUInt64LE(105), slashDeadline: raw.readBigUInt64LE(113), opened: raw.readBigUInt64LE(121) }; }
 async function accountData(address: PublicKey, size?: number): Promise<Buffer> { const info = await connection.getAccountInfo(address, COMMITMENT); assert(info, `missing account ${address}`); if (size !== undefined) assert.equal(info.data.length, size); return info.data; }
+
+class Cursor {
+  offset = 8;
+  constructor(readonly raw: Buffer) {}
+  pubkey(): PublicKey { const value = new PublicKey(this.raw.subarray(this.offset, this.offset + 32)); this.offset += 32; return value; }
+  bytes32(): Buffer { const value = Buffer.from(this.raw.subarray(this.offset, this.offset + 32)); this.offset += 32; return value; }
+  u64(): bigint { const value = this.raw.readBigUInt64LE(this.offset); this.offset += 8; return value; }
+  u16(): number { const value = this.raw.readUInt16LE(this.offset); this.offset += 2; return value; }
+  u8(): number { return this.raw[this.offset++]; }
+  optionU64(): bigint | null { const tag = this.u8(); if (tag === 0) return null; assert.equal(tag, 1); return this.u64(); }
+  optionU16(): number | null { const tag = this.u8(); if (tag === 0) return null; assert.equal(tag, 1); return this.u16(); }
+  optionPubkey(): PublicKey | null { const tag = this.u8(); if (tag === 0) return null; assert.equal(tag, 1); return this.pubkey(); }
+  optionBytes32(): Buffer | null { const tag = this.u8(); if (tag === 0) return null; assert.equal(tag, 1); return this.bytes32(); }
+}
+function proposalView(raw: Buffer) { const c = new Cursor(raw); return { policy: c.pubkey(), id: c.u64(), target: c.pubkey(), programData: c.pubkey(), candidate: c.pubkey(), candidateHash: c.bytes32(), proposer: c.pubkey(), created: c.u64(), start: c.optionU64(), end: c.optionU64(), state: c.u8(), authority: c.optionPubkey(), decisionSlot: c.optionU64(), reason: c.optionU16(), executed: c.optionU64(), bump: c.u8() }; }
+function escrowView(raw: Buffer) { const c = new Cursor(raw); const view = { proposal: c.pubkey(), economicPolicy: c.pubkey(), funder: c.pubkey(), mint: c.pubkey(), bountyVault: c.pubkey(), feeVault: c.pubkey(), penaltyVault: c.pubkey(), bounty: c.u64(), reserve: c.u64(), maxChallenges: c.u8(), committed: c.u8(), unsettled: c.u8(), unclosed: c.u8(), bountyStatus: c.u8(), winningRound: c.optionPubkey(), winningTrace: c.optionPubkey(), funded: c.u64(), refundEligible: c.optionU64(), bountySettled: c.optionU64(), bountyPaid: c.u64(), feesClaimed: c.u64(), refundsPaid: c.u64(), bump: c.u8() }; return view; }
+function commitView(raw: Buffer) { const c = new Cursor(raw); return { proposal: c.pubkey(), invariant: c.pubkey(), hunter: c.pubkey(), commitment: c.bytes32(), committed: c.u64(), earliest: c.u64(), latest: c.u64(), status: c.u8(), trace: c.optionBytes32(), revealed: c.optionU64(), bump: c.u8() }; }
+function traceView(raw: Buffer) { const c = new Cursor(raw); return { proposal: c.pubkey(), invariant: c.pubkey(), commit: c.pubkey(), trace: c.bytes32(), hunter: c.pubkey(), revealed: c.u64(), bump: c.u8() }; }
+function bondView(raw: Buffer) { const c = new Cursor(raw); return { commit: c.pubkey(), escrow: c.pubkey(), hunter: c.pubkey(), vault: c.pubkey(), rent: c.pubkey(), amount: c.u64(), status: c.u8(), funded: c.u64(), settled: c.optionU64(), refunded: c.u64(), forfeited: c.u64(), bump: c.u8() }; }
+function gateView(raw: Buffer) { const c = new Cursor(raw); return { proposal: c.pubkey(), pending: c.u16(), confirmed: c.u8() !== 0, last: c.optionPubkey(), bump: c.u8() }; }
+function roundView(raw: Buffer) { const c = new Cursor(raw); return { policy: c.pubkey(), proposal: c.pubkey(), invariant: c.pubkey(), traceClaim: c.pubkey(), trace: c.bytes32(), candidateHash: c.bytes32(), specificationHash: c.bytes32(), epoch: c.pubkey(), threshold: c.u8(), status: c.u8(), opened: c.u64(), finalized: c.optionU64(), winner: c.optionPubkey(), bump: c.u8() }; }
+function replayView(raw: Buffer) { const c = new Cursor(raw); return { round: c.pubkey(), hash: c.bytes32(), verdict: c.u8(), receipt: c.bytes32(), votes: c.u8(), created: c.u64(), bump: c.u8() }; }
+function attestationView(raw: Buffer) { const c = new Cursor(raw); return { round: c.pubkey(), epoch: c.pubkey(), verifier: c.pubkey(), replay: c.pubkey(), hash: c.bytes32(), slot: c.u64(), bump: c.u8() }; }
+function roundEconomicsFullView(raw: Buffer) { const c = new Cursor(raw); return { round: c.pubkey(), escrow: c.pubkey(), epochEconomics: c.pubkey(), status: c.u8(), feeDeadline: c.u64(), slashDeadline: c.u64(), opened: c.u64(), closed: c.optionU64(), bump: c.u8() }; }
+function feeClaimView(raw: Buffer) { const c = new Cursor(raw); return { round: c.pubkey(), verifier: c.pubkey(), attestation: c.pubkey(), escrow: c.pubkey(), amount: c.u64(), slot: c.u64(), bump: c.u8() }; }
+function slashReceiptView(raw: Buffer) { const c = new Cursor(raw); return { round: c.pubkey(), stake: c.pubkey(), verifier: c.pubkey(), escrow: c.pubkey(), amount: c.u64(), slot: c.u64(), bump: c.u8() }; }
+
+function replayResultCommitment(proposal: PublicKey, invariant: PublicKey, traceClaim: PublicKey, candidateHash: Buffer, specificationHash: Buffer, verdict: 0 | 1, receipt: Buffer): Buffer {
+  return sha256(REPLAY_DOMAIN, proposal.toBuffer(), invariant.toBuffer(), traceClaim.toBuffer(), candidateHash, specificationHash, Buffer.from([verdict]), receipt);
+}
+function createReplay(round: PublicKey, resultHash: Buffer, verdict: 0 | 1, receipt: Buffer): TransactionInstruction { return anchorInstruction(gate, "create_replay_result", [
+  { pubkey: payer.publicKey, isSigner: true, isWritable: true }, { pubkey: round, isSigner: false, isWritable: false },
+  { pubkey: replayResultAddress(round, resultHash), isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+], Buffer.concat([resultHash, Buffer.from([verdict]), receipt])); }
+function attest(verifier: PublicKey, id: bigint, epochId: bigint, round: PublicKey, trace: Buffer, resultHash: Buffer): TransactionInstruction { const proposal = proposalAddress(id); return anchorInstruction(gate, "submit_verifier_attestation", [
+  { pubkey: verifier, isSigner: true, isWritable: true }, { pubkey: policy, isSigner: false, isWritable: false },
+  { pubkey: proposal, isSigner: false, isWritable: false }, { pubkey: invariantAddress(1n), isSigner: false, isWritable: false },
+  { pubkey: traceAddress(proposal, trace), isSigner: false, isWritable: false }, { pubkey: epochAddress(epochId), isSigner: false, isWritable: false },
+  { pubkey: round, isSigner: false, isWritable: false }, { pubkey: replayResultAddress(round, resultHash), isSigner: false, isWritable: true },
+  { pubkey: attestationAddress(round, verifier), isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+], resultHash); }
+function finalizeReplay(id: bigint, round: PublicKey, resultHash: Buffer): TransactionInstruction { const proposal = proposalAddress(id); return anchorInstruction(gate, "finalize_replay_result", [
+  { pubkey: outsider.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false },
+  { pubkey: proposal, isSigner: false, isWritable: true }, { pubkey: proposalGateAddress(proposal), isSigner: false, isWritable: true },
+  { pubkey: round, isSigner: false, isWritable: true }, { pubkey: replayResultAddress(round, resultHash), isSigner: false, isWritable: false }
+]); }
+function closeFinalized(id: bigint, round: PublicKey): TransactionInstruction { const proposal = proposalAddress(id); return anchorInstruction(gate, "close_finalized_round_economics", [
+  { pubkey: payer.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false },
+  { pubkey: proposal, isSigner: false, isWritable: false }, { pubkey: proposalEscrowAddress(proposal), isSigner: false, isWritable: true },
+  { pubkey: proposalGateAddress(proposal), isSigner: false, isWritable: false }, { pubkey: round, isSigner: false, isWritable: false },
+  { pubkey: roundEconomicsAddress(round), isSigner: false, isWritable: true }
+]); }
+function settlementBase(id: bigint, configId: bigint) { const proposal = proposalAddress(id); const ep = economicPolicyAddress(configId); return [
+  { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: economicRegistry, isSigner: false, isWritable: false },
+  { pubkey: ep, isSigner: false, isWritable: false }, { pubkey: proposal, isSigner: false, isWritable: false },
+  { pubkey: proposalEscrowAddress(proposal), isSigner: false, isWritable: true }, { pubkey: configMint.get(ep.toBase58())!, isSigner: false, isWritable: false },
+  { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }
+]; }
+function settleHold(id: bigint, configId: bigint, who: PublicKey, commitment: Buffer, trace: Buffer, destination: PublicKey): TransactionInstruction { const proposal = proposalAddress(id); const commit = commitAddress(proposal, who, commitment); const traceClaim = traceAddress(proposal, trace); const round = roundAddress(traceClaim); return anchorInstruction(gate, "settle_hold_challenge", [
+  { pubkey: payer.publicKey, isSigner: true, isWritable: false }, ...settlementBase(id, configId),
+  { pubkey: traceClaim, isSigner: false, isWritable: false }, { pubkey: commit, isSigner: false, isWritable: false }, { pubkey: bondAddress(commit), isSigner: false, isWritable: true },
+  { pubkey: round, isSigner: false, isWritable: false }, { pubkey: roundEconomicsAddress(round), isSigner: false, isWritable: false },
+  { pubkey: destination, isSigner: false, isWritable: true }, { pubkey: bondVaultAddress(commit), isSigner: false, isWritable: true },
+  { pubkey: penaltyVaultAddress(proposal), isSigner: false, isWritable: true }, { pubkey: who, isSigner: false, isWritable: true }
+]); }
+function settleAccepted(id: bigint, configId: bigint, who: PublicKey, commitment: Buffer, trace: Buffer, destination: PublicKey, overrides: Partial<{ trace: Buffer; round: PublicKey }> = {}): TransactionInstruction { const proposal = proposalAddress(id); const commit = commitAddress(proposal, who, commitment); const suppliedTrace = overrides.trace ?? trace; const traceClaim = traceAddress(proposal, suppliedTrace); const round = overrides.round ?? roundAddress(traceClaim); return anchorInstruction(gate, "settle_accepted_challenge", [
+  { pubkey: payer.publicKey, isSigner: true, isWritable: false }, ...settlementBase(id, configId), { pubkey: proposalGateAddress(proposal), isSigner: false, isWritable: false },
+  { pubkey: traceClaim, isSigner: false, isWritable: false }, { pubkey: commit, isSigner: false, isWritable: false }, { pubkey: bondAddress(commit), isSigner: false, isWritable: true },
+  { pubkey: round, isSigner: false, isWritable: false }, { pubkey: roundEconomicsAddress(round), isSigner: false, isWritable: false },
+  { pubkey: destination, isSigner: false, isWritable: true }, { pubkey: bountyVaultAddress(proposal), isSigner: false, isWritable: true },
+  { pubkey: bondVaultAddress(commit), isSigner: false, isWritable: true }, { pubkey: who, isSigner: false, isWritable: true }
+]); }
+function settleNonReveal(id: bigint, configId: bigint, who: PublicKey, commitment: Buffer): TransactionInstruction { const proposal = proposalAddress(id); const commit = commitAddress(proposal, who, commitment); return anchorInstruction(gate, "settle_non_reveal_challenge", [
+  { pubkey: payer.publicKey, isSigner: true, isWritable: false }, ...settlementBase(id, configId), { pubkey: commit, isSigner: false, isWritable: false },
+  { pubkey: bondAddress(commit), isSigner: false, isWritable: true }, { pubkey: bondVaultAddress(commit), isSigner: false, isWritable: true },
+  { pubkey: penaltyVaultAddress(proposal), isSigner: false, isWritable: true }, { pubkey: who, isSigner: false, isWritable: true }
+]); }
+function settleRoundRefund(id: bigint, configId: bigint, who: PublicKey, commitment: Buffer, trace: Buffer, destination: PublicKey): TransactionInstruction { const proposal = proposalAddress(id); const commit = commitAddress(proposal, who, commitment); const traceClaim = traceAddress(proposal, trace); const round = roundAddress(traceClaim); return anchorInstruction(gate, "settle_timed_out_or_aborted_challenge", [
+  { pubkey: payer.publicKey, isSigner: true, isWritable: false }, ...settlementBase(id, configId), { pubkey: traceClaim, isSigner: false, isWritable: false },
+  { pubkey: commit, isSigner: false, isWritable: false }, { pubkey: bondAddress(commit), isSigner: false, isWritable: true }, { pubkey: round, isSigner: false, isWritable: false },
+  { pubkey: roundEconomicsAddress(round), isSigner: false, isWritable: false }, { pubkey: destination, isSigner: false, isWritable: true },
+  { pubkey: bondVaultAddress(commit), isSigner: false, isWritable: true }, { pubkey: who, isSigner: false, isWritable: true }
+]); }
+function claimFee(id: bigint, configId: bigint, epochId: bigint, round: PublicKey, resultHash: Buffer, verifier: PublicKey, destination: PublicKey): TransactionInstruction { return anchorInstruction(gate, "claim_verifier_fee", [
+  { pubkey: payer.publicKey, isSigner: true, isWritable: true }, ...settlementBase(id, configId), { pubkey: verifier, isSigner: false, isWritable: false },
+  { pubkey: epochAddress(epochId), isSigner: false, isWritable: false }, { pubkey: round, isSigner: false, isWritable: false },
+  { pubkey: roundEconomicsAddress(round), isSigner: false, isWritable: false }, { pubkey: replayResultAddress(round, resultHash), isSigner: false, isWritable: false },
+  { pubkey: attestationAddress(round, verifier), isSigner: false, isWritable: false }, { pubkey: feeClaimAddress(round, verifier), isSigner: false, isWritable: true },
+  { pubkey: destination, isSigner: false, isWritable: true }, { pubkey: feeVaultAddress(proposalAddress(id)), isSigner: false, isWritable: true },
+  { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+]); }
+async function dust(address: PublicKey): Promise<void> { const lamports = await connection.getMinimumBalanceForRentExemption(0, COMMITMENT); await send(SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: address, lamports }), payer); }
+
+type PhaseBSetup = { registry: ReturnType<typeof registryView>; mint: Keypair; ep: PublicKey; params: PolicyParameters; verifiers: Keypair[]; verifierAtas: PublicKey[]; canonical: PublicKey[]; proposerAta: PublicKey; hunters: Keypair[]; hunterAtas: PublicKey[]; buffers: { key: PublicKey; hash: Buffer }[] };
+async function setupPhaseB(name: string, verifierCount: number, threshold: number, params: PolicyParameters, bufferCount: number, stakeAmount: bigint, batched = false): Promise<PhaseBSetup> {
+  await (batched ? bootstrapBatched() : bootstrap());
+  await send(initializeEconomicRegistry(governance.publicKey), governance);
+  const registry = registryView(await accountData(economicRegistry));
+  const mint = Keypair.fromSeed(sha256(Buffer.from(`${name}-mint`)));
+  await createLegacyMint(mint, payer.publicKey, 6);
+  const ep = economicPolicyAddress(0n); configMint.set(ep.toBase58(), mint.publicKey);
+  if (batched) await sendMany([initializeEconomicPolicy(0n, mint.publicKey, params), initializeVerifierRegistry()], governance);
+  else { await send(initializeEconomicPolicy(0n, mint.publicKey, params), governance); await send(initializeVerifierRegistry(), governance); }
+  const verifiers = Array.from({ length: verifierCount }, (_, i) => Keypair.fromSeed(sha256(Buffer.from(`${name}-verifier-${i}`))));
+  const hunters = [hunter, ...Array.from({ length: 3 }, (_, i) => Keypair.fromSeed(sha256(Buffer.from(`${name}-hunter-${i}`))))];
+  let verifierAtas: PublicKey[]; let hunterAtas: PublicKey[]; let proposerAta: PublicKey;
+  if (batched) {
+    await sendMany([...verifiers, ...hunters.slice(1)].map(actor => SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: actor.publicKey, lamports: 5 * LAMPORTS_PER_SOL })), payer);
+    verifierAtas = verifiers.map(verifier => ataAddress(verifier.publicKey, mint.publicKey)); hunterAtas = hunters.map(value => ataAddress(value.publicKey, mint.publicKey)); proposerAta = ataAddress(proposer.publicKey, mint.publicKey);
+    await sendMany([...verifiers.map(value => createAtaInstruction(payer.publicKey, value.publicKey, mint.publicKey)), ...hunters.map(value => createAtaInstruction(payer.publicKey, value.publicKey, mint.publicKey)), createAtaInstruction(payer.publicKey, proposer.publicKey, mint.publicKey)], payer);
+    await sendMany([...verifierAtas.map(value => mintTokensInstruction(mint.publicKey, value, 1_000n)), ...hunterAtas.map(value => mintTokensInstruction(mint.publicKey, value, 2_000n)), mintTokensInstruction(mint.publicKey, proposerAta, 200_000n)], payer);
+    if (name === "m6-phase-b-violation") await dust(slashReceiptAddress(roundAddress(traceAddress(proposalAddress(2n), sha256(Buffer.from("phase-b-timeout-a")))), verifiers[1].publicKey));
+    await sendMany(verifiers.map((verifier, index) => initializeStake(0n, verifier.publicKey, verifierAtas[index], stakeAmount)), payer, verifiers);
+    await sendMany([createEpoch(0n, verifiers.map(value => value.publicKey), threshold), activateEpoch(0n)], governance);
+  } else {
+    await sendMany(verifiers.map(verifier => SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: verifier.publicKey, lamports: 5 * LAMPORTS_PER_SOL })), payer);
+    verifierAtas = [];
+    for (const verifier of verifiers) { const ata = await createAta(payer, verifier.publicKey, mint.publicKey); verifierAtas.push(ata); await mintTokens(mint.publicKey, ata, 1_000n); await send(initializeStake(0n, verifier.publicKey, ata, stakeAmount), verifier); }
+    await send(createEpoch(0n, verifiers.map(value => value.publicKey), threshold), governance); await send(activateEpoch(0n), governance);
+    await sendMany(hunters.slice(1).map(value => SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: value.publicKey, lamports: 5 * LAMPORTS_PER_SOL })), payer);
+    hunterAtas = [];
+    for (const value of hunters) hunterAtas.push(await createAta(payer, value.publicKey, mint.publicKey));
+    proposerAta = await createAta(payer, proposer.publicKey, mint.publicKey); await mintTokens(mint.publicKey, proposerAta, 200_000n);
+  }
+  const canonical = sortedKeys(verifiers.map(value => value.publicKey));
+  await send(activateEpochEconomics(0n, 0n, canonical.map(value => stakeAddress(ep, value))), governance);
+  const buffers: { key: PublicKey; hash: Buffer }[] = [];
+  for (let i = 0; i < bufferCount; i++) buffers.push(await createLoaderBuffer(`${name}-buffer-${i}`, batched));
+  await advanceTo(registry.enforcement, `${name}-enforcement`);
+  return { registry, mint, ep, params, verifiers, verifierAtas, canonical, proposerAta, hunters, hunterAtas, buffers };
+}
+async function prepareFundedProposal(setup: PhaseBSetup, id: bigint, bufferIndex: number, duration: bigint, batched = false): Promise<void> { if (batched) await sendMany([createProposal(id, setup.buffers[bufferIndex].key, setup.buffers[bufferIndex].hash), fundEscrow(id, 0n, proposer.publicKey, setup.proposerAta), startFunded(id, 0n, duration)], proposer); else { await send(createProposal(id, setup.buffers[bufferIndex].key, setup.buffers[bufferIndex].hash), proposer); await send(fundEscrow(id, 0n, proposer.publicKey, setup.proposerAta), proposer); await send(startFunded(id, 0n, duration), proposer); } }
+async function revealBond(id: bigint, who: Keypair, whoAta: PublicKey, trace: Buffer, salt: Buffer) { const bonded = bondedCommit(id, 0n, who.publicKey, whoAta, trace, salt); const signature = await send(bonded.ix, who); const commit = commitView(await accountData(bonded.commit, 204)); await advanceTo(commit.earliest, `reveal-${id}-${who.publicKey.toBase58().slice(0, 6)}`); const revealSignature = await send(reveal(id, who.publicKey, bonded.commitment, trace, salt), who); return { ...bonded, signature, revealSignature, trace, salt }; }
 
 const goodParams: PolicyParameters = { bounty: 700n, bond: 100n, fee: 5n, minimumStake: 100n, slash: 20n, maxChallenges: 3, feeGrace: 10n, slashGrace: 16n, cooldown: 3n };
 const stakeParams: PolicyParameters = { ...goodParams, feeGrace: 4n, slashGrace: 12n, cooldown: 1n };
@@ -552,14 +712,401 @@ async function runStakesWithdrawal(): Promise<void> {
   console.log(`BALANCES stake_initial=100 slash=20 stake_after_slash=80 verifier_before_withdraw=${preWithdrawalAta} verifier_after_withdraw=${await tokenAmount(connection, targetAta)} penalty_after_slash=${await tokenAmount(connection, penaltyVaultAddress(proposalAddress(opened[0].id)))}`);
 }
 
+async function runBondsHold(): Promise<void> {
+  const params: PolicyParameters = { bounty: 700n, bond: 100n, fee: 5n, minimumStake: 20n, slash: 20n, maxChallenges: 2, feeGrace: 2n, slashGrace: 4n, cooldown: 1n };
+  const setup = await setupPhaseB("m6-phase-b-bonds", 2, 2, params, 1, 25n);
+  const id = 1n; await prepareFundedProposal(setup, id, 0, 18n);
+  await mintTokens(setup.mint.publicKey, setup.hunterAtas[0], 1_000n);
+  await mintTokens(setup.mint.publicKey, setup.hunterAtas[1], 99n);
+  await mintTokens(setup.mint.publicKey, setup.hunterAtas[2], 100n);
+  const proposal = proposalAddress(id); const escrow = proposalEscrowAddress(proposal);
+
+  const failedTrace = sha256(Buffer.from("phase-b-failed-bond")); const failedSalt = sha256(Buffer.from("phase-b-failed-salt"));
+  const failedBonded = bondedCommit(id, 0n, setup.hunters[1].publicKey, setup.hunterAtas[1], failedTrace, failedSalt);
+  const escrowBeforeFailure = Buffer.from(await accountData(escrow, 370));
+  await expectFailure("62 failed bond transfer", () => send(failedBonded.ix, setup.hunters[1]), /insufficient funds|custom program error|InsufficientFunds/);
+  await check(62, "failed bond transfer creates no accounts and changes no counters", async () => {
+    assert.equal(await connection.getAccountInfo(failedBonded.commit, COMMITMENT), null); assert.equal(await connection.getAccountInfo(bondAddress(failedBonded.commit), COMMITMENT), null); assert.equal(await connection.getAccountInfo(bondVaultAddress(failedBonded.commit), COMMITMENT), null); assert.deepEqual(await accountData(escrow), escrowBeforeFailure);
+  });
+
+  const trace = sha256(Buffer.from("phase-b-hold-trace")); const salt = sha256(Buffer.from("phase-b-hold-salt")); const first = bondedCommit(id, 0n, setup.hunters[0].publicKey, setup.hunterAtas[0], trace, salt);
+  const commitSignature = await send(first.ix, setup.hunters[0]);
+  await check(61, "ChallengeCommit and ChallengeBond are created atomically", async () => {
+    const commitRaw = await accountData(first.commit, 204); const bondRaw = await accountData(bondAddress(first.commit), 211); const commit = commitView(commitRaw); const bond = bondView(bondRaw);
+    assert.deepEqual(commitRaw.subarray(0, 8), discriminator("account", "ChallengeCommit")); assert.deepEqual(bondRaw.subarray(0, 8), discriminator("account", "ChallengeBond"));
+    assert(commit.proposal.equals(proposal)); assert(commit.hunter.equals(setup.hunters[0].publicKey)); assert.deepEqual(commit.commitment, first.commitment); assert.equal(commit.status, 0);
+    assert(bond.commit.equals(first.commit)); assert(bond.escrow.equals(escrow)); assert(bond.hunter.equals(setup.hunters[0].publicKey)); assert(bond.vault.equals(bondVaultAddress(first.commit))); assert.equal(bond.amount, 100n); assert.equal(bond.status, 0);
+    assert.equal(commit.bump, PublicKey.findProgramAddressSync([Buffer.from("challenge-commit"), proposal.toBuffer(), setup.hunters[0].publicKey.toBuffer(), first.commitment], gate)[1]); assert.equal(bond.bump, PublicKey.findProgramAddressSync([Buffer.from("challenge-bond"), first.commit.toBuffer()], gate)[1]);
+    const vault = tokenView(await accountData(bondVaultAddress(first.commit), TOKEN_ACCOUNT_SIZE)); assert(vault.owner.equals(bondAddress(first.commit))); assert(vault.mint.equals(setup.mint.publicKey)); assert.equal(vault.amount, 100n);
+  });
+  await check(63, "successful bonded commit increments both counters once", async () => { const view = escrowView(await accountData(escrow)); assert.equal(view.committed, 1); assert.equal(view.unsettled, 1); });
+
+  await mintTokens(setup.mint.publicKey, setup.hunterAtas[1], 1n);
+  const secondTrace = sha256(Buffer.from("phase-b-second-trace")); const secondSalt = sha256(Buffer.from("phase-b-second-salt")); const second = bondedCommit(id, 0n, setup.hunters[1].publicKey, setup.hunterAtas[1], secondTrace, secondSalt); await send(second.ix, setup.hunters[1]);
+  const thirdTrace = sha256(Buffer.from("phase-b-third-trace")); const thirdSalt = sha256(Buffer.from("phase-b-third-salt")); const third = bondedCommit(id, 0n, setup.hunters[2].publicKey, setup.hunterAtas[2], thirdTrace, thirdSalt);
+  await expectFailure("64 challenge limit", () => send(third.ix, setup.hunters[2]), /BondedChallengeLimitReached/);
+  const firstCommit = commitView(await accountData(first.commit)); await advanceTo(firstCommit.earliest, "bonds-hold-reveal"); const revealSignature = await send(reveal(id, setup.hunters[0].publicKey, first.commitment, trace, salt), setup.hunters[0]);
+  await check(64, "challenge limit counts successful commits rather than reveals or rounds", async () => { const view = escrowView(await accountData(escrow)); assert.equal(view.committed, 2); assert.equal(view.unsettled, 2); assert.equal(await connection.getAccountInfo(third.commit, COMMITMENT), null); });
+
+  await send(createEpoch(1n, setup.verifiers.map(value => value.publicKey), 2), governance);
+  await send(activateEpochEconomics(1n, 0n, sortedKeys(setup.verifiers.map(value => value.publicKey)).map(value => stakeAddress(setup.ep, value))), governance);
+  const stakes = setup.canonical.map(value => stakeAddress(setup.ep, value)); const opening = openEconomicRound(id, 0n, 0n, setup.hunters[0].publicKey, first.commitment, trace, stakes);
+  const wrongEconomics = openEconomicRound(id, 0n, 0n, setup.hunters[0].publicKey, first.commitment, trace, stakes); wrongEconomics.ix.keys[13].pubkey = epochEconomicsAddress(epochAddress(1n), setup.ep);
+  await fails(66, "economic round requires exact epoch-policy economics", /ConstraintSeeds|WrongVerifierEpochEconomics/, () => send(wrongEconomics.ix, payer));
+  const locksBefore = await Promise.all(stakes.map(value => accountData(value))); const escrowBeforeRound = Buffer.from(await accountData(escrow)); const gateBeforeRound = Buffer.from(await accountData(proposalGateAddress(proposal)));
+  const invalidStakes = [stakes[0], stakes[0]]; const atomicFailure = openEconomicRound(id, 0n, 0n, setup.hunters[0].publicKey, first.commitment, trace, invalidStakes);
+  await expectFailure("67 atomic round lock failure", () => send(atomicFailure.ix, payer), /WrongVerifierStake/);
+  await check(67, "round creation and all stake-lock extensions are atomic", async () => { assert.equal(await connection.getAccountInfo(opening.round, COMMITMENT), null); assert.equal(await connection.getAccountInfo(roundEconomicsAddress(opening.round), COMMITMENT), null); assert.deepEqual(await accountData(escrow), escrowBeforeRound); assert.deepEqual(await accountData(proposalGateAddress(proposal)), gateBeforeRound); for (let i = 0; i < stakes.length; i++) assert.deepEqual(await accountData(stakes[i]), locksBefore[i]); });
+  const roundSignature = await send(opening.ix, payer);
+  await check(68, "successful round opening increments unclosed_rounds once", async () => { const view = escrowView(await accountData(escrow)); assert.equal(view.unclosed, 1); assert.equal(gateView(await accountData(proposalGateAddress(proposal))).pending, 1); const econ = roundEconomicsFullView(await accountData(roundEconomicsAddress(opening.round), 139)); assert.equal(econ.status, 0); assert(econ.round.equals(opening.round)); assert(econ.escrow.equals(escrow)); for (const stake of stakes) assert.equal(stakeView(await accountData(stake)).lock, econ.slashDeadline); });
+  const preDuplicateEscrow = Buffer.from(await accountData(escrow));
+  await fails(65, "one ChallengeCommit cannot create multiple economic rounds", /already in use|AccountAlreadyInitialized/, () => send(opening.ix, payer));
+  await fails(69, "duplicate RoundEconomicState creation fails", /already in use|AccountAlreadyInitialized/, () => send(opening.ix, payer));
+  assert.deepEqual(await accountData(escrow), preDuplicateEscrow);
+
+  const receipt = sha256(Buffer.from("phase-b-hold-receipt")); const resultHash = replayResultCommitment(proposal, invariantAddress(1n), traceAddress(proposal, trace), setup.buffers[0].hash, sha256(Buffer.from("spec-1")), 0, receipt);
+  await send(createReplay(opening.round, resultHash, 0, receipt), payer);
+  for (const verifier of setup.verifiers) await send(attest(verifier.publicKey, id, 0n, opening.round, trace, resultHash), verifier);
+  const econBeforeFinalize = Buffer.from(await accountData(roundEconomicsAddress(opening.round))); const escrowBeforeFinalize = Buffer.from(await accountData(escrow));
+  const finalizationSignature = await send(finalizeReplay(id, opening.round, resultHash), outsider);
+  await check(70, "finalize_replay_result uses six accounts and no economic settlement accounts", async () => { assert.equal(finalizeReplay(id, opening.round, resultHash).keys.length, 6); assert.deepEqual(await accountData(roundEconomicsAddress(opening.round)), econBeforeFinalize); assert.deepEqual(await accountData(escrow), escrowBeforeFinalize); const replay = replayView(await accountData(replayResultAddress(opening.round, resultHash), 115)); assert.equal(replay.votes, 2); assert.equal(replay.verdict, 0); });
+  await check(73, "HOLD finalization leaves proposal ChallengeActive", async () => { const p = proposalView(await accountData(proposal)); const round = roundView(await accountData(opening.round, 317)); assert.equal(p.state, 1); assert.equal(round.status, 1); assert(round.winner?.equals(replayResultAddress(opening.round, resultHash))); });
+  const closeSignature = await send(closeFinalized(id, opening.round), payer);
+  await check(71, "economic close decrements unclosed_rounds exactly once", async () => { const view = escrowView(await accountData(escrow)); const econ = roundEconomicsFullView(await accountData(roundEconomicsAddress(opening.round))); assert.equal(view.unclosed, 0); assert.equal(econ.status, 1); assert(econ.closed !== null); });
+  await check(74, "HOLD economic close closes only its matching round", async () => { const econ = roundEconomicsFullView(await accountData(roundEconomicsAddress(opening.round))); assert(econ.round.equals(opening.round)); assert(econ.escrow.equals(escrow)); assert.equal(escrowView(await accountData(escrow)).winningRound, null); });
+  const closedEscrow = Buffer.from(await accountData(escrow));
+  await fails(72, "duplicate economic close fails without underflow", /RoundEconomicsAlreadyClosed/, () => send(closeFinalized(id, opening.round), payer)); assert.deepEqual(await accountData(escrow), closedEscrow);
+
+  const bountyBefore = await tokenAmount(connection, bountyVaultAddress(proposal)); const penaltyBefore = await tokenAmount(connection, penaltyVaultAddress(proposal)); const hunterBefore = await tokenAmount(connection, setup.hunterAtas[0]); const hunterLamportsBefore = await connection.getBalance(setup.hunters[0].publicKey, COMMITMENT); const bondVaultInfo = await connection.getAccountInfo(bondVaultAddress(first.commit), COMMITMENT); assert(bondVaultInfo);
+  const holdSettlementSignature = await send(settleHold(id, 0n, setup.hunters[0].publicKey, first.commitment, trace, setup.hunterAtas[0]), payer);
+  await check(75, "HOLD settlement forfeits floor bond times 2500 over 10000", async () => { const bond = bondView(await accountData(bondAddress(first.commit), 211)); assert.equal(bond.status, 2); assert.equal(bond.refunded, 75n); assert.equal(bond.forfeited, 25n); assert.equal(await tokenAmount(connection, penaltyVaultAddress(proposal)), penaltyBefore + 25n); assert.equal(await tokenAmount(connection, setup.hunterAtas[0]), hunterBefore + 75n); assert.equal(await connection.getAccountInfo(bondVaultAddress(first.commit), COMMITMENT), null); assert.equal(await connection.getBalance(setup.hunters[0].publicKey, COMMITMENT), hunterLamportsBefore + bondVaultInfo.lamports); assert.equal(escrowView(await accountData(escrow)).unsettled, 1); });
+  await check(76, "HOLD settlement leaves BountyVault unchanged", async () => assert.equal(await tokenAmount(connection, bountyVaultAddress(proposal)), bountyBefore));
+  console.log(`SIGNATURE bonded-commit=${commitSignature} reveal=${revealSignature} round-opening=${roundSignature} hold-finalization=${finalizationSignature} hold-close=${closeSignature} hold-settlement=${holdSettlementSignature}`);
+  console.log(`BALANCES hold hunter_before=${hunterBefore} hunter_after=${await tokenAmount(connection, setup.hunterAtas[0])} bond_before=100 bond_after=closed penalty_before=${penaltyBefore} penalty_after=${await tokenAmount(connection, penaltyVaultAddress(proposal))} bounty_before=${bountyBefore} bounty_after=${await tokenAmount(connection, bountyVaultAddress(proposal))}`);
+}
+
+async function runViolationFees(): Promise<void> {
+  const params: PolicyParameters = { bounty: 700n, bond: 100n, fee: 5n, minimumStake: 20n, slash: 20n, maxChallenges: 2, feeGrace: 1n, slashGrace: 4n, cooldown: 1n };
+  const setup = await setupPhaseB("m6-phase-b-violation-fees", 3, 2, params, 1, 25n, true);
+  const id = 1n; await prepareFundedProposal(setup, id, 0, 14n, true);
+  const proposal = proposalAddress(id); const escrow = proposalEscrowAddress(proposal);
+  const metadata = proposalView(await accountData(proposal));
+  const trace = sha256(Buffer.from("m6-vf-winning-trace")); const salt = sha256(Buffer.from("m6-vf-winning-salt"));
+  const bonded = await revealBond(id, setup.hunters[0], setup.hunterAtas[0], trace, salt);
+  const opening = openEconomicRound(id, 0n, 0n, setup.hunters[0].publicKey, bonded.commitment, trace, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  const roundSignature = await send(opening.ix, payer);
+  const receipt = sha256(Buffer.from("m6-vf-violation-receipt"));
+  const resultHash = replayResultCommitment(proposal, invariantAddress(1n), traceAddress(proposal, trace), setup.buffers[0].hash, sha256(Buffer.from("spec-1")), 1, receipt);
+  const minorityReceipt = sha256(Buffer.from("m6-vf-minority-receipt"));
+  const minorityHash = replayResultCommitment(proposal, invariantAddress(1n), traceAddress(proposal, trace), setup.buffers[0].hash, sha256(Buffer.from("spec-1")), 0, minorityReceipt);
+  await sendMany([createReplay(opening.round, resultHash, 1, receipt), createReplay(opening.round, minorityHash, 0, minorityReceipt)], payer);
+  await sendMany([attest(setup.verifiers[0].publicKey, id, 0n, opening.round, trace, resultHash), attest(setup.verifiers[1].publicKey, id, 0n, opening.round, trace, resultHash)], payer, setup.verifiers.slice(0, 2));
+  await send(attest(setup.verifiers[2].publicKey, id, 0n, opening.round, trace, minorityHash), setup.verifiers[2]);
+  const finalizationSignature = await send(finalizeReplay(id, opening.round, resultHash), outsider);
+  await check(77, "VIOLATION automatically rejects with reason 0x5001", async () => { const p = proposalView(await accountData(proposal)); const g = gateView(await accountData(proposalGateAddress(proposal))); assert.equal(p.state, 3); assert.equal(p.reason, 0x5001); assert(g.confirmed); assert(g.last?.equals(opening.round)); });
+  await fails(84, "post-finalization attestation is impossible", /RoundNotOpen/, () => send(attest(outsider.publicKey, id, 0n, opening.round, trace, resultHash), outsider));
+  const closeSignature = await send(closeFinalized(id, opening.round), payer);
+  await check(78, "accepted settlement requires last_violation_round", async () => { const g = gateView(await accountData(proposalGateAddress(proposal))); const e = escrowView(await accountData(escrow)); assert(g.last?.equals(opening.round)); assert(e.winningRound?.equals(opening.round)); assert(e.winningTrace?.equals(traceAddress(proposal, trace))); });
+  await check(79, "winning trace hunter bond and destination substitution fail", async () => {
+    await expectFailure("79 destination", () => send(settleAccepted(id, 0n, setup.hunters[0].publicKey, bonded.commitment, trace, setup.hunterAtas[1]), payer), /NonCanonicalTokenAccount/);
+    await expectFailure("79 trace", () => send(settleAccepted(id, 0n, setup.hunters[0].publicKey, bonded.commitment, sha256(Buffer.from("wrong-trace")), setup.hunterAtas[0]), payer), /WrongTraceBinding|AccountNotInitialized|Constraint/);
+    await expectFailure("79 hunter", () => send(settleAccepted(id, 0n, setup.hunters[1].publicKey, bonded.commitment, trace, setup.hunterAtas[1]), payer), /WrongChallengeBond|Constraint|AccountNotInitialized/);
+  });
+  const hunterBefore = await tokenAmount(connection, setup.hunterAtas[0]); const bountyBefore = await tokenAmount(connection, bountyVaultAddress(proposal)); const bondBefore = await tokenAmount(connection, bondVaultAddress(bonded.commit));
+  const settlementSignature = await send(settleAccepted(id, 0n, setup.hunters[0].publicKey, bonded.commitment, trace, setup.hunterAtas[0]), payer);
+  await check(80, "canonical hunter receives exact bounty plus full bond", async () => { assert.equal(await tokenAmount(connection, setup.hunterAtas[0]), hunterBefore + params.bounty + params.bond); assert.equal(bountyBefore, params.bounty); assert.equal(bondBefore, params.bond); assert.equal(await tokenAmount(connection, bountyVaultAddress(proposal)), 0n); assert.equal(bondView(await accountData(bondAddress(bonded.commit))).status, 1); });
+  await fails(81, "bounty and bond settlement cannot repeat", /BondNotPending|BountyAlreadySettled/, () => send(settleAccepted(id, 0n, setup.hunters[0].publicKey, bonded.commitment, trace, setup.hunterAtas[0]), payer));
+  await check(82, "candidate and timing metadata remain unchanged", async () => { const after = proposalView(await accountData(proposal)); for (const field of ["policy", "target", "programData", "candidate", "proposer"] as const) assert(after[field].equals(metadata[field])); assert.deepEqual(after.candidateHash, metadata.candidateHash); assert.equal(after.created, metadata.created); assert.equal(after.start, metadata.start); assert.equal(after.end, metadata.end); });
+  const feeVault = feeVaultAddress(proposal); const feeBefore = await tokenAmount(connection, feeVault); const bountyAfter = await tokenAmount(connection, bountyVaultAddress(proposal));
+  const claim0 = await send(claimFee(id, 0n, 0n, opening.round, resultHash, setup.verifiers[0].publicKey, setup.verifierAtas[0]), payer);
+  await check(83, "every matching pre-finalization attestation can claim one fixed fee", async () => { const claim = feeClaimView(await accountData(feeClaimAddress(opening.round, setup.verifiers[0].publicKey))); assert.equal(claim.amount, params.fee); assert(claim.attestation.equals(attestationAddress(opening.round, setup.verifiers[0].publicKey))); });
+  await check(85, "minority mismatching attestation receives no fee and is not slashable", async () => { await expectFailure("85 mismatching fee", () => send(claimFee(id, 0n, 0n, opening.round, resultHash, setup.verifiers[2].publicKey, setup.verifierAtas[2]), payer), /WrongAttestationBinding/); await expectFailure("85 finalized slash", () => send(slashNonReveal(id, 0n, 0n, opening.round, setup.verifiers[2].publicKey), payer), /RoundNotSlashable/); });
+  await fails(86, "duplicate verifier fee claim fails", /VerifierFeeAlreadyClaimed/, () => send(claimFee(id, 0n, 0n, opening.round, resultHash, setup.verifiers[0].publicKey, setup.verifierAtas[0]), payer));
+  await check(87, "aggregate fees remain within fee_reserve_amount", async () => { const e = escrowView(await accountData(escrow)); assert(e.feesClaimed <= e.reserve); assert.equal(e.feesClaimed, params.fee); });
+  await check(88, "fee claim never decreases BountyVault", async () => { assert.equal(await tokenAmount(connection, feeVault), feeBefore - params.fee); assert.equal(await tokenAmount(connection, bountyVaultAddress(proposal)), bountyAfter); });
+  const economics = roundEconomicsFullView(await accountData(roundEconomicsAddress(opening.round)));
+  await advanceTo(economics.feeDeadline - 1n, "violation-fees-deadline-minus-one");
+  const claimAtDeadline = await send(claimFee(id, 0n, 0n, opening.round, resultHash, setup.verifiers[1].publicKey, setup.verifierAtas[1]), payer);
+  await check(89, "claim at exact fee deadline succeeds", async () => assert.equal(feeClaimView(await accountData(feeClaimAddress(opening.round, setup.verifiers[1].publicKey))).slot, economics.feeDeadline));
+  await advancePast(economics.feeDeadline, "violation-fees-after-deadline");
+  await fails(90, "claim after fee deadline fails", /FeeClaimDeadlinePassed/, () => send(claimFee(id, 0n, 0n, opening.round, resultHash, setup.verifiers[1].publicKey, setup.verifierAtas[1]), payer));
+  await check(91, "unclaimed fees remain reserved for original funder refund", async () => { const e = escrowView(await accountData(escrow)); assert.equal(await tokenAmount(connection, feeVault), e.reserve - e.feesClaimed); assert(e.funder.equals(proposer.publicKey)); });
+  console.log(`SIGNATURE violation-bond=${bonded.signature} violation-round=${roundSignature} finalization=${finalizationSignature} close=${closeSignature} settlement=${settlementSignature} fee-claims=${claim0},${claimAtDeadline}`);
+  console.log(`BALANCES hunter_before=${hunterBefore} hunter_after=${await tokenAmount(connection, setup.hunterAtas[0])} bounty_before=${bountyBefore} bounty_after=${await tokenAmount(connection, bountyVaultAddress(proposal))} fee_before=${feeBefore} fee_after=${await tokenAmount(connection, feeVault)}`);
+}
+
+async function runBondOutcomes(): Promise<void> {
+  const params: PolicyParameters = { bounty: 700n, bond: 100n, fee: 5n, minimumStake: 20n, slash: 20n, maxChallenges: 2, feeGrace: 1n, slashGrace: 1n, cooldown: 1n };
+  const setup = await setupPhaseB("m6-phase-b-bond-outcomes", 2, 2, params, 2, 25n, true);
+  const timeoutId = 1n; const violationId = 2n;
+  await prepareFundedProposal(setup, timeoutId, 0, 10n, true);
+  await prepareFundedProposal(setup, violationId, 1, 14n, true);
+  const timeoutProposal = proposalAddress(timeoutId); const violationProposal = proposalAddress(violationId);
+  const timeoutTrace = sha256(Buffer.from("m6-bo-timeout")); const timeoutSalt = sha256(Buffer.from("m6-bo-timeout-salt"));
+  const nonTrace = sha256(Buffer.from("m6-bo-nonreveal")); const nonSalt = sha256(Buffer.from("m6-bo-nonreveal-salt"));
+  const timed = bondedCommit(timeoutId, 0n, setup.hunters[0].publicKey, setup.hunterAtas[0], timeoutTrace, timeoutSalt);
+  const non = bondedCommit(timeoutId, 0n, setup.hunters[1].publicKey, setup.hunterAtas[1], nonTrace, nonSalt);
+  await sendMany([timed.ix, non.ix], payer, setup.hunters.slice(0, 2));
+  await advanceTo(commitView(await accountData(timed.commit)).earliest, "bond-outcomes-timeout-reveal");
+  await send(reveal(timeoutId, setup.hunters[0].publicKey, timed.commitment, timeoutTrace, timeoutSalt), setup.hunters[0]);
+  const timeoutOpen = openEconomicRound(timeoutId, 0n, 0n, setup.hunters[0].publicKey, timed.commitment, timeoutTrace, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  await send(timeoutOpen.ix, payer);
+  const winnerTrace = sha256(Buffer.from("m6-bo-winner")); const winnerSalt = sha256(Buffer.from("m6-bo-winner-salt"));
+  const siblingTrace = sha256(Buffer.from("m6-bo-sibling")); const siblingSalt = sha256(Buffer.from("m6-bo-sibling-salt"));
+  const winner = bondedCommit(violationId, 0n, setup.hunters[0].publicKey, setup.hunterAtas[0], winnerTrace, winnerSalt);
+  const sibling = bondedCommit(violationId, 0n, setup.hunters[1].publicKey, setup.hunterAtas[1], siblingTrace, siblingSalt);
+  await sendMany([winner.ix, sibling.ix], payer, setup.hunters.slice(0, 2));
+  await advanceTo(commitView(await accountData(winner.commit)).earliest, "bond-outcomes-violation-reveal");
+  await sendMany([reveal(violationId, setup.hunters[0].publicKey, winner.commitment, winnerTrace, winnerSalt), reveal(violationId, setup.hunters[1].publicKey, sibling.commitment, siblingTrace, siblingSalt)], payer, setup.hunters.slice(0, 2));
+  const winnerOpen = openEconomicRound(violationId, 0n, 0n, setup.hunters[0].publicKey, winner.commitment, winnerTrace, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  const siblingOpen = openEconomicRound(violationId, 0n, 0n, setup.hunters[1].publicKey, sibling.commitment, siblingTrace, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  await sendMany([winnerOpen.ix, siblingOpen.ix], payer);
+  const receipt = sha256(Buffer.from("m6-bo-violation")); const hash = replayResultCommitment(violationProposal, invariantAddress(1n), traceAddress(violationProposal, winnerTrace), setup.buffers[1].hash, sha256(Buffer.from("spec-1")), 1, receipt);
+  await send(createReplay(winnerOpen.round, hash, 1, receipt), payer);
+  await sendMany([attest(setup.verifiers[0].publicKey, violationId, 0n, winnerOpen.round, winnerTrace, hash), attest(setup.verifiers[1].publicKey, violationId, 0n, winnerOpen.round, winnerTrace, hash)], payer, setup.verifiers);
+  await send(finalizeReplay(violationId, winnerOpen.round, hash), outsider);
+  const timeoutEnd = proposalView(await accountData(timeoutProposal)).end!; await advancePast(timeoutEnd, "bond-outcomes-timeout-end");
+  await send(closeTimedOut(timeoutId, timeoutOpen.round), payer);
+  const timeoutHunterBefore = await tokenAmount(connection, setup.hunterAtas[0]); const timeoutRefund = await send(settleRoundRefund(timeoutId, 0n, setup.hunters[0].publicKey, timed.commitment, timeoutTrace, setup.hunterAtas[0]), payer);
+  await check(93, "verifier-caused timeout returns 100 percent bond", async () => { const b = bondView(await accountData(bondAddress(timed.commit))); assert.equal(b.status, 4); assert.equal(b.refunded, params.bond); assert.equal(await tokenAmount(connection, setup.hunterAtas[0]), timeoutHunterBefore + params.bond); });
+  const nonView = commitView(await accountData(non.commit)); await advancePast(nonView.latest, "bond-outcomes-non-reveal"); const penalty = penaltyVaultAddress(timeoutProposal); const penaltyBefore = await tokenAmount(connection, penalty); const nonBefore = await tokenAmount(connection, setup.hunterAtas[1]); const nonSettlement = await send(settleNonReveal(timeoutId, 0n, setup.hunters[1].publicKey, non.commitment), payer);
+  await check(92, "hunter non-reveal forfeits 100 percent bond", async () => { const b = bondView(await accountData(bondAddress(non.commit))); assert.equal(b.status, 3); assert.equal(b.forfeited, params.bond); assert.equal(await tokenAmount(connection, penalty), penaltyBefore + params.bond); assert.equal(await tokenAmount(connection, setup.hunterAtas[1]), nonBefore); });
+  const violationEnd = proposalView(await accountData(violationProposal)).end!; await advancePast(violationEnd, "bond-outcomes-sibling-abort"); const siblingBefore = await tokenAmount(connection, setup.hunterAtas[1]); await send(closeTimedOut(violationId, siblingOpen.round), payer); const siblingRefund = await send(settleRoundRefund(violationId, 0n, setup.hunters[1].publicKey, sibling.commitment, siblingTrace, setup.hunterAtas[1]), payer);
+  await check(94, "canonical VIOLATION sibling is Aborted and fully refunded", async () => { assert.equal(roundEconomicsFullView(await accountData(roundEconomicsAddress(siblingOpen.round))).status, 4); assert.equal(bondView(await accountData(bondAddress(sibling.commit))).status, 5); assert.equal(await tokenAmount(connection, setup.hunterAtas[1]), siblingBefore + params.bond); await expectFailure("94 aborted slash", () => send(slashNonReveal(violationId, 0n, 0n, siblingOpen.round, setup.verifiers[1].publicKey), payer), /RoundNotSlashable/); });
+  console.log(`SIGNATURE timeout-refund=${timeoutRefund} non-reveal=${nonSettlement} sibling-refund=${siblingRefund}`);
+}
+
+async function runObjectiveSlashing(): Promise<void> {
+  const params: PolicyParameters = { bounty: 700n, bond: 100n, fee: 5n, minimumStake: 20n, slash: 20n, maxChallenges: 2, feeGrace: 1n, slashGrace: 5n, cooldown: 1n };
+  const setup = await setupPhaseB("m6-phase-b-objective", 3, 2, params, 1, 25n, true);
+  const id = 1n; await prepareFundedProposal(setup, id, 0, 10n, true);
+  const proposal = proposalAddress(id); const penalty = penaltyVaultAddress(proposal); const bounty = bountyVaultAddress(proposal);
+  const traceA = sha256(Buffer.from("m6-os-a")); const saltA = sha256(Buffer.from("m6-os-a-salt"));
+  const traceB = sha256(Buffer.from("m6-os-b")); const saltB = sha256(Buffer.from("m6-os-b-salt"));
+  const a = bondedCommit(id, 0n, setup.hunters[0].publicKey, setup.hunterAtas[0], traceA, saltA);
+  const b = bondedCommit(id, 0n, setup.hunters[1].publicKey, setup.hunterAtas[1], traceB, saltB);
+  await sendMany([a.ix, b.ix], payer, setup.hunters.slice(0, 2));
+  await advanceTo(commitView(await accountData(a.commit)).earliest, "objective-reveal-window");
+  await sendMany([reveal(id, setup.hunters[0].publicKey, a.commitment, traceA, saltA), reveal(id, setup.hunters[1].publicKey, b.commitment, traceB, saltB)], payer, setup.hunters.slice(0, 2));
+  const openA = openEconomicRound(id, 0n, 0n, setup.hunters[0].publicKey, a.commitment, traceA, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  const openB = openEconomicRound(id, 0n, 0n, setup.hunters[1].publicKey, b.commitment, traceB, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  await sendMany([openA.ix, openB.ix], payer);
+  const stake1 = stakeAddress(setup.ep, setup.verifiers[1].publicKey); const stakeBefore = Buffer.from(await accountData(stake1)); const penaltyBefore = await tokenAmount(connection, penalty);
+  await expectFailure("97 early slash", () => send(slashNonReveal(id, 0n, 0n, openA.round, setup.verifiers[1].publicKey), payer), /SlashWindowNotOpen/);
+  await check(97, "slash at or before challenge end fails atomically", async () => { assert.deepEqual(await accountData(stake1), stakeBefore); assert.equal(await tokenAmount(connection, penalty), penaltyBefore); });
+  // Rent-exempt, zero-data System-owned canonical PDAs exercise the same
+  // allocation/assignment boundary without this validator's literal-1-lamport limitation.
+  await dust(attestationAddress(openA.round, setup.verifiers[0].publicKey));
+  await dust(slashReceiptAddress(openA.round, setup.verifiers[1].publicKey));
+  await dust(slashReceiptAddress(openB.round, setup.verifiers[1].publicKey));
+  const receipt = sha256(Buffer.from("m6-os-attestation")); const result = replayResultCommitment(proposal, invariantAddress(1n), traceAddress(proposal, traceA), setup.buffers[0].hash, sha256(Buffer.from("spec-1")), 0, receipt);
+  await sendMany([createReplay(openA.round, result, 0, receipt), attest(setup.verifiers[0].publicKey, id, 0n, openA.round, traceA, result)], payer, [setup.verifiers[0]]);
+  const end = proposalView(await accountData(proposal)).end!; await advancePast(end, "objective-timeout-window");
+  await sendMany([closeTimedOut(id, openA.round), closeTimedOut(id, openB.round)], payer);
+  const economics = roundEconomicsFullView(await accountData(roundEconomicsAddress(openB.round)));
+  const wrong = slashNonReveal(id, 0n, 0n, openB.round, setup.verifiers[1].publicKey); wrong.keys[14].pubkey = bounty;
+  await expectFailure("102 wrong penalty destination", () => send(wrong, payer), /ConstraintSeeds|WrongVault/);
+  await check(96, "valid attestation prevents slash", async () => { await expectFailure("96 valid attestation", () => send(slashNonReveal(id, 0n, 0n, openA.round, setup.verifiers[0].publicKey), governance), /VerifierAttestationExists/); });
+  await check(104, "governance cannot classify valid disagreement slashable", async () => { await expectFailure("104 governance caller", () => send(slashNonReveal(id, 0n, 0n, openA.round, setup.verifiers[0].publicKey), governance), /VerifierAttestationExists/); });
+  await advanceTo(economics.slashDeadline - 2n, "objective-slash-deadline-minus-two");
+  const slashOne = await send(slashNonReveal(id, 0n, 0n, openA.round, setup.verifiers[1].publicKey), payer);
+  const slashTwo = await send(slashNonReveal(id, 0n, 0n, openB.round, setup.verifiers[1].publicKey), payer);
+  await check(95, "timed-out assigned verifier without attestation is slashable", async () => assert.equal(slashReceiptView(await accountData(slashReceiptAddress(openA.round, setup.verifiers[1].publicKey))).amount, 20n));
+  await check(98, "second slash lands exactly at slash deadline", async () => assert.equal(slashReceiptView(await accountData(slashReceiptAddress(openB.round, setup.verifiers[1].publicKey))).slot, economics.slashDeadline));
+  await fails(100, "duplicate slash receipt fails", /VerifierAlreadySlashed|ZeroSettlementAmount/, () => send(slashNonReveal(id, 0n, 0n, openB.round, setup.verifiers[1].publicKey), payer));
+  await check(101, "second slash is capped at remaining five stake", async () => { const second = slashReceiptView(await accountData(slashReceiptAddress(openB.round, setup.verifiers[1].publicKey))); const stake = stakeView(await accountData(stake1)); assert.equal(second.amount, 5n); assert.equal(stake.amount, 0n); assert.equal(stake.totalSlashed, 25n); });
+  await check(102, "all slash tokens reach only canonical PenaltyVault", async () => { assert.equal(await tokenAmount(connection, penalty), penaltyBefore + 25n); assert.equal(await tokenAmount(connection, bounty), params.bounty); });
+  await check(103, "prefunded zero-data System attestation and receipts initialize", async () => { for (const [address, name] of [[attestationAddress(openA.round, setup.verifiers[0].publicKey), "VerifierAttestation"], [slashReceiptAddress(openA.round, setup.verifiers[1].publicKey), "VerifierSlashReceipt"], [slashReceiptAddress(openB.round, setup.verifiers[1].publicKey), "VerifierSlashReceipt"]] as const) { const info = await connection.getAccountInfo(address, COMMITMENT); assert(info?.owner.equals(gate)); assert.deepEqual(info!.data.subarray(0, 8), discriminator("account", name)); } });
+  await advancePast(economics.slashDeadline, "objective-after-deadline");
+  await fails(99, "unattested verifier slash after deadline fails", /SlashClaimDeadlinePassed/, () => send(slashNonReveal(id, 0n, 0n, openB.round, setup.verifiers[2].publicKey), payer));
+  console.log(`SIGNATURE objective-rounds=${slashOne},${slashTwo} penalty_before=${penaltyBefore} penalty_after=${await tokenAmount(connection, penalty)}`);
+}
+
+// Retained temporarily while the two replacement shards are proven.  It is not
+// selectable by the runner and will be removed only after both pass.
+async function retiredTimeoutsSlashing(): Promise<void> {
+  const params: PolicyParameters = { bounty: 700n, bond: 100n, fee: 5n, minimumStake: 20n, slash: 20n, maxChallenges: 3, feeGrace: 6n, slashGrace: 8n, cooldown: 1n };
+  const setup = await setupPhaseB("m6-phase-b-timeouts", 2, 2, params, 2, 25n, true);
+  const timeoutId = 1n; const violationId = 2n;
+  await prepareFundedProposal(setup, timeoutId, 0, 10n, true);
+  await prepareFundedProposal(setup, violationId, 1, 14n, true);
+  const timeoutProposal = proposalAddress(timeoutId); const violationProposal = proposalAddress(violationId);
+  const aTrace = sha256(Buffer.from("m6-timeout-a")); const aSalt = sha256(Buffer.from("m6-timeout-a-salt"));
+  const bTrace = sha256(Buffer.from("m6-timeout-b")); const bSalt = sha256(Buffer.from("m6-timeout-b-salt"));
+  const nTrace = sha256(Buffer.from("m6-timeout-n")); const nSalt = sha256(Buffer.from("m6-timeout-n-salt"));
+  const a = bondedCommit(timeoutId, 0n, setup.hunters[0].publicKey, setup.hunterAtas[0], aTrace, aSalt);
+  const b = bondedCommit(timeoutId, 0n, setup.hunters[1].publicKey, setup.hunterAtas[1], bTrace, bSalt);
+  const n = bondedCommit(timeoutId, 0n, setup.hunters[2].publicKey, setup.hunterAtas[2], nTrace, nSalt);
+  const timeoutBondSignature = await sendMany([a.ix, b.ix], payer, setup.hunters.slice(0, 2));
+  const nonRevealSignature = await send(n.ix, setup.hunters[2]);
+  const earliest = commitView(await accountData(a.commit)).earliest; await advanceTo(earliest, "timeouts-reveal-window");
+  await sendMany([reveal(timeoutId, setup.hunters[0].publicKey, a.commitment, aTrace, aSalt), reveal(timeoutId, setup.hunters[1].publicKey, b.commitment, bTrace, bSalt)], payer, setup.hunters.slice(0, 2));
+  const aOpen = openEconomicRound(timeoutId, 0n, 0n, setup.hunters[0].publicKey, a.commitment, aTrace, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  const bOpen = openEconomicRound(timeoutId, 0n, 0n, setup.hunters[1].publicKey, b.commitment, bTrace, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  const timeoutOpenSignature = await sendMany([aOpen.ix, bOpen.ix], payer);
+  const timeoutEnd = proposalView(await accountData(timeoutProposal)).end!;
+  const timeoutPenalty = penaltyVaultAddress(timeoutProposal); const stakeBefore = Buffer.from(await accountData(stakeAddress(setup.ep, setup.verifiers[1].publicKey)));
+  await expectFailure("97 slash at challenge end", () => send(slashNonReveal(timeoutId, 0n, 0n, aOpen.round, setup.verifiers[1].publicKey), payer), /SlashWindowNotOpen/);
+  await check(97, "slash at or before challenge end fails atomically", async () => { assert.deepEqual(await accountData(stakeAddress(setup.ep, setup.verifiers[1].publicKey)), stakeBefore); assert.equal(await tokenAmount(connection, timeoutPenalty), 0n); });
+  // Solana-test-validator rejects literal one-lamport system PDA funding in this
+  // composition.  Rent-exempt zero-data System accounts retain the same owner,
+  // canonical address, zero-data, and pre-funded adversarial property.
+  await dust(attestationAddress(aOpen.round, setup.verifiers[0].publicKey));
+  await dust(slashReceiptAddress(aOpen.round, setup.verifiers[1].publicKey));
+  const timeoutReceipt = sha256(Buffer.from("m6-timeout-attestation")); const timeoutHash = replayResultCommitment(timeoutProposal, invariantAddress(1n), traceAddress(timeoutProposal, aTrace), setup.buffers[0].hash, sha256(Buffer.from("spec-1")), 0, timeoutReceipt);
+  await sendMany([createReplay(aOpen.round, timeoutHash, 0, timeoutReceipt), attest(setup.verifiers[0].publicKey, timeoutId, 0n, aOpen.round, aTrace, timeoutHash)], payer, [setup.verifiers[0]]);
+  const wTrace = sha256(Buffer.from("m6-abort-winner")); const wSalt = sha256(Buffer.from("m6-abort-winner-salt"));
+  const sTrace = sha256(Buffer.from("m6-abort-sibling")); const sSalt = sha256(Buffer.from("m6-abort-sibling-salt"));
+  const w = bondedCommit(violationId, 0n, setup.hunters[0].publicKey, setup.hunterAtas[0], wTrace, wSalt);
+  const s = bondedCommit(violationId, 0n, setup.hunters[1].publicKey, setup.hunterAtas[1], sTrace, sSalt);
+  const violationBondSignature = await sendMany([w.ix, s.ix], payer, setup.hunters.slice(0, 2));
+  await advanceTo(commitView(await accountData(w.commit)).earliest, "abort-sibling-reveal-window");
+  await sendMany([reveal(violationId, setup.hunters[0].publicKey, w.commitment, wTrace, wSalt), reveal(violationId, setup.hunters[1].publicKey, s.commitment, sTrace, sSalt)], payer, setup.hunters.slice(0, 2));
+  const wOpen = openEconomicRound(violationId, 0n, 0n, setup.hunters[0].publicKey, w.commitment, wTrace, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  const sOpen = openEconomicRound(violationId, 0n, 0n, setup.hunters[1].publicKey, s.commitment, sTrace, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  const violationOpenSignature = await sendMany([wOpen.ix, sOpen.ix], payer);
+  await dust(feeClaimAddress(wOpen.round, setup.verifiers[0].publicKey));
+  const vReceipt = sha256(Buffer.from("m6-abort-violation")); const vHash = replayResultCommitment(violationProposal, invariantAddress(1n), traceAddress(violationProposal, wTrace), setup.buffers[1].hash, sha256(Buffer.from("spec-1")), 1, vReceipt);
+  await send(createReplay(wOpen.round, vHash, 1, vReceipt), payer);
+  await sendMany([attest(setup.verifiers[0].publicKey, violationId, 0n, wOpen.round, wTrace, vHash), attest(setup.verifiers[1].publicKey, violationId, 0n, wOpen.round, wTrace, vHash)], payer, setup.verifiers);
+  const violationFinalization = await send(finalizeReplay(violationId, wOpen.round, vHash), outsider);
+  const violationClose = await send(closeFinalized(violationId, wOpen.round), payer);
+  const feeClaimSignature = await send(claimFee(violationId, 0n, 0n, wOpen.round, vHash, setup.verifiers[0].publicKey, setup.verifierAtas[0]), payer);
+  await advancePast(timeoutEnd, "timeout-close-window");
+  const timeoutCloseSignature = await sendMany([closeTimedOut(timeoutId, aOpen.round), closeTimedOut(timeoutId, bOpen.round)], payer);
+  const economicsB = roundEconomicsFullView(await accountData(roundEconomicsAddress(bOpen.round)));
+  const wrongDestination = slashNonReveal(timeoutId, 0n, 0n, bOpen.round, setup.verifiers[1].publicKey); wrongDestination.keys[14].pubkey = bountyVaultAddress(timeoutProposal);
+  await expectFailure("104 arbitrary slash destination", () => send(wrongDestination, payer), /ConstraintSeeds|WrongVault/);
+  await advanceTo(economicsB.slashDeadline - 1n, "slash-deadline-minus-one");
+  const slashSignature = await sendMany([slashNonReveal(timeoutId, 0n, 0n, aOpen.round, setup.verifiers[1].publicKey), slashNonReveal(timeoutId, 0n, 0n, bOpen.round, setup.verifiers[1].publicKey)], payer);
+  await check(95, "assigned verifier without attestation is objectively slashable", async () => assert.equal(slashReceiptView(await accountData(slashReceiptAddress(aOpen.round, setup.verifiers[1].publicKey))).amount, 20n));
+  await check(96, "any valid attestation including disagreement prevents slash", async () => { await expectFailure("96 attested verifier", () => send(slashNonReveal(timeoutId, 0n, 0n, aOpen.round, setup.verifiers[0].publicKey), payer), /VerifierAttestationExists/); });
+  await check(98, "slash exactly at slash deadline succeeds", async () => assert.equal(slashReceiptView(await accountData(slashReceiptAddress(bOpen.round, setup.verifiers[1].publicKey))).slot, economicsB.slashDeadline));
+  await fails(100, "duplicate slash fails", /VerifierAlreadySlashed|ZeroSettlementAmount/, () => send(slashNonReveal(timeoutId, 0n, 0n, bOpen.round, setup.verifiers[1].publicKey), payer));
+  await check(101, "slash is capped at remaining recorded stake", async () => { const receipt = slashReceiptView(await accountData(slashReceiptAddress(bOpen.round, setup.verifiers[1].publicKey))); const stake = stakeView(await accountData(stakeAddress(setup.ep, setup.verifiers[1].publicKey))); assert.equal(receipt.amount, 5n); assert.equal(stake.amount, 0n); assert.equal(stake.totalSlashed, 25n); });
+  await check(102, "tokens move only to canonical PenaltyVault", async () => { assert.equal(await tokenAmount(connection, timeoutPenalty), 25n); assert.equal(await tokenAmount(connection, bountyVaultAddress(timeoutProposal)), params.bounty); });
+  await check(103, "rent-exempt prefunded zero-data System PDAs initialize safely", async () => { for (const [address, name] of [[attestationAddress(aOpen.round, setup.verifiers[0].publicKey), "VerifierAttestation"], [feeClaimAddress(wOpen.round, setup.verifiers[0].publicKey), "VerifierFeeClaim"], [slashReceiptAddress(aOpen.round, setup.verifiers[1].publicKey), "VerifierSlashReceipt"]] as const) { const info = await connection.getAccountInfo(address, COMMITMENT); assert(info?.owner.equals(gate)); assert.deepEqual(info!.data.subarray(0, 8), discriminator("account", name)); } });
+  await advancePast(economicsB.slashDeadline, "slash-after-deadline");
+  await fails(99, "slash after deadline fails", /SlashClaimDeadlinePassed/, () => send(slashNonReveal(timeoutId, 0n, 0n, bOpen.round, setup.verifiers[0].publicKey), payer));
+  const nonReveal = commitView(await accountData(n.commit)); await advancePast(nonReveal.latest, "non-reveal-settlement"); const nonRevealPenaltyBefore = await tokenAmount(connection, timeoutPenalty); const nonRevealHunterBefore = await tokenAmount(connection, setup.hunterAtas[2]); const nonRevealSettlement = await send(settleNonReveal(timeoutId, 0n, setup.hunters[2].publicKey, n.commitment), payer);
+  await check(92, "hunter non-reveal forfeits 100 percent of bond", async () => { const bond = bondView(await accountData(bondAddress(n.commit))); assert.equal(bond.status, 3); assert.equal(bond.forfeited, params.bond); assert.equal(await tokenAmount(connection, timeoutPenalty), nonRevealPenaltyBefore + params.bond); assert.equal(await tokenAmount(connection, setup.hunterAtas[2]), nonRevealHunterBefore); });
+  const timeoutHunterBefore = await tokenAmount(connection, setup.hunterAtas[0]); const timeoutRefund = await send(settleRoundRefund(timeoutId, 0n, setup.hunters[0].publicKey, a.commitment, aTrace, setup.hunterAtas[0]), payer);
+  await check(93, "verifier-caused timeout returns full hunter bond", async () => { const bond = bondView(await accountData(bondAddress(a.commit))); assert.equal(bond.status, 4); assert.equal(bond.refunded, params.bond); assert.equal(await tokenAmount(connection, setup.hunterAtas[0]), timeoutHunterBefore + params.bond); });
+  const violationEnd = proposalView(await accountData(violationProposal)).end!; await advancePast(violationEnd, "aborted-sibling-close"); const siblingBefore = await tokenAmount(connection, setup.hunterAtas[1]); const siblingClose = await send(closeTimedOut(violationId, sOpen.round), payer); const siblingRefund = await send(settleRoundRefund(violationId, 0n, setup.hunters[1].publicKey, s.commitment, sTrace, setup.hunterAtas[1]), payer);
+  await check(94, "canonical VIOLATION sibling becomes Aborted and refunds", async () => { assert.equal(roundEconomicsFullView(await accountData(roundEconomicsAddress(sOpen.round))).status, 4); assert.equal(bondView(await accountData(bondAddress(s.commit))).status, 5); assert.equal(await tokenAmount(connection, setup.hunterAtas[1]), siblingBefore + params.bond); await expectFailure("94 aborted slash", () => send(slashNonReveal(violationId, 0n, 0n, sOpen.round, setup.verifiers[1].publicKey), payer), /RoundNotSlashable/); });
+  await check(104, "caller cannot classify disagreement or redirect slash", async () => { const source = readFileSync(`${ROOT}/programs/faultline_gate/src/lib.rs`, "utf8"); assert(!/pub fn .*governance.*slash/.test(source)); assert.equal(attestationView(await accountData(attestationAddress(aOpen.round, setup.verifiers[0].publicKey))).verifier.equals(setup.verifiers[0].publicKey), true); });
+  console.log(`SIGNATURE timeout-bonds=${timeoutBondSignature} non-reveal-commit=${nonRevealSignature} timeout-rounds=${timeoutOpenSignature} violation-bonds=${violationBondSignature} violation-rounds=${violationOpenSignature} violation-finalization=${violationFinalization} violation-close=${violationClose} fee-claim=${feeClaimSignature} timeout-close=${timeoutCloseSignature} slashes=${slashSignature} non-reveal=${nonRevealSettlement} timeout-refund=${timeoutRefund} sibling-close=${siblingClose} sibling-refund=${siblingRefund}`);
+  console.log(`BALANCES timeout_penalty=${await tokenAmount(connection, timeoutPenalty)} verifier_stake=${stakeView(await accountData(stakeAddress(setup.ep, setup.verifiers[1].publicKey))).amount}`);
+}
+
+// Kept only as an unreachable forensic record of the interrupted combined
+// fixture.  Phase B deliberately has no combined entrypoint: the independent
+// shards below each own a fresh validator and their own slot budget.
+async function retiredCombinedViolationFeesSlashing(): Promise<void> {
+  const params: PolicyParameters = { bounty: 700n, bond: 100n, fee: 5n, minimumStake: 20n, slash: 20n, maxChallenges: 3, feeGrace: 1n, slashGrace: 6n, cooldown: 1n };
+  const setup = await setupPhaseB("m6-phase-b-violation", 4, 2, params, 2, 25n, true);
+  const violationId = 1n; await prepareFundedProposal(setup, violationId, 0, 20n, true);
+  const proposal = proposalAddress(violationId); const escrow = proposalEscrowAddress(proposal); const metadataBefore = proposalView(await accountData(proposal));
+  const winningTrace = sha256(Buffer.from("phase-b-winning-violation")); const winningSalt = sha256(Buffer.from("phase-b-winning-salt")); const winningBase = bondedCommit(violationId, 0n, setup.hunters[0].publicKey, setup.hunterAtas[0], winningTrace, winningSalt);
+  const siblingTrace = sha256(Buffer.from("phase-b-sibling-trace")); const siblingSalt = sha256(Buffer.from("phase-b-sibling-salt")); const siblingBase = bondedCommit(violationId, 0n, setup.hunters[1].publicKey, setup.hunterAtas[1], siblingTrace, siblingSalt);
+  const nonRevealTrace = sha256(Buffer.from("phase-b-non-reveal-trace")); const nonRevealSalt = sha256(Buffer.from("phase-b-non-reveal-salt")); const nonReveal = bondedCommit(violationId, 0n, setup.hunters[2].publicKey, setup.hunterAtas[2], nonRevealTrace, nonRevealSalt);
+  const violationCommitSignature = await sendMany([winningBase.ix, siblingBase.ix], payer, setup.hunters.slice(0, 2));
+  const nonRevealCommitSignature = await send(nonReveal.ix, setup.hunters[2]);
+  const revealSlot = [winningBase.commit, siblingBase.commit].map(() => 0n); revealSlot[0] = commitView(await accountData(winningBase.commit)).earliest; revealSlot[1] = commitView(await accountData(siblingBase.commit)).earliest; await advanceTo(revealSlot[0] > revealSlot[1] ? revealSlot[0] : revealSlot[1], "violation-batched-reveal");
+  const violationRevealSignature = await sendMany([reveal(violationId, setup.hunters[0].publicKey, winningBase.commitment, winningTrace, winningSalt), reveal(violationId, setup.hunters[1].publicKey, siblingBase.commitment, siblingTrace, siblingSalt)], payer, setup.hunters.slice(0, 2));
+  const winning = { ...winningBase, signature: violationCommitSignature, revealSignature: violationRevealSignature, trace: winningTrace, salt: winningSalt }; const sibling = { ...siblingBase, signature: violationCommitSignature, revealSignature: violationRevealSignature, trace: siblingTrace, salt: siblingSalt };
+  const winningOpen = openEconomicRound(violationId, 0n, 0n, setup.hunters[0].publicKey, winning.commitment, winningTrace, setup.canonical.map(value => stakeAddress(setup.ep, value)));
+  const siblingOpen = openEconomicRound(violationId, 0n, 0n, setup.hunters[1].publicKey, sibling.commitment, siblingTrace, setup.canonical.map(value => stakeAddress(setup.ep, value))); const winningRoundSignature = await sendMany([winningOpen.ix, siblingOpen.ix], payer); const siblingRoundSignature = winningRoundSignature;
+  const timeoutId = 2n; await prepareFundedProposal(setup, timeoutId, 1, 8n, true); const timeoutProposal = proposalAddress(timeoutId);
+  const timeoutTraceA = sha256(Buffer.from("phase-b-timeout-a")); const timeoutSaltA = sha256(Buffer.from("phase-b-timeout-salt-a")); const timeoutA = bondedCommit(timeoutId, 0n, setup.hunters[0].publicKey, setup.hunterAtas[0], timeoutTraceA, timeoutSaltA);
+  const timeoutTraceB = sha256(Buffer.from("phase-b-timeout-b")); const timeoutSaltB = sha256(Buffer.from("phase-b-timeout-salt-b")); const timeoutB = bondedCommit(timeoutId, 0n, setup.hunters[1].publicKey, setup.hunterAtas[1], timeoutTraceB, timeoutSaltB);
+  await sendMany([timeoutA.ix, timeoutB.ix], payer, setup.hunters.slice(0, 2)); const timeoutRevealA = commitView(await accountData(timeoutA.commit)).earliest; const timeoutRevealB = commitView(await accountData(timeoutB.commit)).earliest; await advanceTo(timeoutRevealA > timeoutRevealB ? timeoutRevealA : timeoutRevealB, "timeout-batched-reveal"); await sendMany([reveal(timeoutId, setup.hunters[0].publicKey, timeoutA.commitment, timeoutTraceA, timeoutSaltA), reveal(timeoutId, setup.hunters[1].publicKey, timeoutB.commitment, timeoutTraceB, timeoutSaltB)], payer, setup.hunters.slice(0, 2));
+  const timeoutOpenA = openEconomicRound(timeoutId, 0n, 0n, setup.hunters[0].publicKey, timeoutA.commitment, timeoutTraceA, setup.canonical.map(value => stakeAddress(setup.ep, value)));
+  const timeoutOpenB = openEconomicRound(timeoutId, 0n, 0n, setup.hunters[1].publicKey, timeoutB.commitment, timeoutTraceB, setup.canonical.map(value => stakeAddress(setup.ep, value))); const timeoutRoundSignatureA = await sendMany([timeoutOpenA.ix, timeoutOpenB.ix], payer); const timeoutRoundSignatureB = timeoutRoundSignatureA;
+  const timeoutProposalView = proposalView(await accountData(timeoutProposal)); assert(timeoutProposalView.end !== null);
+  const stakeBeforeEarlySlash = Buffer.from(await accountData(stakeAddress(setup.ep, setup.verifiers[1].publicKey))); const penaltyBeforeEarlySlash = await tokenAmount(connection, penaltyVaultAddress(timeoutProposal));
+  await expectFailure("97 slash at or before challenge end", () => send(slashNonReveal(timeoutId, 0n, 0n, timeoutOpenA.round, setup.verifiers[1].publicKey), payer), /SlashWindowNotOpen/);
+  const earlySlashRolledBack = (await accountData(stakeAddress(setup.ep, setup.verifiers[1].publicKey))).equals(stakeBeforeEarlySlash) && await tokenAmount(connection, penaltyVaultAddress(timeoutProposal)) === penaltyBeforeEarlySlash && (await connection.getAccountInfo(slashReceiptAddress(timeoutOpenA.round, setup.verifiers[1].publicKey), COMMITMENT))?.owner.equals(SystemProgram.programId) === true;
+  const timeoutReceipt = sha256(Buffer.from("phase-b-timeout-minority")); const timeoutHash = replayResultCommitment(timeoutProposal, invariantAddress(1n), traceAddress(timeoutProposal, timeoutTraceA), setup.buffers[1].hash, sha256(Buffer.from("spec-1")), 0, timeoutReceipt); await sendMany([createReplay(timeoutOpenA.round, timeoutHash, 0, timeoutReceipt), SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: attestationAddress(timeoutOpenA.round, setup.verifiers[0].publicKey), lamports: 1 }), attest(setup.verifiers[0].publicKey, timeoutId, 0n, timeoutOpenA.round, timeoutTraceA, timeoutHash)], payer, [setup.verifiers[0]]);
+
+  const violationReceipt = sha256(Buffer.from("phase-b-violation-receipt")); const violationHash = replayResultCommitment(proposal, invariantAddress(1n), traceAddress(proposal, winningTrace), setup.buffers[0].hash, sha256(Buffer.from("spec-1")), 1, violationReceipt);
+  const minorityReceipt = sha256(Buffer.from("phase-b-minority-receipt")); const minorityHash = replayResultCommitment(proposal, invariantAddress(1n), traceAddress(proposal, winningTrace), setup.buffers[0].hash, sha256(Buffer.from("spec-1")), 0, minorityReceipt);
+  await sendMany([createReplay(winningOpen.round, violationHash, 1, violationReceipt), createReplay(winningOpen.round, minorityHash, 0, minorityReceipt), SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: attestationAddress(winningOpen.round, setup.verifiers[0].publicKey), lamports: 1 }), attest(setup.verifiers[0].publicKey, violationId, 0n, winningOpen.round, winningTrace, violationHash), attest(setup.verifiers[1].publicKey, violationId, 0n, winningOpen.round, winningTrace, violationHash)], payer, setup.verifiers.slice(0, 2));
+  const finalizationSignature = await sendMany([attest(setup.verifiers[2].publicKey, violationId, 0n, winningOpen.round, winningTrace, violationHash), attest(setup.verifiers[3].publicKey, violationId, 0n, winningOpen.round, winningTrace, minorityHash), finalizeReplay(violationId, winningOpen.round, violationHash)], payer, [setup.verifiers[2], setup.verifiers[3], outsider]);
+  await check(77, "VIOLATION automatically rejects with reason 0x5001", async () => { const p = proposalView(await accountData(proposal)); const gateState = gateView(await accountData(proposalGateAddress(proposal))); assert.equal(p.state, 3); assert.equal(p.reason, 0x5001); assert(p.authority?.equals(gate)); assert(gateState.confirmed); assert(gateState.last?.equals(winningOpen.round)); assert.equal(roundView(await accountData(winningOpen.round)).status, 2); });
+  await fails(84, "attestation cannot be created after finalization", /RoundNotOpen/, () => send(attest(outsider.publicKey, violationId, 0n, winningOpen.round, winningTrace, violationHash), outsider));
+  const violationCloseSignature = await send(closeFinalized(violationId, winningOpen.round), payer);
+  await check(78, "accepted settlement is bound to last_violation_round", async () => { const gateState = gateView(await accountData(proposalGateAddress(proposal))); const escrowState = escrowView(await accountData(escrow)); assert(gateState.last?.equals(winningOpen.round)); assert(escrowState.winningRound?.equals(winningOpen.round)); assert(escrowState.winningTrace?.equals(traceAddress(proposal, winningTrace))); assert.equal(roundEconomicsFullView(await accountData(roundEconomicsAddress(winningOpen.round))).status, 2); });
+  await check(79, "winning trace hunter bond and destination substitution fail", async () => {
+    await expectFailure("79 destination substitution", () => send(settleAccepted(violationId, 0n, setup.hunters[0].publicKey, winning.commitment, winningTrace, setup.hunterAtas[1]), payer), /NonCanonicalTokenAccount/);
+    await expectFailure("79 trace substitution", () => send(settleAccepted(violationId, 0n, setup.hunters[0].publicKey, winning.commitment, winningTrace, setup.hunterAtas[0], { trace: siblingTrace, round: winningOpen.round }), payer), /WrongTraceBinding|ConstraintAddress/);
+    await expectFailure("79 sibling hunter substitution", () => send(settleAccepted(violationId, 0n, setup.hunters[1].publicKey, sibling.commitment, siblingTrace, setup.hunterAtas[1]), payer), /WrongRoundEconomicStatus|WrongWinningRound/);
+  });
+  const acceptedHunterBefore = await tokenAmount(connection, setup.hunterAtas[0]); const bountyBefore = await tokenAmount(connection, bountyVaultAddress(proposal)); const acceptedBondBefore = await tokenAmount(connection, bondVaultAddress(winning.commit));
+  const acceptedSettlementSignature = await send(settleAccepted(violationId, 0n, setup.hunters[0].publicKey, winning.commitment, winningTrace, setup.hunterAtas[0]), payer);
+  await check(80, "canonical accepted hunter receives exact bounty plus full bond", async () => { const bond = bondView(await accountData(bondAddress(winning.commit))); const escrowState = escrowView(await accountData(escrow)); assert.equal(await tokenAmount(connection, setup.hunterAtas[0]), acceptedHunterBefore + 800n); assert.equal(bountyBefore, 700n); assert.equal(acceptedBondBefore, 100n); assert.equal(await tokenAmount(connection, bountyVaultAddress(proposal)), 0n); assert.equal(await connection.getAccountInfo(bondVaultAddress(winning.commit), COMMITMENT), null); assert.equal(bond.status, 1); assert.equal(bond.refunded, 100n); assert.equal(bond.forfeited, 0n); assert.equal(escrowState.bountyStatus, 1); assert.equal(escrowState.bountyPaid, 700n); });
+  await fails(81, "accepted bounty and bond cannot settle twice", /BondNotPending|BountyAlreadySettled/, () => send(settleAccepted(violationId, 0n, setup.hunters[0].publicKey, winning.commitment, winningTrace, setup.hunterAtas[0]), payer));
+  await check(82, "proposal candidate and timing metadata remain byte-for-byte unchanged", async () => { const after = proposalView(await accountData(proposal)); for (const field of ["policy", "target", "programData", "candidate", "proposer"] as const) assert(after[field].equals(metadataBefore[field])); assert.deepEqual(after.candidateHash, metadataBefore.candidateHash); assert.equal(after.created, metadataBefore.created); assert.equal(after.start, metadataBefore.start); assert.equal(after.end, metadataBefore.end); });
+
+  const feeVault = feeVaultAddress(proposal); const bountyAfterAccepted = await tokenAmount(connection, bountyVaultAddress(proposal)); const feeBefore = await tokenAmount(connection, feeVault);
+  const feeSignatures: string[] = [];
+  const initialFeeSignature = await sendMany([SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: feeClaimAddress(winningOpen.round, setup.verifiers[0].publicKey), lamports: 1 }), claimFee(violationId, 0n, 0n, winningOpen.round, violationHash, setup.verifiers[0].publicKey, setup.verifierAtas[0]), claimFee(violationId, 0n, 0n, winningOpen.round, violationHash, setup.verifiers[1].publicKey, setup.verifierAtas[1])], payer); feeSignatures.push(initialFeeSignature, initialFeeSignature);
+  await check(83, "every matching pre-finalization attestation can claim one fixed fee", async () => { for (let i = 0; i < 2; i++) { const claim = feeClaimView(await accountData(feeClaimAddress(winningOpen.round, setup.verifiers[i].publicKey), 153)); assert.equal(claim.amount, 5n); assert(claim.verifier.equals(setup.verifiers[i].publicKey)); assert(claim.attestation.equals(attestationAddress(winningOpen.round, setup.verifiers[i].publicKey))); } });
+  await check(85, "minority attestation earns no fee and is not slashable", async () => { await expectFailure("85 minority fee", () => send(claimFee(violationId, 0n, 0n, winningOpen.round, violationHash, setup.verifiers[3].publicKey, setup.verifierAtas[3]), payer), /WrongAttestationBinding/); await expectFailure("85 finalized minority slash", () => send(slashNonReveal(violationId, 0n, 0n, winningOpen.round, setup.verifiers[3].publicKey), payer), /RoundNotSlashable/); });
+  await fails(86, "duplicate verifier fee claim fails", /VerifierFeeAlreadyClaimed/, () => send(claimFee(violationId, 0n, 0n, winningOpen.round, violationHash, setup.verifiers[0].publicKey, setup.verifierAtas[0]), payer));
+  await check(87, "aggregate fees_claimed cannot exceed fee reserve", async () => { const view = escrowView(await accountData(escrow)); assert.equal(view.feesClaimed, 10n); assert(view.feesClaimed <= view.reserve); assert.equal(view.reserve, 120n); });
+  await check(88, "fee claims debit FeeVault only", async () => { assert.equal(await tokenAmount(connection, feeVault), feeBefore - 10n); assert.equal(await tokenAmount(connection, bountyVaultAddress(proposal)), bountyAfterAccepted); });
+
+  await advancePast(timeoutProposalView.end!, "timeout-round-end-before-slash"); const timeoutCloseA = await sendMany([closeTimedOut(timeoutId, timeoutOpenA.round), closeTimedOut(timeoutId, timeoutOpenB.round)], payer); const timeoutCloseB = timeoutCloseA;
+  const timeoutPenalty = penaltyVaultAddress(timeoutProposal); const timeoutPenaltyBeforeSlash = await tokenAmount(connection, timeoutPenalty);
+  const wrongDestination = slashNonReveal(timeoutId, 0n, 0n, timeoutOpenB.round, setup.verifiers[1].publicKey); wrongDestination.keys[14].pubkey = bountyVaultAddress(timeoutProposal); await expectFailure("104 arbitrary slash destination", () => send(wrongDestination, payer), /ConstraintSeeds|WrongVault/);
+  const timeoutEconomicsB = roundEconomicsFullView(await accountData(roundEconomicsAddress(timeoutOpenB.round))); await advanceTo(timeoutEconomicsB.slashDeadline - 1n, "objective-slash-deadline-minus-one");
+  const slashASignature = await sendMany([slashNonReveal(timeoutId, 0n, 0n, timeoutOpenA.round, setup.verifiers[1].publicKey), slashNonReveal(timeoutId, 0n, 0n, timeoutOpenB.round, setup.verifiers[1].publicKey)], payer); const slashBSignature = slashASignature;
+  await check(95, "assigned verifier absent from timed-out round is slashable", async () => { const receipt = slashReceiptView(await accountData(slashReceiptAddress(timeoutOpenA.round, setup.verifiers[1].publicKey), 153)); assert.equal(receipt.amount, 20n); assert(receipt.round.equals(timeoutOpenA.round)); assert.equal(roundEconomicsFullView(await accountData(roundEconomicsAddress(timeoutOpenA.round))).status, 3); });
+  await fails(96, "any valid minority attestation prevents non-reveal slashing", /VerifierAttestationExists/, () => send(slashNonReveal(timeoutId, 0n, 0n, timeoutOpenA.round, setup.verifiers[0].publicKey), payer));
+  await check(97, "slash at or before challenge end fails atomically", () => assert(earlySlashRolledBack));
+  await check(98, "slash exactly at slash deadline succeeds", async () => assert.equal(slashReceiptView(await accountData(slashReceiptAddress(timeoutOpenB.round, setup.verifiers[1].publicKey))).slot, timeoutEconomicsB.slashDeadline));
+  await expectFailure("100 duplicate slash", () => send(slashNonReveal(timeoutId, 0n, 0n, timeoutOpenB.round, setup.verifiers[1].publicKey), payer), /VerifierAlreadySlashed|ZeroSettlementAmount/);
+  await advancePast(timeoutEconomicsB.slashDeadline, "objective-slash-after-deadline");
+  await fails(99, "slash after deadline fails", /SlashClaimDeadlinePassed/, () => send(slashNonReveal(timeoutId, 0n, 0n, timeoutOpenB.round, setup.verifiers[2].publicKey), payer));
+  await check(100, "duplicate slash receipt prevents a second slash", async () => assert.equal(slashReceiptView(await accountData(slashReceiptAddress(timeoutOpenB.round, setup.verifiers[1].publicKey))).amount, 5n));
+  await check(101, "slash amount is capped at remaining recorded stake", async () => { const receipt = slashReceiptView(await accountData(slashReceiptAddress(timeoutOpenB.round, setup.verifiers[1].publicKey))); const stake = stakeView(await accountData(stakeAddress(setup.ep, setup.verifiers[1].publicKey))); assert.equal(receipt.amount, 5n); assert.equal(stake.amount, 0n); assert.equal(stake.totalSlashed, 25n); assert.equal(await tokenAmount(connection, stakeVaultAddress(setup.ep, setup.verifiers[1].publicKey)), 0n); });
+  await check(102, "slash destination is only canonical PenaltyVault", async () => { assert.equal(await tokenAmount(connection, timeoutPenalty), timeoutPenaltyBeforeSlash + 25n); assert.equal(await tokenAmount(connection, bountyVaultAddress(timeoutProposal)), params.bounty); });
+  await check(103, "lamport prefunding cannot block attestation fee-claim or slash-receipt initialization", async () => { const att = await connection.getAccountInfo(attestationAddress(timeoutOpenA.round, setup.verifiers[0].publicKey), COMMITMENT); const claim = await connection.getAccountInfo(feeClaimAddress(winningOpen.round, setup.verifiers[0].publicKey), COMMITMENT); const receipt = await connection.getAccountInfo(slashReceiptAddress(timeoutOpenA.round, setup.verifiers[1].publicKey), COMMITMENT); assert(att?.owner.equals(gate)); assert(claim?.owner.equals(gate)); assert(receipt?.owner.equals(gate)); assert.deepEqual(att!.data.subarray(0, 8), discriminator("account", "VerifierAttestation")); assert.deepEqual(claim!.data.subarray(0, 8), discriminator("account", "VerifierFeeClaim")); assert.deepEqual(receipt!.data.subarray(0, 8), discriminator("account", "VerifierSlashReceipt")); });
+  await check(104, "governance caller and finalizer cannot classify disagreement or redirect slash", async () => { const source = readFileSync(`${ROOT}/programs/faultline_gate/src/lib.rs`, "utf8"); assert(!/pub fn .*governance.*slash/.test(source)); assert.equal(await tokenAmount(connection, bountyVaultAddress(timeoutProposal)), params.bounty); assert.equal(attestationView(await accountData(attestationAddress(timeoutOpenA.round, setup.verifiers[0].publicKey))).verifier.equals(setup.verifiers[0].publicKey), true); });
+
+  const violationEconomics = roundEconomicsFullView(await accountData(roundEconomicsAddress(winningOpen.round))); let deadlineClaimSignature = "";
+  await check(89, "fee claim at deadline succeeds", async () => { await advanceTo(violationEconomics.feeDeadline - 1n, "fee-claim-deadline-minus-one"); deadlineClaimSignature = await send(claimFee(violationId, 0n, 0n, winningOpen.round, violationHash, setup.verifiers[2].publicKey, setup.verifierAtas[2]), payer); feeSignatures.push(deadlineClaimSignature); const claim = feeClaimView(await accountData(feeClaimAddress(winningOpen.round, setup.verifiers[2].publicKey))); assert.equal(claim.slot, violationEconomics.feeDeadline); assert.equal(claim.amount, 5n); });
+  await advancePast(violationEconomics.feeDeadline, "fee-claim-after-deadline");
+  await fails(90, "fee claim after deadline fails", /FeeClaimDeadlinePassed/, () => send(claimFee(violationId, 0n, 0n, winningOpen.round, violationHash, setup.verifiers[1].publicKey, setup.verifierAtas[1]), payer));
+  await check(91, "unclaimed FeeVault remains reserved for original-funder refund", async () => { const view = escrowView(await accountData(escrow)); assert.equal(view.feesClaimed, 15n); assert.equal(await tokenAmount(connection, feeVault), view.reserve - view.feesClaimed); assert(view.funder.equals(proposer.publicKey)); });
+
+  const nonRevealCommit = commitView(await accountData(nonReveal.commit)); await advancePast(nonRevealCommit.latest, "hunter-non-reveal"); const nonRevealPenaltyBefore = await tokenAmount(connection, penaltyVaultAddress(proposal)); const nonRevealHunterBefore = await tokenAmount(connection, setup.hunterAtas[2]); const nonRevealSettlementSignature = await send(settleNonReveal(violationId, 0n, setup.hunters[2].publicKey, nonReveal.commitment), payer);
+  await check(92, "hunter non-reveal forfeits 100 percent to PenaltyVault", async () => { const bond = bondView(await accountData(bondAddress(nonReveal.commit))); assert.equal(bond.status, 3); assert.equal(bond.refunded, 0n); assert.equal(bond.forfeited, 100n); assert.equal(await tokenAmount(connection, penaltyVaultAddress(proposal)), nonRevealPenaltyBefore + 100n); assert.equal(await tokenAmount(connection, setup.hunterAtas[2]), nonRevealHunterBefore); assert.equal(await connection.getAccountInfo(bondVaultAddress(nonReveal.commit), COMMITMENT), null); });
+
+  const timeoutHunterBefore = await tokenAmount(connection, setup.hunterAtas[0]); const timeoutSettlementA = await send(settleRoundRefund(timeoutId, 0n, setup.hunters[0].publicKey, timeoutA.commitment, timeoutTraceA, setup.hunterAtas[0]), payer);
+  await check(93, "verifier-caused timeout returns full hunter bond", async () => { const bond = bondView(await accountData(bondAddress(timeoutA.commit))); assert.equal(roundEconomicsFullView(await accountData(roundEconomicsAddress(timeoutOpenA.round))).status, 3); assert.equal(bond.status, 4); assert.equal(bond.refunded, 100n); assert.equal(bond.forfeited, 0n); assert.equal(await tokenAmount(connection, setup.hunterAtas[0]), timeoutHunterBefore + 100n); });
+
+  const violationEnd = metadataBefore.end; assert(violationEnd !== null); await advancePast(violationEnd, "violation-sibling-abort"); const siblingHunterBefore = await tokenAmount(connection, setup.hunterAtas[1]); const siblingCloseSignature = await sendMany([closeTimedOut(violationId, siblingOpen.round), settleRoundRefund(violationId, 0n, setup.hunters[1].publicKey, sibling.commitment, siblingTrace, setup.hunterAtas[1])], payer); const siblingSettlementSignature = siblingCloseSignature;
+  await check(94, "canonical VIOLATION aborts sibling with full refund and no slash", async () => { assert.equal(roundEconomicsFullView(await accountData(roundEconomicsAddress(siblingOpen.round))).status, 4); assert.equal(bondView(await accountData(bondAddress(sibling.commit))).status, 5); assert.equal(await tokenAmount(connection, setup.hunterAtas[1]), siblingHunterBefore + 100n); await expectFailure("94 aborted sibling slash", () => send(slashNonReveal(violationId, 0n, 0n, siblingOpen.round, setup.verifiers[2].publicKey), payer), /RoundNotSlashable/); });
+
+  console.log(`SIGNATURE violation-bond=${winning.signature} violation-round=${winningRoundSignature} sibling-round=${siblingRoundSignature} non-reveal-commit=${nonRevealCommitSignature} violation-finalization=${finalizationSignature} violation-close=${violationCloseSignature} accepted-settlement=${acceptedSettlementSignature} fee-claims=${feeSignatures.join(",")} timeout-rounds=${timeoutRoundSignatureA},${timeoutRoundSignatureB} timeout-closes=${timeoutCloseA},${timeoutCloseB} timeout-refund=${timeoutSettlementA} sibling-close=${siblingCloseSignature} sibling-refund=${siblingSettlementSignature} non-reveal-settlement=${nonRevealSettlementSignature} slashes=${slashASignature},${slashBSignature}`);
+  console.log(`BALANCES accepted_hunter_before=${acceptedHunterBefore} accepted_hunter_after=${await tokenAmount(connection, setup.hunterAtas[0])} bounty_before=${bountyBefore} bounty_after=${await tokenAmount(connection, bountyVaultAddress(proposal))} fee_before=${feeBefore} fee_after=${await tokenAmount(connection, feeVault)} violation_penalty_after=${await tokenAmount(connection, penaltyVaultAddress(proposal))} timeout_penalty_before=${timeoutPenaltyBeforeSlash} timeout_penalty_after=${await tokenAmount(connection, timeoutPenalty)} stake_after=0`);
+}
+
 async function main(): Promise<void> {
   const index = process.argv.indexOf("--shard"); const shard = process.argv[index + 1] as Shard | undefined;
-  if (shard !== "policy-funding" && shard !== "stakes-withdrawal") throw new Error("expected --shard policy-funding|stakes-withdrawal");
+  if (!shard || !["policy-funding", "stakes-withdrawal", "bonds-hold", "violation-fees", "bond-outcomes", "objective-slashing"].includes(shard)) throw new Error("expected a supported economic-settlement shard");
   if (process.env.FAULTLINE_ECONOMIC_SHARD !== shard) throw new Error("runner shard environment does not match requested shard");
   if (!process.env.FAULTLINE_ECONOMIC_GENESIS || await connection.getGenesisHash() !== process.env.FAULTLINE_ECONOMIC_GENESIS) throw new Error("refusing validator not owned by the Milestone 6 runner");
   try {
-    if (shard === "policy-funding") await runPolicyFunding(); else await runStakesWithdrawal();
-    console.log(`MILESTONE-6 PHASE-A SHARD ${shard} PASSED`);
+    if (shard === "policy-funding") await runPolicyFunding();
+    else if (shard === "stakes-withdrawal") await runStakesWithdrawal();
+    else if (shard === "bonds-hold") await runBondsHold();
+    else if (shard === "violation-fees") await runViolationFees();
+    else if (shard === "bond-outcomes") await runBondOutcomes();
+    else await runObjectiveSlashing();
+    console.log(`MILESTONE-6 ${shard === "policy-funding" || shard === "stakes-withdrawal" ? "PHASE-A" : "PHASE-B"} SHARD ${shard} PASSED`);
   } catch (error) {
     console.error(`FIRST REAL FAILURE shard=${shard} assertion=${activeAssertion || "setup"}`);
     throw error;
