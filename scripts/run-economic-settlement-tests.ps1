@@ -17,7 +17,7 @@ $nodeExe = (Get-Command node.exe -ErrorAction Stop).Source
 $processPathValue = [Environment]::GetEnvironmentVariable('Path', 'Process')
 [Environment]::SetEnvironmentVariable('PATH', $null, 'Process')
 [Environment]::SetEnvironmentVariable('Path', $processPathValue, 'Process')
-$shards = if ($Shard) { @($Shard) } else { @('violation-fees', 'bond-outcomes', 'objective-slashing') }
+$shards = if ($Shard) { @($Shard) } else { @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing') }
 
 function Test-TcpPortListening([int]$Port) {
   $client = [Net.Sockets.TcpClient]::new()
