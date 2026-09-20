@@ -987,6 +987,195 @@ Milestone 7 does **not** implement AppContainer, a restricted token, Windows Fir
 
 Candidate SBF executes inside the pinned VM and cannot directly invoke Windows APIs, but the native VM remains part of the trusted computing base. Stronger OS isolation and heterogeneous runners are later reliability work.
 
+### 10.4 Checkpoint 4 worker IPC protocol
+
+This subsection is normative for Checkpoint 4. It freezes the worker IPC framing, request and response envelopes, signing-key transport, failure mapping, cleanup behavior, deterministic test identities, and three-worker agreement projection.
+
+#### Common binary frame
+
+Every structured stdin, stdout, and signing-key pipe carries exactly one frame. The 16-byte header is:
+
+| Offset | Width | Encoding | Meaning |
+| ---: | ---: | --- | --- |
+| 0 | 8 | ASCII | exact magic `FLTWORK1` |
+| 8 | 2 | `u16be` | protocol version, exactly `1` |
+| 10 | 2 | `u16be` | frame kind |
+| 12 | 4 | `u32be` | payload length |
+
+The frame kinds are:
+
+- `0x0001`: canonical worker request;
+- `0x0002`: raw signing seed; and
+- `0x0003`: canonical worker response.
+
+No frame uses compression, a BOM, or a platform newline. The receiver reads the header and declared payload exactly. EOF before the complete header or payload is invalid. After the declared payload, the next read must return EOF. Any trailing byte, second frame, partial frame, wrong magic, wrong version, wrong kind, or oversized length fails closed. The length covers only the payload and excludes the 16-byte header.
+
+The stdin request payload maximum is 1 MiB. A signing payload is exactly 32 bytes. The structured stdout response maximum is 8 MiB. Stderr is an untrusted diagnostic byte stream capped at 1 MiB; it is never parsed as protocol data, hashed, signed, or used to select a classification. Bytes beyond that limit terminate the worker job as `RUNNER_OUTPUT_LIMIT_OR_MALFORMED_OUTPUT`.
+
+Both sides close pipe handles deterministically after their single frame. The numeric inherited signing-pipe handle may be communicated as a non-secret launch parameter, but signing bytes never appear in arguments, environment variables, stdin JSON, stdout, stderr, logs, receipts, or repository files.
+
+#### `faultline.worker-request.v1`
+
+The worker request is a closed canonical JSON object with exactly these required fields:
+
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | exactly `faultline.worker-request.v1` |
+| `canonicalization` | string | exactly `faultline.canonical-json.v1` |
+| `coordinator_nonce` | string | exactly 64 lowercase hexadecimal characters |
+| `worker_ordinal` | JSON integer | `0`, `1`, or `2` |
+| `expected_verifier_pubkey` | string | canonical Base58 Solana public key |
+| `replay_job` | object | complete validated `faultline.replay-job.v1` |
+| `input_paths` | object | the closed path object defined below |
+
+The closed `input_paths` object contains exactly these required string fields: `candidate_build_manifest`, `runner_manifest`, `fixture_manifest`, `invariant_manifest`, `trace`, and `candidate_executable`.
+
+Every input path is repository-relative, uses `/`, contains no empty, `.`, or `..` segment, and is not absolute, drive-relative, UNC, a device path, an alternate-data-stream path, or a symlink, junction, or reparse-point traversal. It resolves under the already-frozen allowed roots and is opened and final-path checked before its bytes are accepted.
+
+The worker independently reads each bounded file, validates canonical form where applicable, recomputes every binding, and rejects any mismatch. Paths and host locations are not added to any replay hash. Any additional program-mirror path referenced by a validated fixture or build manifest is derived and validated under the same allowed-root and final-path rules. URLs are never dereferenced.
+
+The request payload itself must be the canonical JSON encoding of this schema. Duplicate keys, unknown fields at any depth, noncanonical encoding, malformed UTF-8, missing fields, and trailing bytes fail closed.
+
+#### Signing-key pipe
+
+The signing-key frame uses kind `0x0002` and contains exactly one raw 32-byte Ed25519 seed. The derived public key must equal the request's `expected_verifier_pubkey`. The worker reads the signing frame only after request framing and basic request-schema validation. It never echoes or logs the seed and overwrites its mutable input buffer immediately after keypair construction on a best-effort basis.
+
+The seed cannot be supplied through stdin, command-line arguments, environment variables, files, or repository configuration. A missing, malformed, repeated, trailing, or identity-mismatched signing frame produces no signature or attestation intent and is `RUNNER_ISOLATION_SETUP`.
+
+Production launches require coordinator-supplied OS-CSPRNG identities. There is no default or fallback signer.
+
+#### `faultline.worker-response.v1`
+
+The worker response is a closed canonical JSON envelope. Its common required fields are:
+
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | exactly `faultline.worker-response.v1` |
+| `canonicalization` | string | exactly `faultline.canonical-json.v1` |
+| `coordinator_nonce` | string | exactly 64 lowercase hexadecimal characters |
+| `worker_ordinal` | JSON integer | `0`, `1`, or `2` |
+| `status` | string enum | exactly `signed_output` or `failure` |
+
+For `status = signed_output`, the envelope requires exactly one `signed_worker_output`, forbids envelope-level `classification` and `result_code`, and requires the embedded signed output to pass its complete frozen schema and Ed25519 verification. Its nonce, ordinal, and verifier public key must match the launch expectations.
+
+For `status = failure`, the envelope requires `classification` and numeric `result_code`; forbids `signed_worker_output`, receipt hash, verdict, commitment, signature, and attestation intent; and permits only `InvalidEvidence`, `UnsupportedEnvironment`, or `RunnerFault` with an existing Section 9 code valid for that classification. A failure envelope is fail-closed diagnostic output, not authenticated evidence, and never an attestation.
+
+Stdout contains exactly one framed canonical response followed by EOF. Human diagnostics belong only on bounded stderr.
+
+### 10.5 Exhaustive Checkpoint 4 failure mapping
+
+Evidence and schema failures map exactly as follows:
+
+| Condition | Stable code |
+| --- | --- |
+| malformed JSON or malformed UTF-8 | `INVALID_JSON` |
+| duplicate JSON key | `INVALID_DUPLICATE_KEY` |
+| unknown field | `INVALID_UNKNOWN_FIELD` |
+| noncanonical encoding | `INVALID_CANONICAL_ENCODING` |
+| wrong or missing schema or version | `INVALID_SCHEMA_OR_VERSION` |
+| hash, manifest, artifact, fixture, job, or receipt binding mismatch | `INVALID_DIGEST_BINDING` |
+| invalid alias, reference, repository-relative path, root escape, forbidden path form, reparse point, or unresolved declared input | `INVALID_ALIAS_OR_REFERENCE` |
+| declared or input size, count, numeric, or structural bound violation | `INVALID_BOUNDS` |
+| invalid signature, verifier identity, nonce, ordinal, or duplicate worker identity | `INVALID_SIGNATURE_OR_IDENTITY` |
+
+Unsupported execution maps exactly as follows:
+
+| Condition | Stable code |
+| --- | --- |
+| engine or runtime mismatch | `UNSUPPORTED_ENGINE_OR_RUNTIME` |
+| unsupported program | `UNSUPPORTED_PROGRAM` |
+| unsupported CPI | `UNSUPPORTED_CPI` |
+| unsupported sysvar or external-data dependency | `UNSUPPORTED_SYSVAR_OR_EXTERNAL_DATA` |
+| unsupported trace feature | `UNSUPPORTED_TRACE_FEATURE` |
+
+Coordinator and runner failures map exactly as follows:
+
+| Condition | Stable code |
+| --- | --- |
+| internal invariant, unexpected I/O race after a validated file open, or unclassified trusted-code failure | `RUNNER_INTERNAL` |
+| abnormal worker exit, panic, abort, or termination not attributed to another frozen limit | `RUNNER_CRASH` |
+| 30-second wall timeout or 25-second user-mode CPU limit | `RUNNER_TIMEOUT` |
+| process or Job Object memory limit | `RUNNER_MEMORY_LIMIT` |
+| stdout or stderr limit, malformed response frame, partial response, trailing response bytes, invalid response envelope, or missing response after nominal exit | `RUNNER_OUTPUT_LIMIT_OR_MALFORMED_OUTPUT` |
+| worker executable validation, pipe creation, handle-list construction, Job Object creation, configuration, or assignment, signing-pipe failure, active-process-limit violation, or launch failure | `RUNNER_ISOLATION_SETUP` |
+| surviving process, open owned handle preventing teardown, or unremovable per-run directory after the five-second cleanup grace | `RUNNER_CLEANUP` |
+| three otherwise valid authenticated workers whose consensus projections differ | `WORKER_DISAGREEMENT` |
+
+When multiple failures are observed, the coordinator returns exactly the highest-precedence stable result from this order:
+
+1. `RUNNER_CLEANUP`;
+2. OS-confirmed memory limit;
+3. wall-clock or CPU timeout;
+4. isolation setup or active-process violation;
+5. output limit or malformed output;
+6. abnormal crash;
+7. authenticated semantic disagreement;
+8. worker-reported evidence or unsupported classification; and
+9. `RUNNER_INTERNAL`.
+
+The coordinator records every observed diagnostic, but no failure classification contains or produces a commitment or attestation intent.
+
+### 10.6 Retry and cleanup rules
+
+Checkpoint 4 performs no automatic retry. A failed worker launch is not replaced, and a failed three-worker shard is not rerun unchanged. Timeout, cancellation, crash, limit violation, malformed output, disagreement, signing failure, or cleanup failure stops the shard.
+
+Every terminal path closes the owned Job Object and all owned pipe, process, and thread handles. Cleanup is part of correctness rather than best-effort success reporting. If otherwise valid work is followed by cleanup failure, the shard result is `RUNNER_CLEANUP` and no attestation is emitted.
+
+### 10.7 Test-only deterministic worker identities and nonces
+
+Production identities and nonces are OS-CSPRNG-generated and unique per launch. For reproducible Checkpoint 4 tests only, worker ordinal `i` in `{0,1,2}` uses:
+
+```text
+test_signer_seed_i = SHA256(
+    ASCII("FAULTLINE_CP4_TEST_SIGNER_V1")
+    || BYTE(i)
+)
+
+test_nonce_i = SHA256(
+    ASCII("FAULTLINE_CP4_TEST_NONCE_V1")
+    || replay_job_hash_raw_32_bytes
+    || BYTE(i)
+)
+```
+
+Because the nonce binds the replay job, the two existing candidate jobs intentionally have different nonce vectors. Their frozen replay-job hashes are v2 `76cd28ba983a92475d4c52defdb1225d3fbcd5c5489202d5d2c13a068b41f43b` and v3 `5b0c7a9c945b0fdaef42204bf0c11d1f0141fdbfe4d3db7db867a08d23d12e2a`.
+
+| Ordinal | Seed hex | Raw public-key hex | Base58 public key | v2 nonce hex | v3 nonce hex |
+| ---: | --- | --- | --- | --- | --- |
+| 0 | `a131302e0473e6c89129e7901057b2082e56c0b49b45c829db8aabf200b3dd3d` | `78ebbce82d7cee4a2b11e8c57f83ca6bd9d004b07a896e900a2a52c874b582c3` | `992QsRZRM8H59Kd96VCPhu8HQZTuXaZUE9i99Cf9jVZ4` | `ee37af3a42128ec081f4c16fb77c6ba73ca77ac2b877594bf9aea6a6c7587d07` | `7c975424e4a903d7686ac5509b4b7ac6dc32241c56ce83557921d5e0e64cd536` |
+| 1 | `e5b03d97e12bd9c949502c7f41a1a3af5f1bea6b70010c8c64c2486400a456e2` | `7e226876bb759cc519fe34216244244e369ea8789241ccde60b1413299cf4b40` | `9VNoSABNshf46oaW9cJATi4i3pTPcLMRmCxBTdXLXAQf` | `1bf038c3a99e54fa8fa15d87ff6b8a3a7b8fa1d98d96511bc2ec0a76ab48d9da` | `2c890741e9cd0ec964c891b97257e9c53b00d8ca2a9d07a305495b87ad4a805b` |
+| 2 | `b2e32f629a4c0d72e4c23205b0347875486abd8860c4ba1217892f76904a5bae` | `3e7e00ba8cd2e7c90798921418386d6d3d82e9966f447e4d63041a531e79cc15` | `5CwiTeTWofME9j6iksUYpPjQx4Bu5ycsthHT9LCt6ocQ` | `f0243e6c8267b04bd330af95397c765d7c7518145d8e67a709deb7722c3bea3b` | `0b86af2201ccf6ff9fbbca28ed699464fa11a5abd643a5deff3009b0c7418e9a` |
+
+The identities and nonces are pairwise distinct. An independent Node Ed25519/SHA-256 implementation reproduces the complete table; Solana's Rust CLI independently loads each 64-byte seed-plus-public-key keypair, reproduces its Base58 public key, and successfully signs and verifies with it; and an independent platform SHA-256 implementation reproduces every seed and nonce. These values are public test vectors only. Production APIs never default to them. Repeated test launches use them only when explicit test-vector mode is selected; production-mode outputs are not expected to be byte-identical because production identities and nonces are ephemeral.
+
+### 10.8 Three-worker authentication and agreement
+
+Complete signed outputs are not compared byte-for-byte because nonce, ordinal, verifier identity, signature, and the attestation intent's verifier key are intentionally worker-specific.
+
+Before agreement, each worker response must have the expected nonce, expected ordinal, expected distinct verifier public key, valid Ed25519 signature, valid closed schemas, valid classification/code pairing, and all Checkpoint 3 cross-field validations.
+
+The identity-independent consensus projection contains exactly:
+
+- `replay_job_hash`;
+- `classification`;
+- `result_code`;
+- `receipt_hash`, when eligible;
+- `verdict_u8`, when eligible;
+- `replay_result_commitment`, when eligible; and
+- from `attestation_intent`: `verification_round`, `proposal`, `invariant_account`, `trace_claim`, `verdict_u8`, `receipt_hash`, and `replay_result_commitment`.
+
+The projection excludes only `coordinator_nonce`, `worker_ordinal`, `verifier_pubkey`, the signature, and the attestation intent's `verifier_pubkey`.
+
+Agreement requires exactly three valid responses; ordinals exactly `{0,1,2}`; three distinct expected verifier public keys; three expected distinct nonces; no duplicated response, ordinal, nonce, identity, or signature; and byte-identical canonical consensus projections.
+
+Eligible consensus exists only when all three authenticated projections agree on `Preserved` or all agree on `Violated`. For unanimous ineligible results, no commitment or attestation is emitted; the unanimous classification and code are preserved only as a fail-closed shard outcome.
+
+Any mixture of classifications or codes, eligible and ineligible results, receipt hashes, verdicts, commitments, or identity-independent attestation fields is `WORKER_DISAGREEMENT`. An invalid signature, wrong identity, wrong nonce, wrong ordinal, duplicate identity, or duplicated response is `INVALID_SIGNATURE_OR_IDENTITY`, not disagreement.
+
+### 10.9 Checkpoint allocation clarification
+
+Checkpoint 4 implements assertions 13–16 and 24–27. Checkpoint 5 retains assertion 28 and final closeout. Assertions 1–12 and 17–23 remain unchanged. No assertion is renumbered.
+
 ---
 
 ## 11. Security invariants
