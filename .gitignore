@@ -1,4 +1,6 @@
 docs/*
+!docs/PRD.md
+!docs/Architecture.md
 !docs/MILESTONE_1_GUARD.md
 !docs/MILESTONE_2_TREASURY.md
 !docs/MILESTONE_3_PROPOSAL_STATE_MACHINE.md
