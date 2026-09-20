@@ -1,7 +1,10 @@
 pub mod canonical;
 pub mod generator;
 pub mod hash;
+pub mod invariant;
+pub mod runner;
 pub mod schema;
+pub mod trace;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

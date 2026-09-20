@@ -780,7 +780,7 @@ impl Validate for ReplayJob {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum Classification {
     Preserved,
@@ -790,28 +790,28 @@ pub enum Classification {
     RunnerFault,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransactionStatus {
     Success,
     Error,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeErrorKind {
     Custom,
     Builtin,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RuntimeErrorCode {
     Custom(u32),
     Builtin(BuiltinInstructionError),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BuiltinInstructionError {
     GenericError,
     InvalidArgument,
@@ -924,7 +924,7 @@ pub const BUILTIN_ERROR_SYMBOLS: [&str; 53] = [
     "BuiltinProgramsMustConsumeComputeUnits",
 ];
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StableRuntimeError {
     pub instruction_index: u16,
@@ -1406,6 +1406,10 @@ fn treasury_state_data(_pda: &str, vault: &str, mint: &str) -> Result<Vec<u8>> {
 }
 
 pub fn derived_key(domain: &str, alias: &str) -> Result<String> {
+    Ok(derived_keypair(domain, alias)?.pubkey().to_string())
+}
+
+pub fn derived_keypair(domain: &str, alias: &str) -> Result<solana_sdk::signature::Keypair> {
     let mut hasher = Sha256::new();
     hasher.update(domain.as_bytes());
     hasher.update([0]);
@@ -1413,7 +1417,7 @@ pub fn derived_key(domain: &str, alias: &str) -> Result<String> {
     let seed: [u8; 32] = hasher.finalize().into();
     let keypair = keypair_from_seed(&seed)
         .map_err(|error| Error::Validation(format!("key derivation: {error}")))?;
-    Ok(keypair.pubkey().to_string())
+    Ok(keypair)
 }
 
 fn validate_state_hashes(values: &[StateHash]) -> Result<()> {
