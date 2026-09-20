@@ -1,0 +1,18 @@
+{
+  "schema": "faultline.build.v1",
+  "canonicalization": "faultline.canonical-json.v1",
+  "program": "faultline_treasury",
+  "program_id": "46zDmEZAYrpwi3k6FsKFf1rPWZDbZEKM21SFzMKzb1a4",
+  "build": "v2",
+  "cargo_features": [
+    "v2"
+  ],
+  "artifact_path": "artifacts/treasury/v2/faultline_treasury.so",
+  "executable_sha256": "82bf0adc96092daeae5758715ba1e05d7c9b272b03b8588e62ec3858ef4b4f6a",
+  "toolchain": {
+    "solana_cli": "solana-cli 1.18.10 (src:a093e239; feat:3469865029, client:Agave)",
+    "cargo_build_sbf": "solana-cargo-build-sbf 1.18.10",
+    "platform_tools": "v1.41",
+    "anchor_crates": "0.30.1"
+  }
+}

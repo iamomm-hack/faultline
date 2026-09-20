@@ -1,0 +1,31 @@
+[package]
+name = "faultline-replay"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+base64 = "=0.21.7"
+bs58 = "=0.5.1"
+litesvm = "=0.1.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+solana-address-lookup-table-program = "=1.18.22"
+solana-bpf-loader-program = "=1.18.22"
+solana-compute-budget-program = "=1.18.22"
+solana-loader-v4-program = "=1.18.22"
+solana-program = "=1.18.22"
+solana-program-runtime = "=1.18.22"
+solana-sdk = "=1.18.22"
+solana-system-program = "=1.18.22"
+solana_rbpf = "=0.8.3"
+thiserror = "=1.0.69"
+unicode-normalization = "=0.1.25"
+
+[[bin]]
+name = "generate-formats"
+path = "src/bin/generate-formats.rs"

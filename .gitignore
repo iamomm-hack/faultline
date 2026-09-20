@@ -12,5 +12,6 @@ docs/*
 /.localnet/
 /artifacts/
 /target/
+/crates/faultline-replay/target/
 /node_modules/
 /test-ledger/

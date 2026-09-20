@@ -1,0 +1,95 @@
+{
+  "schema": "faultline.fixture.v1",
+  "canonicalization": "faultline.canonical-json.v1",
+  "fixture_id": "treasury-v1",
+  "base_slot": "1",
+  "clock": {
+    "slot": "1",
+    "unix_timestamp": "0"
+  },
+  "programs": [
+    {
+      "kind": "target",
+      "alias": "faultline_treasury",
+      "program_id": "46zDmEZAYrpwi3k6FsKFf1rPWZDbZEKM21SFzMKzb1a4"
+    },
+    {
+      "kind": "bundled",
+      "alias": "spl_token",
+      "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "bundle_name": "spl-token-3.5.0",
+      "artifact_path": "manifests/programs/spl-token-3.5.0.so",
+      "executable_sha256": "18264f491c7e0ad056dd36f42f8de6d1fedf9f044d1f521e714b4dc6b61594b6",
+      "source_crate": "litesvm",
+      "source_crate_version": "0.1.0",
+      "source_crate_sha256": "0963e4df461a414763f0348b73eb284a734534a53558fcae35f984a0c16a6e6c",
+      "source_member_path": "src/spl/programs/spl_token-3.5.0.so"
+    }
+  ],
+  "accounts": [
+    {
+      "alias": "attacker_token_account",
+      "pubkey": "3DUXuoksqpratbjmysGEKQQUUb1mZRR4y3GWNjSiNTPP",
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "lamports": "2039280",
+      "executable": false,
+      "rent_epoch": "0",
+      "data_base64": "GAWhXr8Te/HwStVu41Wu9UUeK+Ud7g6hhKgs1Sevr8nACGa81c5JSZROzXi+2CO1zF/+Sin+SX3UwmQpgS8XzQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "alias": "payment_mint",
+      "pubkey": "2cmmKxvd7YMFYhfqSFb45Q7zVYyhqsgoswxbvVeThgkG",
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "lamports": "1461600",
+      "executable": false,
+      "rent_epoch": "0",
+      "data_base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMqaOwAAAAAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+    },
+    {
+      "alias": "treasury_pda",
+      "pubkey": "EiRj7VptpwZTy2uRMbHeqCU45fmbPFd4FrGGbQ2MZfi2",
+      "owner": "46zDmEZAYrpwi3k6FsKFf1rPWZDbZEKM21SFzMKzb1a4",
+      "lamports": "2352480",
+      "executable": false,
+      "rent_epoch": "0",
+      "data_base64": "8Djinor0T5oBPLpaMOkYW/wulgNMC9NraYAtzOWhHbRY4P2y6gN1AozBZgbW3vEnrKAemtF7WtHzOeyN6IxMMWvHvaAkJ25D9wDKmjsAAAAA/xgFoV6/E3vx8ErVbuNVrvVFHivlHe4OoYSoLNUnr6/JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "alias": "treasury_vault",
+      "pubkey": "E1wvHDQMjFVw8hZgdsLzo5tXqSttrvHB56Du1oD1roDY",
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "lamports": "2039280",
+      "executable": false,
+      "rent_epoch": "0",
+      "data_base64": "GAWhXr8Te/HwStVu41Wu9UUeK+Ud7g6hhKgs1Sevr8nLxLN5V+YZLpuK9pdX5gk3kBxU5SrQY4Xi/nw8e/dqQwDKmjsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  ],
+  "signers": [
+    {
+      "alias": "attacker",
+      "pubkey": "Dvci5BTD5CkwYCQh6pC6UumLWF9LHSinJ5doS8PS9hV6",
+      "lamports": "10000000000"
+    },
+    {
+      "alias": "treasury-admin",
+      "pubkey": "564Gpg3mVA7LwcW7hVQkeATttbaRRMTntp9eV2AGNpbd",
+      "lamports": "10000000000"
+    },
+    {
+      "alias": "user",
+      "pubkey": "58aVWrJhcixCdUrm8wVdfUVZiC5Y7QzpFQuoQbJHMV4i",
+      "lamports": "10000000000"
+    }
+  ],
+  "setup_transactions": [],
+  "initial_state": {
+    "original_admin": "564Gpg3mVA7LwcW7hVQkeATttbaRRMTntp9eV2AGNpbd",
+    "treasury_state": "EiRj7VptpwZTy2uRMbHeqCU45fmbPFd4FrGGbQ2MZfi2",
+    "treasury_vault": "E1wvHDQMjFVw8hZgdsLzo5tXqSttrvHB56Du1oD1roDY",
+    "attacker_token_account": "3DUXuoksqpratbjmysGEKQQUUb1mZRR4y3GWNjSiNTPP",
+    "payment_mint": "2cmmKxvd7YMFYhfqSFb45Q7zVYyhqsgoswxbvVeThgkG",
+    "mint_decimals": 6,
+    "treasury_vault_base_units": "1000000000",
+    "attacker_base_units": "0"
+  }
+}

@@ -3,6 +3,7 @@ members = [
     "programs/faultline_gate",
     "programs/faultline_treasury",
 ]
+exclude = ["crates/faultline-replay"]
 resolver = "2"
 
 [profile.release]

@@ -1,0 +1,28 @@
+{
+  "schema": "faultline.runner.v1",
+  "canonicalization": "faultline.canonical-json.v1",
+  "engine": "litesvm",
+  "engine_version": "0.1.0",
+  "engine_source_commit": "5cda1d2dcfae16714a6ff808b58f0c087b21bd42",
+  "solana_runtime": "1.18.22",
+  "feature_set": "litesvm-0.1.0-all-enabled",
+  "sigverify": true,
+  "clock_mode": "fixture",
+  "recent_blockhash_mode": "runner-deterministic",
+  "token_program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "token_program_bundle": "spl-token-3.5.0",
+  "allowed_external_programs": [
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  ],
+  "limits": {
+    "max_transactions": 32,
+    "max_instructions_per_transaction": 16,
+    "max_accounts_per_instruction": 64,
+    "max_instruction_data_bytes": 10240,
+    "max_compute_units_per_transaction": 1400000,
+    "max_manifest_bytes": 1048576,
+    "max_trace_bytes": 2097152,
+    "max_fixture_bytes": 10485760,
+    "max_output_bytes": 8388608
+  }
+}
