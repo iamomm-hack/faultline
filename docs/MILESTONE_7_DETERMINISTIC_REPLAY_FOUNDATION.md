@@ -30,15 +30,17 @@ Milestone 7 ends at signed attestation intents. Transaction construction, transa
 
 > **Revision note — Solana runtime pin erratum (2026-09-20):** Attempting to match the existing artifacts' Solana/SBF `1.18.10` build provenance in the replay runtime could not create a fresh lockfile because that runtime's `solana-bpf-loader-program` requires the yanked `solana_rbpf 0.8.0`. Solana `1.18.22` is the first compatible `1.18.x` patch using non-yanked `solana_rbpf 0.8.3`. The compatibility probe resolved one unified Solana `1.18.22` family within the off-chain replay dependency closure. Under LiteSVM `0.1.0` plus Solana `1.18.22`, both existing treasury v2/v3 artifacts loaded and entered their Anchor programs, returning the expected `InstructionMissing` / `Custom(100)`. Their build provenance and artifact hashes remain unchanged.
 
+> **Revision note — Cargo workspace isolation erratum (2026-09-20):** Cargo cannot resolve the semver-compatible exact crates.io `solana-program` pins `=1.18.10` and `=1.18.22` in one workspace resolution. The root on-chain workspace and the standalone nested replay workspace therefore have separate manifests and authoritative lockfiles. This isolation changes no runtime pin, fixture genesis, Tokenkeg provenance, schema, hash or signature domain, artifact hash, assertion meaning, or checkpoint boundary.
+
 ### 2.1 Dependency planes
 
 Milestone 7 freezes two separate dependency planes:
 
-**On-chain artifact build plane.** The existing crates under `programs/**` remain pinned to `solana-program = "=1.18.10"`. The existing v2/v3 SBF artifacts and their historical build manifests retain their Solana CLI/SBF `1.18.10` provenance and hashes. Program manifests, program source, artifacts, and historical build hashes are not modified. This plane represents the already validated deployable BPF artifacts.
+**On-chain artifact build plane.** The root Cargo workspace continues to contain only `programs/faultline_gate` and `programs/faultline_treasury`; both remain pinned to `solana-program = "=1.18.10"`. During Checkpoint 1, the root `Cargo.toml` adds `exclude = ["crates/faultline-replay"]` and must not add the replay crate as a workspace member. The root `/Cargo.lock` remains the authoritative on-chain-plane lockfile and Checkpoint 1 must not update it. The existing v2/v3 SBF artifacts and their historical build manifests retain their Solana CLI/SBF `1.18.10` provenance and hashes. Program manifests, program source, artifacts, and historical build hashes are not modified. This plane represents the already validated deployable BPF artifacts.
 
-**Off-chain deterministic replay plane.** `faultline-replay` uses `litesvm = "=0.1.0"`. Its complete normal, build, development, and runtime dependency closure uses the Solana runtime family exactly `1.18.22` and resolves `solana_rbpf` exactly once at `0.8.3`. No Solana `1.18.10` package and neither on-chain workspace crate may be reachable from `faultline-replay`. Rust types from the two Solana versions never cross crate boundaries. Replay consumes the existing program artifacts as verified byte files plus canonical manifest data; it does not depend on, link, or import either on-chain program crate.
+**Off-chain deterministic replay plane.** `crates/faultline-replay` is an independent nested Cargo workspace and package. Its `Cargo.toml` contains its package definition and a `[workspace]` section with `resolver = "2"`; `/crates/faultline-replay/Cargo.lock` is its authoritative lockfile. `faultline-replay` uses `litesvm = "=0.1.0"`. Its complete normal, build, development, target-specific, and runtime dependency closure uses the Solana runtime family exactly `1.18.22` and resolves `solana_rbpf` exactly once at `0.8.3`. No Solana `1.18.10` package and neither on-chain workspace crate may be reachable from `faultline-replay`. Rust types from the two Solana versions never cross crate boundaries. Replay consumes the existing repository artifacts, policies, traces, and manifests through validated repository-relative paths as verified bytes and canonical data; it does not depend on, link, or import either on-chain program crate.
 
-The repository-level `Cargo.lock` may therefore legitimately contain both Solana `1.18.10` and `1.18.22`. “One unified Solana runtime family” and “no second runtime version” apply to the dependency closure rooted at `faultline-replay`, not to every workspace member or to the lockfile as a whole. Workspace-wide checks may compile both planes, but each plane must remain internally version-consistent. Artifact build provenance remains `1.18.10`; replay execution provenance is `1.18.22`. This separation changes no executable hash, canonical schema, hash or signature domain, assertion meaning, or checkpoint boundary.
+The repository has two authoritative lockfiles and two disjoint resolution graphs: `/Cargo.lock` contains the root on-chain plane at Solana `1.18.10`, while `/crates/faultline-replay/Cargo.lock` contains the replay plane at Solana `1.18.22` and `solana_rbpf 0.8.3`. Neither lockfile may contain the other plane merely to share one resolution. No package-source trick, Git override, `[patch]`, vendored duplicate, or version migration may be used merely to force both exact Solana versions into one graph. “One unified Solana runtime family” and “no second runtime version” apply to the standalone replay workspace and its dependency closure. Artifact build provenance remains `1.18.10`; replay execution provenance is `1.18.22`.
 
 ### 2.2 Selected engine
 
@@ -57,7 +59,7 @@ The dependency is pinned exactly. Its Solana dependency family must also resolve
 
 The replay crate also pins `solana_rbpf = "=0.8.3"`, official upstream tag `v0.8.3`, commit `20648d721f8cba862df874754650919a66ca9966`, crates.io checksum `da5d083187e3b3f453e140f292c09186881da8a02a7b5e27f645ee26de3d9cc5`.
 
-Checkpoint 1 must verify these exact versions with a dependency tree rooted at `faultline-replay` plus plane-aware lockfile inspection. Upgrading LiteSVM, `solana_rbpf`, or any Solana runtime crate in the replay plane is a specification change.
+Checkpoint 1 must verify these exact versions with a dependency tree rooted in `crates/faultline-replay/Cargo.toml` plus inspection of the replay workspace's own lockfile. Upgrading LiteSVM, `solana_rbpf`, or any Solana runtime crate in the replay plane is a specification change.
 
 ### 2.3 Pinned toolchain
 
@@ -169,6 +171,7 @@ Implementation is one cohesive Rust crate rather than a package-per-concept spli
 crates/
   faultline-replay/
     Cargo.toml
+    Cargo.lock
     src/
       lib.rs
       canonical.rs
@@ -198,7 +201,7 @@ scripts/
   run-replay-foundation-tests.ps1
 ```
 
-The root workspace adds only `crates/faultline-replay`. That crate has no dependency path to `faultline_gate` or `faultline_treasury`; it reads SBF artifacts as bytes. Existing policy, trace, logical fixture, and treasury SBF files remain inputs; they are not silently rewritten. Checkpoint 1 additionally tracks the exact Tokenkeg SBF bytes embedded by LiteSVM 0.1.0 at `manifests/programs/spl-token-3.5.0.so`, as specified in Section 7.4.3.
+The root workspace keeps only `programs/faultline_gate` and `programs/faultline_treasury` as members and explicitly excludes `crates/faultline-replay`. The replay directory is a standalone nested workspace with its own `[workspace]` section, resolver 2, package, and lockfile. It has no dependency path to `faultline_gate` or `faultline_treasury`; it reads repository inputs as validated bytes through repository-relative paths. Existing policy, trace, logical fixture, and treasury SBF files remain inputs; they are not silently rewritten. Checkpoint 1 additionally tracks the exact Tokenkeg SBF bytes embedded by LiteSVM 0.1.0 at `manifests/programs/spl-token-3.5.0.so`, as specified in Section 7.4.3.
 
 ---
 
@@ -424,7 +427,7 @@ Validation decodes each payload, requires its exact length, reconstructs it inde
 
 LiteSVM 0.1.0 does not execute Tokenkeg through a native Rust processor. `LiteSVM::new()` calls `with_spl_programs()`, whose `load_spl_programs` passes `include_bytes!("programs/spl_token-3.5.0.so")` to `add_program` for the Tokenkeg program ID. Tokenkeg therefore executes as actual SBF bytes in the pinned Solana 1.18.22 loader/runtime.
 
-The authoritative source package is the non-yanked crates.io `litesvm` 0.1.0 crate from `registry+https://github.com/rust-lang/crates.io-index`, checksum `0963e4df461a414763f0348b73eb284a734534a53558fcae35f984a0c16a6e6c`, corresponding to the already pinned upstream commit `5cda1d2dcfae16714a6ff808b58f0c087b21bd42`. Its member `src/spl/programs/spl_token-3.5.0.so` is exactly 133352 bytes with SHA-256 `18264f491c7e0ad056dd36f42f8de6d1fedf9f044d1f521e714b4dc6b61594b6`. The replay crate's exact `litesvm = "=0.1.0"` dependency and the package source/checksum in `Cargo.lock`, together with the runner manifest's engine version and `token_program_bundle`, bind that implementation; no separate native `spl-token` processor dependency is used for execution.
+The authoritative source package is the non-yanked crates.io `litesvm` 0.1.0 crate from `registry+https://github.com/rust-lang/crates.io-index`, checksum `0963e4df461a414763f0348b73eb284a734534a53558fcae35f984a0c16a6e6c`, corresponding to the already pinned upstream commit `5cda1d2dcfae16714a6ff808b58f0c087b21bd42`. Its member `src/spl/programs/spl_token-3.5.0.so` is exactly 133352 bytes with SHA-256 `18264f491c7e0ad056dd36f42f8de6d1fedf9f044d1f521e714b4dc6b61594b6`. The replay crate's exact `litesvm = "=0.1.0"` dependency and the package source/checksum in `/crates/faultline-replay/Cargo.lock`, together with the runner manifest's engine version and `token_program_bundle`, bind that implementation; no separate native `spl-token` processor dependency is used for execution.
 
 Checkpoint 1 extracts those bytes without modification into the tracked repository-relative file `manifests/programs/spl-token-3.5.0.so`. Generation rejects any crate-checksum, member-length, member-hash, tracked-file-hash, program-ID, or runner-version mismatch. Checkpoint 2 uses LiteSVM's embedded copy and first verifies that the tracked mirror has the same frozen hash; the fixture manifest binds the tracked path, source identity, and executable hash. Neither a local Solana distribution nor a separately downloaded SPL artifact is authoritative.
 
@@ -993,17 +996,37 @@ Allocator abort, abnormal exit, limit violation, malformed worker output, disagr
 4. **Worker checkpoint:** Windows Job Objects, resource limits, three-worker agreement, and failure handling.
 5. **Closeout checkpoint:** the 28 focused assertions and preserved evidence.
 
-Every checkpoint requires a scoped diff, `git diff --check`, relevant focused tests, plane-aware lockfile review, and confirmation that no production Solana semantics changed. Milestone 1–6 suites are rerun only at the later integration boundary, not during Milestone 7 planning or routine replay-foundation development.
+Every checkpoint requires a scoped diff, `git diff --check`, relevant focused tests, separate review of any authoritative lockfile in scope, and confirmation that no production Solana semantics changed. Milestone 1–6 suites are rerun only at the later integration boundary, not during Milestone 7 planning or routine replay-foundation development.
+
+Checkpoint 1 runs the replay and on-chain planes separately. Replay-plane verification uses exactly:
+
+```text
+cargo fmt --manifest-path crates/faultline-replay/Cargo.toml --all -- --check
+cargo check --manifest-path crates/faultline-replay/Cargo.toml --workspace --all-targets --locked
+cargo test --manifest-path crates/faultline-replay/Cargo.toml --workspace --all-targets --locked
+```
+
+Its dependency-tree audit is rooted in `crates/faultline-replay/Cargo.toml`. These commands must not resolve or compile either on-chain program crate.
+
+Root on-chain-plane verification uses exactly:
+
+```text
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo test --workspace --all-targets --locked
+```
+
+These root commands must not resolve or compile the excluded replay workspace and must leave `/Cargo.lock` byte-for-byte unchanged.
 
 Checkpoint 1 dependency evidence must prove all of the following:
 
-- `cargo tree -p faultline-replay` contains LiteSVM `0.1.0`;
+- `cargo tree --manifest-path crates/faultline-replay/Cargo.toml -p faultline-replay` contains LiteSVM `0.1.0`;
 - every Solana runtime package reachable from `faultline-replay`, including normal, build, development, and target-specific edges, is exactly `1.18.22`;
 - `solana_rbpf` reachable from `faultline-replay` resolves exactly once at `0.8.3`;
 - neither `faultline_gate` nor `faultline_treasury` is reachable from `faultline-replay`; and
 - the existing on-chain program crates remain pinned to `solana-program 1.18.10`.
 
-Repository-wide `Cargo.lock` inspection must classify Solana packages by reachability rather than reject the expected coexistence of the two planes. A `1.18.10` package reachable from `faultline-replay`, a non-`1.18.22` replay-runtime package, a second replay-plane RBPF version, or a replay dependency on an on-chain program crate is a Checkpoint 1 failure.
+The replay audit inspects `/crates/faultline-replay/Cargo.lock` and rejects any `1.18.10` Solana package, any non-`1.18.22` replay-runtime package, a second replay-plane RBPF version, or a replay dependency on an on-chain program crate. The root audit verifies that `/Cargo.lock` remains the unchanged on-chain lockfile and that the program crates remain at `solana-program 1.18.10`. The planes are never audited as if they shared one lockfile or resolution graph.
 
 ---
 
@@ -1050,7 +1073,7 @@ AI-assisted trace generation remains optional after reliability work and cannot 
 ## 17. Known limitations
 
 - LiteSVM 0.1.0 uses its deterministic all-enabled Solana 1.18 feature set; it is not a proof of exact historical Mainnet feature activation.
-- Workspace-wide Cargo operations compile separate Solana 1.18.10 on-chain and Solana 1.18.22 replay planes; closure audits, not repository-wide version counts, enforce replay consistency.
+- Cargo operations run separately against the root on-chain workspace and the standalone nested replay workspace; no single Cargo invocation resolves or compiles both planes.
 - The feasibility audit establishes dependency, loader, and program-entry compatibility. Full deterministic v2/v3 replay results are proven only by assertions 10 and 11 during implementation.
 - All three workers share one engine and runtime implementation, so agreement does not protect against common-mode VM defects.
 - Windows Job Objects enforce process, memory, CPU, and cleanup limits but do not provide network or filesystem sandboxing.
