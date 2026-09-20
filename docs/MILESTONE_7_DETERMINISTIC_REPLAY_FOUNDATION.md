@@ -28,11 +28,13 @@ Milestone 7 ends at signed attestation intents. Transaction construction, transa
 
 ## 2. Feasibility decision and pinned execution engine
 
+> **Revision note — Solana runtime pin erratum (2026-09-20):** Attempting to match the existing artifacts' Solana/SBF `1.18.10` build provenance in the replay runtime could not create a fresh lockfile because that runtime's `solana-bpf-loader-program` requires the yanked `solana_rbpf 0.8.0`. Solana `1.18.22` is the first compatible `1.18.x` patch using non-yanked `solana_rbpf 0.8.3`. The compatibility probe resolved one unified Solana `1.18.22` runtime family. Under LiteSVM `0.1.0` plus Solana `1.18.22`, both existing treasury v2/v3 artifacts loaded and entered their Anchor programs, returning the expected `InstructionMissing` / `Custom(100)`. Their build provenance and artifact hashes remain unchanged.
+
 ### 2.1 Selected engine
 
 The deterministic engine is the Rust crate `litesvm = "=0.1.0"`, upstream tag `v0.1.0`, peeled commit `5cda1d2dcfae16714a6ff808b58f0c087b21bd42`.
 
-The dependency is pinned exactly. Its Solana dependency family must also resolve exactly to `1.18.10`, not merely to any version accepted by LiteSVM's `~1.18` requirements. The replay crate therefore pins these runtime crates to `=1.18.10` and the lockfile must contain no second Solana runtime version:
+The dependency is pinned exactly. Its Solana dependency family must also resolve exactly to `1.18.22`, not merely to any version accepted by LiteSVM's `~1.18` requirements. The replay crate therefore pins these runtime crates to `=1.18.22` and the lockfile must contain no second Solana runtime version:
 
 - `solana-program`;
 - `solana-program-runtime`;
@@ -43,7 +45,9 @@ The dependency is pinned exactly. Its Solana dependency family must also resolve
 - `solana-loader-v4-program`; and
 - `solana-address-lookup-table-program`.
 
-The implementation checkpoint must verify this with `cargo tree -d` and lockfile inspection. Upgrading LiteSVM or any Solana runtime crate is a specification change.
+The replay crate also pins `solana_rbpf = "=0.8.3"`, official upstream tag `v0.8.3`, commit `20648d721f8cba862df874754650919a66ca9966`, crates.io checksum `da5d083187e3b3f453e140f292c09186881da8a02a7b5e27f645ee26de3d9cc5`.
+
+The implementation checkpoint must verify these exact versions with `cargo tree -d` and lockfile inspection. Upgrading LiteSVM, `solana_rbpf`, or any Solana runtime crate is a specification change.
 
 ### 2.2 Pinned toolchain
 
@@ -53,7 +57,8 @@ The implementation checkpoint must verify this with `cargo tree -d` and lockfile
 | Host Cargo | `cargo 1.89.0 (c24e10642 2025-06-23)` |
 | LiteSVM | `0.1.0`, commit `5cda1d2dcfae16714a6ff808b58f0c087b21bd42` |
 | LiteSVM MSRV | `1.75.0` |
-| Solana/Agave runtime crates | `1.18.10` exactly |
+| Solana/Agave runtime crates | `1.18.22` exactly |
+| Solana RBPF | `0.8.3` exactly; tag `v0.8.3`; commit `20648d721f8cba862df874754650919a66ca9966`; crates.io checksum `da5d083187e3b3f453e140f292c09186881da8a02a7b5e27f645ee26de3d9cc5` |
 | Solana CLI used for existing artifacts | `solana-cli 1.18.10 (src:a093e239; feat:3469865029, client:Agave)` |
 | SBF builder | `solana-cargo-build-sbf 1.18.10` |
 | SBF platform tools | `v1.41` |
@@ -75,7 +80,7 @@ The existing replay targets are SBF artifacts built with the pinned Solana 1.18.
 
 The treasury uses Anchor instruction decoding, System Program account creation, PDA signing, and legacy Tokenkeg transfer CPI. All are in the selected runtime surface. Each replay VM loads exactly one candidate artifact directly at the treasury program ID; loader upgrade state is not part of replay execution.
 
-This is a static compatibility determination. Assertions 10 and 11 are the implementation proof that the artifacts execute and produce the frozen results.
+The compatibility probe proves that both artifacts load and enter their Anchor programs under the selected runtime. Assertions 10 and 11 remain the implementation proof that full deterministic replay produces the frozen results.
 
 ---
 
@@ -101,7 +106,7 @@ This is a static compatibility determination. Assertions 10 and 11 are the imple
 
 - coordinator and worker native Rust code;
 - canonical JSON and hashing implementation;
-- LiteSVM 0.1.0 and the pinned Solana 1.18.10 runtime crates;
+- LiteSVM 0.1.0, the pinned Solana 1.18.22 runtime crates, and `solana_rbpf 0.8.3`;
 - host Rust standard library and Windows kernel;
 - artifact files after digest verification;
 - coordinator configuration and its allowed-root list; and
@@ -263,7 +268,7 @@ Required fields:
 - `engine`: `litesvm`;
 - `engine_version`: `0.1.0`;
 - `engine_source_commit`: `5cda1d2dcfae16714a6ff808b58f0c087b21bd42`;
-- `solana_runtime`: `1.18.10`;
+- `solana_runtime`: `1.18.22`;
 - `feature_set`: `litesvm-0.1.0-all-enabled`;
 - `sigverify`: `true`;
 - `clock_mode`: `fixture`;
@@ -735,7 +740,7 @@ AI-assisted trace generation remains optional after reliability work and cannot 
 ## 17. Known limitations
 
 - LiteSVM 0.1.0 uses its deterministic all-enabled Solana 1.18 feature set; it is not a proof of exact historical Mainnet feature activation.
-- The feasibility audit establishes API and dependency compatibility. Actual v2/v3 execution is proven only by assertions 10 and 11 during implementation.
+- The feasibility audit establishes dependency, loader, and program-entry compatibility. Full deterministic v2/v3 replay results are proven only by assertions 10 and 11 during implementation.
 - All three workers share one engine and runtime implementation, so agreement does not protect against common-mode VM defects.
 - Windows Job Objects enforce process, memory, CPU, and cleanup limits but do not provide network or filesystem sandboxing.
 - Filesystem and network restrictions rely on audited coordinator/worker code and the inability of SBF code to call host Windows APIs directly.
