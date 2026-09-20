@@ -238,136 +238,314 @@ The identifier is `faultline.canonical-json.v1`.
 
 All hashes are lowercase 64-character SHA-256 hex. All Solana public keys are canonical Base58 strings that decode to exactly 32 bytes and re-encode identically. All signatures are canonical Base58 strings that decode to exactly 64 bytes.
 
+> **Revision note — Checkpoint 1 schema clarification (2026-09-20):** This section replaces underspecified schema shorthand with the complete closed input formats. It does not change evaluator behavior, hash domains, runtime pins, or checkpoint boundaries. Unless a field is explicitly marked optional or nullable, it is required. Every object at every depth is closed: missing required fields, duplicate keys, and unknown fields are invalid. Nested objects do not carry independent schema discriminators; they are valid only inside their declared parent schema. Strings and keys obey Section 6, decimal strings obey Section 6.3, and arrays obey the cardinality, uniqueness, and ordering rules stated below.
+
+The tracked Milestone 2 policy, fixture, trace, resolved-fixture outputs, and artifact build-manifest JSON were reviewed as source/provenance records. The new files under `manifests/` are the Milestone 7 trust-path manifests defined here; historical fixture and artifact JSON are not silently reinterpreted or rewritten as those manifests even where a legacy `schema` string is shared. The build manifests transcribe the existing artifact path, digest, feature, program ID, and toolchain provenance into the closed Section 7.2 shape. The fixture manifest transcribes resolved public state into the candidate-independent Section 7.4 shape. The tracked policy supplies the exact Section 7.5 values, while the tracked trace itself is parsed directly under Section 7.6.
+
 ### 7.1 Common manifest fields
 
-Every manifest is a closed object containing:
+Every manifest is a closed object containing these required fields:
 
-- `schema`: one of the exact schema identifiers below; and
-- `canonicalization`: exactly `faultline.canonical-json.v1`.
+- `schema`: JSON string equal to the exact schema identifier named by its subsection; and
+- `canonicalization`: JSON string exactly `faultline.canonical-json.v1`.
+
+For all duplicate-free arrays, uniqueness is equality of the canonical field identified by that schema. “Canonical order” means ascending unsigned UTF-8 byte order of that field. Arrays described as execution ordered preserve input order and are never sorted. Arrays not explicitly declared duplicate-free may contain repeated values; their input order remains hash-binding.
 
 ### 7.2 `faultline.build.v1`
 
-Required fields:
+The closed build manifest has exactly these required keys:
 
-- common manifest fields;
-- `program`: `faultline_treasury`;
-- `program_id`: treasury program public key;
-- `build`: `v2` or `v3`;
-- `cargo_features`: a nonempty, duplicate-free ordered array containing the selected version feature;
-- `artifact_path`: normalized repository-relative path using `/` separators;
-- `executable_sha256`;
-- `toolchain`: closed object with exact strings `solana_cli`, `cargo_build_sbf`, `platform_tools`, and `anchor_crates`.
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | `faultline.build.v1` |
+| `canonicalization` | string | `faultline.canonical-json.v1` |
+| `program` | string | `faultline_treasury` |
+| `program_id` | string | canonical treasury public key |
+| `build` | string enum | `v2` or `v3` |
+| `cargo_features` | array of strings | exactly one element, equal to `build` |
+| `artifact_path` | string | normalized repository-relative path |
+| `executable_sha256` | string | SHA-256 hex |
+| `toolchain` | object | closed toolchain object below |
+
+The closed `toolchain` object has exactly four required string keys: `solana_cli` = `solana-cli 1.18.10 (src:a093e239; feat:3469865029, client:Agave)`, `cargo_build_sbf` = `solana-cargo-build-sbf 1.18.10`, `platform_tools` = `v1.41`, and `anchor_crates` = `0.30.1`.
 
 Absolute paths, `.` or `..` segments, drive prefixes, UNC paths, alternate data streams, and backslashes are invalid.
 
 ### 7.3 `faultline.runner.v1`
 
-Required fields:
+The closed runner manifest has exactly these required keys:
 
-- common manifest fields;
-- `engine`: `litesvm`;
-- `engine_version`: `0.1.0`;
-- `engine_source_commit`: `5cda1d2dcfae16714a6ff808b58f0c087b21bd42`;
-- `solana_runtime`: `1.18.22`;
-- `feature_set`: `litesvm-0.1.0-all-enabled`;
-- `sigverify`: `true`;
-- `clock_mode`: `fixture`;
-- `recent_blockhash_mode`: `runner-deterministic`;
-- `token_program`: Tokenkeg public key;
-- `token_program_bundle`: `spl-token-3.5.0`;
-- `allowed_external_programs`: duplicate-free ordered public-key array;
-- `limits`: closed object containing numeric `max_transactions` = 32, `max_instructions_per_transaction` = 16, `max_accounts_per_instruction` = 64, `max_instruction_data_bytes` = 10240, `max_compute_units_per_transaction` = 1400000, `max_manifest_bytes` = 1048576, `max_trace_bytes` = 2097152, `max_fixture_bytes` = 10485760, and `max_output_bytes` = 8388608.
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | `faultline.runner.v1` |
+| `canonicalization` | string | `faultline.canonical-json.v1` |
+| `engine` | string | `litesvm` |
+| `engine_version` | string | `0.1.0` |
+| `engine_source_commit` | string | `5cda1d2dcfae16714a6ff808b58f0c087b21bd42` |
+| `solana_runtime` | string | `1.18.22` |
+| `feature_set` | string | `litesvm-0.1.0-all-enabled` |
+| `sigverify` | Boolean | `true` |
+| `clock_mode` | string | `fixture` |
+| `recent_blockhash_mode` | string | `runner-deterministic` |
+| `token_program` | string | canonical Tokenkeg public key |
+| `token_program_bundle` | string | `spl-token-3.5.0` |
+| `allowed_external_programs` | array of public-key strings | exactly one element, Tokenkeg; unique and canonically ordered |
+| `limits` | object | closed limits object below |
+
+The closed `limits` object contains exactly nine required JSON integer fields, each fixed to the shown value: `max_transactions` = 32, `max_instructions_per_transaction` = 16, `max_accounts_per_instruction` = 64, `max_instruction_data_bytes` = 10240, `max_compute_units_per_transaction` = 1400000, `max_manifest_bytes` = 1048576, `max_trace_bytes` = 2097152, `max_fixture_bytes` = 10485760, and `max_output_bytes` = 8388608. Each value is within `u32` and uses a JSON numeric token.
 
 ### 7.4 `faultline.fixture.v1`
 
-Required fields:
+The closed fixture manifest has exactly these required keys:
 
-- common manifest fields;
-- `fixture_id`: `treasury-v1`;
-- `base_slot`: canonical `u64` decimal string;
-- `clock`: closed object with canonical `slot` and signed `unix_timestamp` decimal strings;
-- `programs`: duplicate-free ordered array of closed tagged objects. A `candidate` entry contains `kind`, `alias`, `program_id`, `executable_sha256`, and `build_manifest_hash`. A `bundled` entry contains `kind`, `alias`, `program_id`, `bundle_name`, and `executable_sha256`; Tokenkeg is the fixed bundled entry;
-- `accounts`: duplicate-free ordered array of closed objects containing `alias`, `pubkey`, `owner`, `lamports` as a `u64` decimal string, `executable`, `rent_epoch` as a `u64` decimal string, and `data_base64`;
-- `signers`: duplicate-free ordered array of closed objects containing `alias` and public key only;
-- `setup_transactions`: an ordered array in normalized trace-transaction form;
-- `initial_state`: closed object containing `original_admin`, `treasury_state`, `treasury_vault`, `attacker_token_account`, `payment_mint`, `mint_decimals`, `treasury_vault_base_units`, and `attacker_base_units`.
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | `faultline.fixture.v1` |
+| `canonicalization` | string | `faultline.canonical-json.v1` |
+| `fixture_id` | string | `treasury-v1` |
+| `base_slot` | string | canonical `u64` decimal string |
+| `clock` | object | closed clock object |
+| `programs` | array | exactly two closed tagged entries, canonically ordered by `alias` |
+| `accounts` | array | 1–64 closed account entries, unique and canonically ordered by `alias` |
+| `signers` | array | 1–64 closed signer entries, unique and canonically ordered by `alias` |
+| `setup_transactions` | array | 0–32 raw transactions in execution order |
+| `initial_state` | object | closed initial-state object |
 
-Private key bytes are never present in the fixture manifest. Deterministic test keypairs are derived in the trusted coordinator from a test-only seed domain and are not accepted from evidence.
+The closed `clock` object has exactly `slot`, a canonical `u64` decimal string equal to `base_slot`, and `unix_timestamp`, a canonical signed `i64` decimal string.
+
+The fixture is candidate-independent. Its `programs` array contains exactly:
+
+- one closed target entry with `kind` = `target`, `alias` = `faultline_treasury`, and `program_id` = the canonical treasury public key; and
+- one closed bundled entry with `kind` = `bundled`, `alias` = `spl_token`, `program_id` = the canonical Tokenkeg public key, `bundle_name` = `spl-token-3.5.0`, and `executable_sha256` = the SHA-256 of the bundled executable.
+
+The target entry contains no executable hash or build-manifest hash. `candidate_executable_sha256` and `build_manifest_hash` exist only in `faultline.replay-job.v1`; selecting v2 versus v3 therefore changes the replay-job hash but not the fixture hash. Bundled external programs remain independently hash-bound by the fixture.
+
+Each closed `accounts` entry has exactly these required fields: `alias` (nonempty string), `pubkey` (canonical public key), `owner` (canonical public key), `lamports` (canonical `u64` decimal string), `executable` (Boolean), `rent_epoch` (canonical `u64` decimal string), and `data_base64` (canonical RFC 4648 standard-alphabet padded Base64 string). Account-array order is canonical alias order; aliases and public keys are each unique.
+
+Each closed `signers` entry has exactly `alias` (nonempty string) and `pubkey` (canonical public key). Signer-array order is canonical alias order; aliases and public keys are each unique. Private key bytes are never present in the fixture manifest. Deterministic test keypairs are derived in the trusted coordinator from a test-only seed domain and are not accepted from evidence.
+
+The closed `initial_state` object has exactly these required fields:
+
+| Key | JSON type | Constraint |
+| --- | --- | --- |
+| `original_admin` | string | canonical public key |
+| `treasury_state` | string | canonical public key |
+| `treasury_vault` | string | canonical public key |
+| `attacker_token_account` | string | canonical public key |
+| `payment_mint` | string | canonical public key |
+| `mint_decimals` | JSON integer | `0..=255` (`u8`) |
+| `treasury_vault_base_units` | string | canonical `u64` decimal string |
+| `attacker_base_units` | string | canonical `u64` decimal string |
+
+Missing, duplicate, or unknown `initial_state` fields are invalid.
+
+#### 7.4.1 Shared raw transaction input
+
+`faultline.trace.v1.transactions` and `faultline.fixture.v1.setup_transactions` use this same raw, closed input structure. These bytes are the pre-normalization input. Alias resolution, account-meta resolution, and runtime normalization remain Checkpoint 2 work.
+
+Each raw transaction has exactly these required keys:
+
+| Key | JSON type | Constraint |
+| --- | --- | --- |
+| `step` | JSON integer | `u32` in `1..=32`; steps in each containing array are contiguous from 1 |
+| `label` | string | nonempty descriptive label |
+| `recent_blockhash_mode` | string | `runner` |
+| `signer_aliases` | array of strings | 0–64 unique aliases in canonical alias order |
+| `instructions` | array | 1–16 closed instructions in execution order |
+
+Each closed instruction has required `program_id_ref` (string exactly `programs.<alias>`, where `<alias>` is a declared fixture program alias), `instruction` (nonempty instruction label), `data_base64` (canonical padded Base64 decoding to at most 10,240 bytes), and `accounts` (1–64 closed account entries in account-meta order). It may additionally contain optional `amount_base_units`, a canonical `u64` decimal string. No other instruction field is allowed.
+
+Each closed instruction account has required `ref` (nonempty string referencing one declared fixture account, signer, or program), `is_signer` (Boolean), and `is_writable` (Boolean). It may additionally contain optional `role` (nonempty descriptive string). No other account field is allowed. Repeated `ref` values are permitted because the tracked canonical trace deliberately passes the attacker account in two roles; array position and flags remain binding.
 
 ### 7.5 `faultline.invariant.v1`
 
-The tracked `policies/invariants/AUTH-001.json` is the semantic baseline. Implementation copies its semantics into `manifests/auth-001-invariant.json`, adds the common canonicalization field, and does not rewrite the tracked policy. Required fields are the resulting closed fields:
+The tracked `policies/invariants/AUTH-001.json` is the semantic baseline. `manifests/auth-001-invariant.json` adds only the required common `canonicalization` field and preserves these exact closed fields and values:
 
-- common manifest fields;
-- `invariant_id`: `AUTH-001`;
-- numeric `version`: 1;
-- `name`, `statement`, and `semantic_rule`;
-- `machine_evaluator`: closed object with `type` = `unauthorized_token_outflow_v1` and numeric `version` = 1;
-- typed treasury, admin-authority, allowed-operation, selector, relation, supported-trace-schema, and limit fields matching the tracked policy.
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | `faultline.invariant.v1` |
+| `canonicalization` | string | `faultline.canonical-json.v1` |
+| `invariant_id` | string | `AUTH-001` |
+| `version` | JSON integer | `1` |
+| `name` | string | `Unauthorized treasury token outflow is forbidden` |
+| `statement` | string | `A non-admin signer must never cause the tracked treasury token balance to decrease.` |
+| `machine_evaluator` | object | closed object below |
+| `tracked_treasury_account` | object | closed object below |
+| `admin_authority_source` | object | closed object below |
+| `allowed_outflow_conditions` | array | exactly two closed objects in the order shown below |
+| `pre_state_selector` | string | `treasury_vault.token_balance` |
+| `post_state_selector` | string | `treasury_vault.token_balance` |
+| `violation_relation` | string | `if_no_valid_original_admin_authorization_then_post_balance_must_be_greater_than_or_equal_to_pre_balance` |
+| `semantic_rule` | string | `Let original_admin be TreasuryState.admin in the captured pre-state. If no transaction in the trace contains a valid authorization from original_admin for the relevant migration or withdrawal operation, then post_treasury_vault_balance >= pre_treasury_vault_balance. A trace cannot satisfy authorization by first corrupting TreasuryState.admin.` |
+| `supported_trace_schema` | string | `faultline.trace.v1` |
+| `limits` | object | closed object below |
+| `limitations` | array of strings | exactly the three tracked entries in tracked order |
 
-Human-readable `limitations` are bound by the manifest hash but cannot change evaluator behavior.
+The closed `machine_evaluator` object is exactly `{ "type": "unauthorized_token_outflow_v1", "version": 1 }`. The closed `tracked_treasury_account` object has `fixture_account_ref` = `treasury_pda`, `state_account_type` = `TreasuryState`, and `vault_field` = `vault_token_account`. The closed `admin_authority_source` object has `kind` = `pre_state_treasury_admin` and `field` = `TreasuryState.admin`.
+
+The two closed `allowed_outflow_conditions` objects each have exactly `operation` (string enum), `required_authority` = `original_admin`, and `required_signature` = `true`. Their execution-independent canonical order is: first `operation` = `admin_withdraw`, then `operation` = `migrate_authority`. Duplicate operations are invalid.
+
+The closed invariant `limits` object is exactly: `max_transactions` as JSON integer 32, `token_program` = `spl-token-v3-tokenkeg`, and `amount_encoding` = `u64_base_units`.
+
+The three required `limitations` strings, in order, are: `Milestone 2 defines the evaluator contract and canonical policy but does not implement the verifier quorum or generic replay daemon.`; `Only the configured fixture treasury and Tokenkeg mint are in scope.`; and `Token-2022 extensions, transfer fees, confidential balances, rebasing assets, and oracle-dependent policies are out of scope.` Reordering, omitting, adding, or duplicating an entry changes or invalidates the invariant manifest.
+
+`name`, `statement`, `semantic_rule`, and `limitations` are hash-bound. Only `machine_evaluator`, `tracked_treasury_account`, `admin_authority_source`, `allowed_outflow_conditions`, the selector/relation fields, `supported_trace_schema`, and `limits` are evaluator configuration. Descriptive fields cannot independently alter evaluator behavior.
 
 ### 7.6 `faultline.trace.v1`
 
-The tracked exploit trace is the compatibility baseline. The closed schema requires:
+The tracked exploit trace is the compatibility baseline. The closed trace has exactly these required keys:
 
-- `schema`, `trace_id`, `invariant_id`, `target_version`, and `fixture`;
-- `canonicalization`: closed object describing UTF-8, canonical JSON, and instruction encoding;
-- duplicate-free `signer_aliases`;
-- closed `pre_state_selectors`;
-- ordered `transactions`, each with numeric sequential `step`, `label`, `recent_blockhash_mode` = `runner`, duplicate-free signer aliases, and 1–16 instructions;
-- each instruction has exactly one declared `program_id_ref`, an instruction label, canonical base64 data, optional canonical amount string, and 1–64 ordered closed account entries;
-- each account entry has one declared fixture `ref`, optional role, and exact Boolean signer/writable flags;
-- `expected_violation` and `safety_notes` as test metadata.
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | `faultline.trace.v1` |
+| `trace_id` | string | `auth-001-v2-authority-takeover` |
+| `invariant_id` | string | `AUTH-001` |
+| `target_version` | string | `v2`; this identifies the trace's discovery target and does not select the replay candidate |
+| `fixture` | string | `treasury-v1` |
+| `canonicalization` | object | closed trace-canonicalization object |
+| `signer_aliases` | array of strings | 1–64 unique aliases in canonical alias order |
+| `pre_state_selectors` | object | exact closed selector object below |
+| `transactions` | array | 1–32 shared raw transactions in execution order |
+| `expected_violation` | object | exact closed metadata object below |
+| `safety_notes` | array of strings | 1–32 descriptive entries; input order preserved |
 
-`expected_violation` and `safety_notes` are hashed but removed from normalized evaluator input. Changing them cannot alter the evaluator result.
+The closed trace `canonicalization` object has exactly `encoding` = `utf8`, `json` = `sorted_keys_no_insignificant_whitespace_for_hashing`, and `instruction_data` = `anchor_discriminator_plus_borsh_args_base64`.
+
+The closed `pre_state_selectors` object has exactly these required string fields and values: `original_admin` = `treasury_state.admin`, `treasury_vault_balance` = `treasury_vault.token_balance`, and `attacker_balance` = `attacker_token_account.token_balance`. These three field names are the selector IDs used in receipt state-hash arrays.
+
+The closed `expected_violation` object has exactly these required fields: `selector` = `treasury_vault.token_balance`; `relation` = `post_gte_pre_for_non_admin`; and `pre_balance_base_units`, `post_balance_after_v2_base_units`, and `attacker_post_balance_after_v2_base_units`, each a canonical `u64` decimal string.
+
+`expected_violation` and `safety_notes` are descriptive test metadata. They are included in canonical trace bytes and the trace hash, but are removed before runtime normalization and are not evaluator input. No metadata field becomes evaluator input unless this specification explicitly identifies it as such.
 
 ### 7.7 `faultline.replay-job.v1`
 
-The closed replay-job object requires:
+The closed replay job has exactly these required keys:
 
-- `schema` and `canonicalization`;
-- `verification_round`, `proposal`, `invariant_account`, and `trace_claim` public keys;
-- `candidate_buffer_hash` and `invariant_specification_hash` copied from the frozen round binding;
-- `build_manifest_hash`, `runner_manifest_hash`, `fixture_manifest_hash`, `invariant_manifest_hash`, and `trace_hash`;
-- `target_program_id` and `candidate_executable_sha256`; and
-- `expected_invariant_id`: `AUTH-001`.
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | `faultline.replay-job.v1` |
+| `canonicalization` | string | `faultline.canonical-json.v1` |
+| `verification_round` | string | canonical public key |
+| `proposal` | string | canonical public key |
+| `invariant_account` | string | canonical public key |
+| `trace_claim` | string | canonical public key |
+| `candidate_buffer_hash` | string | SHA-256 hex copied from the frozen round binding |
+| `invariant_specification_hash` | string | SHA-256 hex copied from the frozen round binding |
+| `build_manifest_hash` | string | SHA-256 hex |
+| `runner_manifest_hash` | string | SHA-256 hex |
+| `fixture_manifest_hash` | string | SHA-256 hex |
+| `invariant_manifest_hash` | string | SHA-256 hex |
+| `trace_hash` | string | SHA-256 hex |
+| `target_program_id` | string | canonical treasury public key |
+| `candidate_executable_sha256` | string | SHA-256 hex matching the selected build manifest |
+| `expected_invariant_id` | string | `AUTH-001` |
 
 Verifier identity, worker ordinal, host path, wall-clock time, and coordinator nonce are excluded so all workers share one job hash.
 
 ### 7.8 `faultline.replay-receipt.v1`
 
-The closed receipt requires:
+The closed receipt has exactly these required keys:
 
-- `schema` and `canonicalization`;
-- `replay_job_hash`;
-- all five manifest/trace hashes from the replay job;
-- `candidate_executable_sha256`;
-- `engine`, `engine_version`, `engine_source_commit`, `solana_runtime`, and `feature_set`;
-- `transactions`: ordered closed results containing numeric index, `status` (`success` or `error`), stable runtime error code or `null`, numeric compute units, return-data hash or `null`, and log hash;
-- `pre_state_hashes` and `post_state_hashes`: closed objects keyed by the frozen selectors;
-- `normalized_logs_sha256`;
-- `classification` and numeric stable `result_code`; and
-- `total_compute_units` as a canonical `u64` decimal string.
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | `faultline.replay-receipt.v1` |
+| `canonicalization` | string | `faultline.canonical-json.v1` |
+| `replay_job_hash` | string | SHA-256 hex |
+| `build_manifest_hash` | string | SHA-256 hex copied from the job |
+| `runner_manifest_hash` | string | SHA-256 hex copied from the job |
+| `fixture_manifest_hash` | string | SHA-256 hex copied from the job |
+| `invariant_manifest_hash` | string | SHA-256 hex copied from the job |
+| `trace_hash` | string | SHA-256 hex copied from the job |
+| `candidate_executable_sha256` | string | SHA-256 hex copied from the job |
+| `engine` | string | `litesvm` |
+| `engine_version` | string | `0.1.0` |
+| `engine_source_commit` | string | `5cda1d2dcfae16714a6ff808b58f0c087b21bd42` |
+| `solana_runtime` | string | `1.18.22` |
+| `feature_set` | string | `litesvm-0.1.0-all-enabled` |
+| `transactions` | array | 1–32 closed results in execution order |
+| `pre_state_hashes` | array | exact selector set in canonical selector order |
+| `post_state_hashes` | array | exact selector set in canonical selector order |
+| `normalized_logs_sha256` | string | SHA-256 hex |
+| `classification` | string enum | `Preserved` or `Violated` |
+| `result_code` | JSON integer | `0` for `Preserved`, `1` for `Violated`; `u32` |
+| `total_compute_units` | string | canonical `u64` decimal string |
+
+Each closed transaction result has exactly `index` (JSON integer `u16`, contiguous from 0 in array order), `status` (`success` or `error`), `error` (nullable stable runtime error object below), `compute_units` (JSON integer `u32` in `0..=1400000`), `return_data_sha256` (SHA-256 hex string or JSON `null`), and `logs_sha256` (SHA-256 hex). `status = success` requires `error = null`; `status = error` requires a non-null error object. JSON `null` is permitted only for these two explicitly nullable fields.
+
+Each state-hash array element is a closed object with exactly `selector_id` (string referencing one declared `pre_state_selectors` field name) and `sha256` (SHA-256 hex). Both `pre_state_hashes` and `post_state_hashes` contain exactly the three unique selector IDs `attacker_balance`, `original_admin`, and `treasury_vault_balance` in that canonical UTF-8 order. Missing, additional, duplicate, or out-of-order selector IDs are invalid.
+
+#### 7.8.1 Stable Solana instruction errors
+
+Transaction failure `error` is either JSON `null` or a closed object with exactly `instruction_index`, `kind`, and `code`:
+
+- `instruction_index` is a JSON integer representable as `u16`;
+- for `kind` = `custom`, `code` is a JSON integer representable as `u32`; and
+- for `kind` = `builtin`, `code` is one of the exact symbolic strings in the table below.
+
+The table is authoritative for Solana `1.18.22`: it is derived directly from `solana_program::instruction::InstructionError`. Exact Rust variant identifiers are used as the wire symbols so debug/display text is never serialized. `Custom(u32)` maps to `kind = custom` and its numeric payload. `BorshIoError(String)` maps to `kind = builtin`, `code = BorshIoError`; its unstable string payload is deliberately discarded.
+
+| Supported builtin `code` symbols | | |
+| --- | --- | --- |
+| `GenericError` | `InvalidArgument` | `InvalidInstructionData` |
+| `InvalidAccountData` | `AccountDataTooSmall` | `InsufficientFunds` |
+| `IncorrectProgramId` | `MissingRequiredSignature` | `AccountAlreadyInitialized` |
+| `UninitializedAccount` | `UnbalancedInstruction` | `ModifiedProgramId` |
+| `ExternalAccountLamportSpend` | `ExternalAccountDataModified` | `ReadonlyLamportChange` |
+| `ReadonlyDataModified` | `DuplicateAccountIndex` | `ExecutableModified` |
+| `RentEpochModified` | `NotEnoughAccountKeys` | `AccountDataSizeChanged` |
+| `AccountNotExecutable` | `AccountBorrowFailed` | `AccountBorrowOutstanding` |
+| `DuplicateAccountOutOfSync` | `InvalidError` | `ExecutableDataModified` |
+| `ExecutableLamportChange` | `ExecutableAccountNotRentExempt` | `UnsupportedProgramId` |
+| `CallDepth` | `MissingAccount` | `ReentrancyNotAllowed` |
+| `MaxSeedLengthExceeded` | `InvalidSeeds` | `InvalidRealloc` |
+| `ComputationalBudgetExceeded` | `PrivilegeEscalation` | `ProgramEnvironmentSetupFailure` |
+| `ProgramFailedToComplete` | `ProgramFailedToCompile` | `Immutable` |
+| `IncorrectAuthority` | `BorshIoError` | `AccountNotRentExempt` |
+| `InvalidAccountOwner` | `ArithmeticOverflow` | `UnsupportedSysvar` |
+| `IllegalOwner` | `MaxAccountsDataAllocationsExceeded` | `MaxAccountsExceeded` |
+| `MaxInstructionTraceLengthExceeded` | `BuiltinProgramsMustConsumeComputeUnits` | |
 
 Worker identity, process ID, host timing, memory use, and signature are excluded from the receipt.
 
 ### 7.9 `faultline.worker-output.v1`
 
-The closed unsigned worker output requires:
+This schema is the unsigned canonical payload. Checkpoint 1 implements and validates only this format. It has these required keys plus the conditionally present eligible-result keys:
 
-- `schema` and `canonicalization`;
-- `coordinator_nonce`: exactly 64 lowercase hexadecimal characters encoding 32 bytes supplied uniquely for the worker launch;
-- numeric `worker_ordinal`: 0, 1, or 2;
-- `verifier_pubkey`;
-- `replay_job_hash`;
-- `classification` and numeric stable code;
-- `receipt_hash`, `verdict_u8`, and `replay_result_commitment`, present only for eligible results;
-- `attestation_intent`, present only for eligible results, containing `verification_round`, `proposal`, `invariant_account`, `trace_claim`, `verifier_pubkey`, `verdict_u8`, `receipt_hash`, and `replay_result_commitment`;
-- diagnostic `process_peak_memory_bytes` and `elapsed_milliseconds` as canonical `u64` decimal strings; and
-- `signature_algorithm`: `solana-ed25519-sha256-v1`.
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | `faultline.worker-output.v1` |
+| `canonicalization` | string | `faultline.canonical-json.v1` |
+| `coordinator_nonce` | string | exactly 64 lowercase hexadecimal characters |
+| `worker_ordinal` | JSON integer | `0`, `1`, or `2` |
+| `verifier_pubkey` | string | canonical public key |
+| `replay_job_hash` | string | SHA-256 hex |
+| `classification` | string enum | `Preserved`, `Violated`, `InvalidEvidence`, `UnsupportedEnvironment`, or `RunnerFault` |
+| `result_code` | JSON integer | one `u32` code permitted for the classification by Section 9 |
+| `receipt_hash` | string | required only for eligible results; otherwise absent |
+| `verdict_u8` | JSON integer | required only for eligible results: 0 for `Preserved`, 1 for `Violated`; otherwise absent |
+| `replay_result_commitment` | string | SHA-256 hex required only for eligible results; otherwise absent |
+| `attestation_intent` | object | required only for eligible results; otherwise absent |
+| `process_peak_memory_bytes` | string | canonical `u64` decimal string |
+| `elapsed_milliseconds` | string | canonical `u64` decimal string |
 
-The serialized signed form adds exactly one `signature` field. The signature field is absent from the signed bytes.
+The closed `attestation_intent` object has exactly these required fields: `verification_round`, `proposal`, `invariant_account`, `trace_claim`, and `verifier_pubkey` as canonical public keys; `verdict_u8` as JSON integer 0 or 1 matching the output; and `receipt_hash` and `replay_result_commitment` as SHA-256 hex matching the output. Its verifier public key must equal the enclosing output's `verifier_pubkey`.
+
+`Preserved` requires result code `0`; `Violated` requires `1`. `InvalidEvidence` permits only `0x00010001..=0x00010009`; `UnsupportedEnvironment` permits only `0x00020001..=0x00020005`; and `RunnerFault` permits only `0x00030001..=0x00030007`. Only `Preserved` and `Violated` contain the four eligible-result fields. No unsigned payload contains a signature or signature-algorithm field.
+
+### 7.10 `faultline.signed-worker-output.v1`
+
+The signed form is a separate closed wrapper with exactly these required keys:
+
+| Key | JSON type | Required value or constraint |
+| --- | --- | --- |
+| `schema` | string | `faultline.signed-worker-output.v1` |
+| `canonicalization` | string | `faultline.canonical-json.v1` |
+| `output` | object | complete closed `faultline.worker-output.v1` unsigned payload |
+| `signature_algorithm` | string | `solana-ed25519-sha256-v1` |
+| `signer_pubkey` | string | canonical public key equal to `output.verifier_pubkey` |
+| `signature` | string | canonical Base58 encoding of exactly 64 signature bytes |
+
+The wrapper is not part of Checkpoint 1 implementation. Signed parsing, signature generation, and verification remain deferred to the receipt/signing and worker checkpoints. The signature preimage contains only canonical serialized `output`; no wrapper field is included.
 
 ---
 
@@ -425,7 +603,7 @@ replay_receipt_hash = SHA256(preimage)
 
 ### 8.5 Worker-output signature
 
-Each worker identity is a Solana Ed25519 keypair. The public identity is the same 32-byte public key form used by the existing verifier epoch. The worker signs exactly one 32-byte message digest:
+Each worker identity is a Solana Ed25519 keypair. The public identity is the same 32-byte public key form used by the existing verifier epoch. The worker signs exactly one 32-byte message digest. Here `unsigned_worker_output` is the complete `faultline.worker-output.v1` object stored in the signed wrapper's `output` field:
 
 ```text
 signature_preimage = ASCII("FAULTLINE_WORKER_OUTPUT_V1")
@@ -437,7 +615,7 @@ worker_message_digest = SHA256(signature_preimage)
 signature = ED25519_SIGN(verifier_secret_key, worker_message_digest)
 ```
 
-Verification decodes the declared Solana public key and 64-byte signature, recomputes the digest, and calls Ed25519 verification. The coordinator nonce and ordinal make copying or replaying another worker's signed output invalid for the current launch.
+The `faultline.signed-worker-output.v1` wrapper introduces no additional hash or signature domain. Its `schema`, `canonicalization`, `signature_algorithm`, `signer_pubkey`, and `signature` fields are excluded from the preimage. Verification requires `signer_pubkey = output.verifier_pubkey`, decodes that Solana public key and the 64-byte signature, recomputes the digest from canonical `output` alone, and calls Ed25519 verification. The coordinator nonce and ordinal make copying or replaying another worker's signed output invalid for the current launch.
 
 The signing key is passed to the worker through an inherited anonymous pipe. It is never placed in command-line arguments, environment variables, JSON input, logs, receipts, or repository files. Test identities are ephemeral and distinct. Persistent/on-chain verifier key management is Milestone 8 work.
 
