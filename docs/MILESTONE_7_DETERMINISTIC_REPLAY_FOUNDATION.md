@@ -781,13 +781,17 @@ Every Checkpoint 1 generated field has one authoritative source and one determin
 
 For Checkpoint 1 job, receipt, and worker schema vectors only, the following frozen raw 32-byte values and canonical Base58 encodings are used. They are test data, not protocol identities and not a new hash domain:
 
+> **Revision note — verifier signing-vector correction:** The original Checkpoint 1 worker vector treated raw public-key bytes `[0x15; 32]` as the verifier identity, producing `2RJD1KnDRGEkvuFfAGrJ7PD28LRE9LRDjZznDywagzmr`. No corresponding private seed was frozen, so that value cannot serve as the Checkpoint 3 signing identity and is retired from the worker vectors. The corrected deterministic identity uses the exact 32-byte Ed25519 seed `1515151515151515151515151515151515151515151515151515151515151515` (each byte is `0x15`) with Solana's standard seed-to-keypair derivation. Its derived raw public key is `d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da`, canonically encoded as `FMUEmtxhU46GzhKF4FW9MLJdQWiLgjiXP9TYRWSrqTpV`. This correction changes only the worker-output payloads and their Section 8.5 message digests; it changes no job, receipt, manifest, trace, artifact, or Milestone 5 vector.
+
 | Field | Raw bytes | Canonical Base58 |
 | --- | --- | --- |
 | `verification_round` | `0x11` repeated 32 times | `29d2S7vB453rNYFdR5Ycwt7y9haRT5fwVwL9zTmBhfV2` |
 | `proposal` | `0x12` repeated 32 times | `2DYKaRPBeNM5WdW8rNsYEktjPrnd89Mm4Lzp3qonSzoj` |
 | `invariant_account` | `0x13` repeated 32 times | `2HTciirCEfeJeikeHgCTXdfVe1zpoD3ackfU7DrPCL8S` |
 | `trace_claim` | `0x14` repeated 32 times | `2MNus2KCpxwXnp19iyXNpWSFtBD2UGjQBAL8AbtywfT9` |
-| `verifier_pubkey` | `0x15` repeated 32 times | `2RJD1KnDRGEkvuFfAGrJ7PD28LRE9LRDjZznDywagzmr` |
+| `verifier_pubkey` | `d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da` (derived from seed `[0x15; 32]`) | `FMUEmtxhU46GzhKF4FW9MLJdQWiLgjiXP9TYRWSrqTpV` |
+
+The corrected seed and keypair are public deterministic test-vector material only and must never be used as a production verifier identity. Production APIs require an externally supplied signer or keypair; production code contains no fallback or default test seed. The test seed may exist only in specification vectors, generator/test fixtures, or focused tests. No runtime worker may silently select this identity when no signer is supplied.
 
 The vector `coordinator_nonce` is `0x16` repeated 32 times and encoded as 64 lowercase hexadecimal characters. Any other placeholder SHA-256 field in a receipt or worker schema vector is `SHA256(ASCII("FAULTLINE_CP1_VECTOR_V1") || BYTE(0x00) || U16BE(byte_length(UTF8(field_path))) || UTF8(field_path))`, where `field_path` is its unique lowercase dotted JSON path recorded beside the vector constructor. This is only a reproducible source of syntactically valid vector data; production trust-path hashing still uses only Section 8. The replay-job vector's `candidate_buffer_hash` and `candidate_executable_sha256` are the selected real artifact hash, its `invariant_specification_hash` is SHA-256 of the exact tracked policy-file bytes (`b63f9fccb4731d21ea15c254634ba9f569ed3ff305e6e5c16bfab3dfc53dec7c`), and all five manifest/trace bindings are their actual Section 8 hashes rather than placeholders.
 

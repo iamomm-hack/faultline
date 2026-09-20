@@ -5,6 +5,7 @@ use std::{
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+use solana_sdk::signature::{keypair_from_seed, Signer};
 
 use crate::{
     canonical,
@@ -18,6 +19,7 @@ const V3_HASH: &str = "8ef2ad4bd0b7bf799ebe82ce17984b8ec80d55b47bd5ea5b9ec6aa304
 const POLICY_HASH: &str = "b63f9fccb4731d21ea15c254634ba9f569ed3ff305e6e5c16bfab3dfc53dec7c";
 const TOKEN_HASH: &str = "18264f491c7e0ad056dd36f42f8de6d1fedf9f044d1f521e714b4dc6b61594b6";
 const LITESVM_CRATE_HASH: &str = "0963e4df461a414763f0348b73eb284a734534a53558fcae35f984a0c16a6e6c";
+const WORKER_VECTOR_SEED: [u8; 32] = [0x15; 32];
 
 #[derive(Debug, Serialize)]
 pub struct GenerationReport {
@@ -480,7 +482,15 @@ fn worker(job: &ReplayJob, job_hash: &str, receipt_hash: &str) -> Result<WorkerO
         &hex_bytes(receipt_hash)?,
     );
     let commitment = hex(&commitment);
-    let verifier = "2RJD1KnDRGEkvuFfAGrJ7PD28LRE9LRDjZznDywagzmr".to_string();
+    let verifier = keypair_from_seed(&WORKER_VECTOR_SEED)
+        .map_err(|error| Error::Validation(format!("worker vector key derivation: {error}")))?
+        .pubkey()
+        .to_string();
+    if verifier != "FMUEmtxhU46GzhKF4FW9MLJdQWiLgjiXP9TYRWSrqTpV" {
+        return Err(Error::Validation(
+            "worker vector public-key derivation mismatch".into(),
+        ));
+    }
     Ok(WorkerOutput {
         schema: "faultline.worker-output.v1".into(),
         canonicalization: CANONICALIZATION.into(),

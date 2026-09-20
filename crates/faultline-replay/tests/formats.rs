@@ -6,6 +6,7 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use faultline_replay::{canonical, generator, hash, schema::*};
 use serde_json::{json, Value};
+use solana_sdk::signature::{keypair_from_seed, Signer};
 
 const V2_MANIFEST: &str = "a213c958500d3a70c2728c0e338c8d107e1fd60ce6f710a8e239ed758de20446";
 const V3_MANIFEST: &str = "2aee101be039a43d5e627ced1bac08c6d198d44d4bc79aab79382b94e131d002";
@@ -22,9 +23,22 @@ const RECEIPT_HASHES: [&str; 2] = [
     "f0325d9d847009900492f89831efc80fdad67fb189b6da1bba4b7984c8613eff",
 ];
 const WORKER_DIGESTS: [&str; 2] = [
-    "3d6a55952102f1323e5cb8aa1442bb057150dad44e8d02f9bdaa7d2352dcfa2a",
-    "3e873f206c9ed9db04da8551cb981ce1c27998b927f4ea842ce61bcd7907cd9e",
+    "7aa1497bf5b22a4e0d509e06f94dcba16a0f89780c7830021d5c703da9e37095",
+    "181fae409bc55b721152b2f1221e6536fd717eb3e8d0d23e7d7eaf89c420f9ad",
 ];
+
+#[test]
+fn checkpoint_1_worker_vector_identity_derives_from_frozen_seed() {
+    let keypair = keypair_from_seed(&[0x15; 32]).unwrap();
+    assert_eq!(
+        hash::hex(&keypair.pubkey().to_bytes()),
+        "d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da"
+    );
+    assert_eq!(
+        keypair.pubkey().to_string(),
+        "FMUEmtxhU46GzhKF4FW9MLJdQWiLgjiXP9TYRWSrqTpV"
+    );
+}
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
