@@ -41,6 +41,14 @@ pub struct ReplayTransactionEvidence {
     pub compute_units: u64,
     pub logs: Vec<String>,
     pub logs_sha256: String,
+    pub return_data: Option<ReplayReturnData>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayReturnData {
+    pub program_id: String,
+    pub data_base64: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +307,16 @@ fn transaction_result(
     let index = u16::try_from(index)
         .map_err(|_| Error::Validation("transaction index exceeds u16".into()))?;
     let logs_bytes = canonical::serialize_typed(&metadata.logs)?;
+    let return_data = if metadata.return_data.program_id == Pubkey::default()
+        && metadata.return_data.data.is_empty()
+    {
+        None
+    } else {
+        Some(ReplayReturnData {
+            program_id: metadata.return_data.program_id.to_string(),
+            data_base64: BASE64.encode(metadata.return_data.data),
+        })
+    };
     Ok(ReplayTransactionEvidence {
         index,
         status,
@@ -306,6 +324,7 @@ fn transaction_result(
         compute_units: metadata.compute_units_consumed,
         logs: metadata.logs,
         logs_sha256: digest(&logs_bytes),
+        return_data,
     })
 }
 

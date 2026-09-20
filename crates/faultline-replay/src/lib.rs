@@ -2,9 +2,11 @@ pub mod canonical;
 pub mod generator;
 pub mod hash;
 pub mod invariant;
+pub mod receipt;
 pub mod runner;
 pub mod schema;
 pub mod trace;
+pub mod worker;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

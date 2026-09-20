@@ -948,7 +948,7 @@ impl Validate for StableRuntimeError {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransactionResult {
     pub index: u16,
@@ -959,14 +959,14 @@ pub struct TransactionResult {
     pub logs_sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateHash {
     pub selector_id: String,
     pub sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplayReceipt {
     pub schema: String,
@@ -1053,7 +1053,7 @@ impl Validate for ReplayReceipt {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttestationIntent {
     pub verification_round: String,
@@ -1066,7 +1066,7 @@ pub struct AttestationIntent {
     pub replay_result_commitment: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerOutput {
     pub schema: String,
@@ -1154,6 +1154,45 @@ impl Validate for WorkerOutput {
                     return invalid("ineligible worker fields");
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedWorkerOutput {
+    pub schema: String,
+    pub canonicalization: String,
+    pub output: WorkerOutput,
+    pub signature_algorithm: String,
+    pub signer_pubkey: String,
+    pub signature: String,
+}
+
+impl Validate for SignedWorkerOutput {
+    fn validate(&self) -> Result<()> {
+        exact(
+            &self.schema,
+            "faultline.signed-worker-output.v1",
+            "signed worker.schema",
+        )?;
+        common(&self.canonicalization)?;
+        self.output.validate()?;
+        exact(
+            &self.signature_algorithm,
+            "solana-ed25519-sha256-v1",
+            "signed worker.signature_algorithm",
+        )?;
+        public_key(&self.signer_pubkey)?;
+        if self.signer_pubkey != self.output.verifier_pubkey {
+            return invalid("signed worker signer binding");
+        }
+        let decoded = bs58::decode(&self.signature)
+            .into_vec()
+            .map_err(|_| Error::Validation("invalid Base58 signature".into()))?;
+        if decoded.len() != 64 || bs58::encode(&decoded).into_string() != self.signature {
+            return invalid("noncanonical signature");
         }
         Ok(())
     }
