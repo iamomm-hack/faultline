@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('policy-funding', 'stakes-withdrawal', 'bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')]
+  [ValidateSet('policy-funding', 'stakes-withdrawal', 'bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing', 'pending-refund', 'paid-refund', 'revealed-unopened')]
   [string]$Shard
 )
 
@@ -92,6 +92,18 @@ function Invoke-OwnedProcess {
       if ($ValidatorProcess.HasExited) {
         Stop-Process -Id $process.Id -Force
         $process.WaitForExit()
+        Set-Content -LiteralPath $ProcessStdout -Value $stdoutTask.Result
+        Set-Content -LiteralPath $ProcessStderr -Value $stderrTask.Result
+        $diagnostic = @(
+          "DIAGNOSTIC stage=$Stage command=$command elapsed_ms=$($watch.ElapsedMilliseconds) owned_pid=$($process.Id) exit_code=validator-exited $(Get-SlotEvidence)",
+          '--- process stdout tail ---', (Get-LogTail $ProcessStdout),
+          '--- process stderr tail ---', (Get-LogTail $ProcessStderr),
+          '--- validator stdout tail ---', (Get-LogTail $ValidatorStdout),
+          '--- validator stderr tail ---', (Get-LogTail $ValidatorStderr),
+          '--- end diagnostic ---'
+        ) -join [Environment]::NewLine
+        Write-Output $diagnostic
+        Add-Content -LiteralPath $Evidence -Value $diagnostic
         throw "$Stage lost owned validator PID $($ValidatorProcess.Id); terminated owned PID $($process.Id)"
       }
       if ($watch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
@@ -164,7 +176,7 @@ foreach ($currentShard in $shards) {
     Remove-Item -LiteralPath $ledger -Recurse -Force
   }
   New-Item -ItemType Directory -Path $ledger | Out-Null
-  $phase = if ($currentShard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } else { 'A' }
+  $phase = if ($currentShard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($currentShard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
   Set-Content -LiteralPath $evidence -Value "Milestone 6 Phase $phase shard=$currentShard"
   try {
     $flags = '--reset --rpc-port 8899 --faucet-port 9900 --ticks-per-slot 1024 --log'
@@ -216,7 +228,7 @@ foreach ($currentShard in $shards) {
     ) -TimeoutSeconds 2400 -ProcessStdout (Join-Path $localRoot "economic-settlement-$currentShard.test.stdout.log") -ProcessStderr (Join-Path $localRoot "economic-settlement-$currentShard.test.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
     $finalConfirmedSlot = Get-ValidatorSlot 'confirmed'
     $finalFinalizedSlot = Get-ValidatorSlot 'finalized'
-    if ($phase -eq 'B' -and [int]$finalConfirmedSlot -ge 90) { throw "Phase B shard $currentShard exceeded confirmed-slot budget: $finalConfirmedSlot" }
+    if ($phase -in @('B', 'C') -and [int]$finalConfirmedSlot -ge 90) { throw "Phase $phase shard $currentShard exceeded confirmed-slot budget: $finalConfirmedSlot" }
     Write-Stage $evidence "SHARD COMPLETE name=$currentShard confirmed_final_slot=$finalConfirmedSlot finalized_final_slot=$finalFinalizedSlot"
   } finally {
     Remove-Item Env:FAULTLINE_ECONOMIC_GENESIS -ErrorAction SilentlyContinue
@@ -241,7 +253,7 @@ foreach ($currentShard in $shards) {
 }
 
 if ($Shard) {
-  $reportedPhase = if ($Shard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } else { 'A' }
+  $reportedPhase = if ($Shard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($Shard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
   Write-Output "MILESTONE-6 PHASE-$reportedPhase SHARD PASSED: $Shard"
 } else {
   Write-Output 'MILESTONE-6 PHASE-B ASSERTIONS 61-104 PASSED'

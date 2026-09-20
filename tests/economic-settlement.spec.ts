@@ -1,4 +1,4 @@
-/* Milestone 6 dedicated fresh-ledger validation, Phase A and B assertions. */
+/* Milestone 6 dedicated fresh-ledger validation, Phase A, B and C assertions. */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync } from "node:fs";
@@ -15,7 +15,7 @@ import {
   tokenAmount
 } from "../scripts/lib/spl-token-lite.js";
 
-type Shard = "policy-funding" | "stakes-withdrawal" | "bonds-hold" | "violation-fees" | "bond-outcomes" | "objective-slashing";
+type Shard = "policy-funding" | "stakes-withdrawal" | "bonds-hold" | "violation-fees" | "bond-outcomes" | "objective-slashing" | "pending-refund" | "paid-refund" | "revealed-unopened";
 type PolicyParameters = {
   bounty: bigint; bond: bigint; fee: bigint; minimumStake: bigint; slash: bigint;
   maxChallenges: number; feeGrace: bigint; slashGrace: bigint; cooldown: bigint;
@@ -486,6 +486,28 @@ function claimFee(id: bigint, configId: bigint, epochId: bigint, round: PublicKe
   { pubkey: destination, isSigner: false, isWritable: true }, { pubkey: feeVaultAddress(proposalAddress(id)), isSigner: false, isWritable: true },
   { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
 ]); }
+function expireProposal(id: bigint): TransactionInstruction { return anchorInstruction(gate, "expire_proposal", [
+  { pubkey: payer.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false },
+  { pubkey: proposalAddress(id), isSigner: false, isWritable: true }
+]); }
+function recordDecision(id: bigint, state: 2 | 3, reasonCode: number): TransactionInstruction { const proposal = proposalAddress(id); const reason = Buffer.alloc(2); reason.writeUInt16LE(reasonCode); return anchorInstruction(gate, "record_temporary_decision", [
+  { pubkey: governance.publicKey, isSigner: true, isWritable: false }, { pubkey: policy, isSigner: false, isWritable: false },
+  { pubkey: proposal, isSigner: false, isWritable: true }, { pubkey: proposalGateAddress(proposal), isSigner: false, isWritable: false }
+], Buffer.concat([Buffer.from([state]), reason])); }
+function recordRejected(id: bigint): TransactionInstruction { return recordDecision(id, 3, 0x6001); }
+function refundEscrow(id: bigint, configId: bigint, caller = payer.publicKey, destination?: PublicKey, rentRecipient?: PublicKey): TransactionInstruction { const proposal = proposalAddress(id); return anchorInstruction(gate, "refund_proposal_escrow", [
+  { pubkey: caller, isSigner: true, isWritable: false }, ...settlementBase(id, configId),
+  { pubkey: destination ?? ataAddress(proposer.publicKey, configMint.get(economicPolicyAddress(configId).toBase58())!), isSigner: false, isWritable: true },
+  { pubkey: bountyVaultAddress(proposal), isSigner: false, isWritable: true }, { pubkey: feeVaultAddress(proposal), isSigner: false, isWritable: true },
+  { pubkey: penaltyVaultAddress(proposal), isSigner: false, isWritable: true }, { pubkey: rentRecipient ?? proposer.publicKey, isSigner: false, isWritable: true }
+]); }
+function settleRevealedUnopened(id: bigint, configId: bigint, who: PublicKey, commitment: Buffer, trace: Buffer, destination: PublicKey): TransactionInstruction { const proposal = proposalAddress(id); const commit = commitAddress(proposal, who, commitment); const traceClaim = traceAddress(proposal, trace); const round = roundAddress(traceClaim); return anchorInstruction(gate, "settle_revealed_unopened_challenge", [
+  { pubkey: payer.publicKey, isSigner: true, isWritable: false }, ...settlementBase(id, configId),
+  { pubkey: traceClaim, isSigner: false, isWritable: false }, { pubkey: commit, isSigner: false, isWritable: false },
+  { pubkey: bondAddress(commit), isSigner: false, isWritable: true }, { pubkey: round, isSigner: false, isWritable: true },
+  { pubkey: roundEconomicsAddress(round), isSigner: false, isWritable: true }, { pubkey: destination, isSigner: false, isWritable: true },
+  { pubkey: bondVaultAddress(commit), isSigner: false, isWritable: true }, { pubkey: who, isSigner: false, isWritable: true }
+]); }
 async function dust(address: PublicKey): Promise<void> { const lamports = await connection.getMinimumBalanceForRentExemption(0, COMMITMENT); await send(SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: address, lamports }), payer); }
 
 type PhaseBSetup = { registry: ReturnType<typeof registryView>; mint: Keypair; ep: PublicKey; params: PolicyParameters; verifiers: Keypair[]; verifierAtas: PublicKey[]; canonical: PublicKey[]; proposerAta: PublicKey; hunters: Keypair[]; hunterAtas: PublicKey[]; buffers: { key: PublicKey; hash: Buffer }[] };
@@ -925,9 +947,151 @@ async function runObjectiveSlashing(): Promise<void> {
   console.log(`SIGNATURE objective-rounds=${slashOne},${slashTwo} penalty_before=${penaltyBefore} penalty_after=${await tokenAmount(connection, penalty)}`);
 }
 
+async function runPendingRefund(): Promise<void> {
+  const params: PolicyParameters = { bounty: 700n, bond: 100n, fee: 5n, minimumStake: 20n, slash: 20n, maxChallenges: 2, feeGrace: 2n, slashGrace: 2n, cooldown: 1n };
+  const setup = await setupPhaseB("m6-phase-c-pending-refund", 1, 1, params, 2, 25n, true);
+  const pendingId = 1n; const nonterminalId = 2n;
+  await prepareFundedProposal(setup, pendingId, 0, 12n, true);
+  const pendingProposal = proposalAddress(pendingId); const pendingEscrow = proposalEscrowAddress(pendingProposal);
+  await sendMany([createProposal(nonterminalId, setup.buffers[1].key, setup.buffers[1].hash), fundEscrow(nonterminalId, 0n, proposer.publicKey, setup.proposerAta)], proposer);
+  await check(105, "Draft, ChallengeActive, and Approved proposals are nonterminal and cannot refund proposal escrow", async () => {
+    await expectFailure("105 ChallengeActive", () => send(refundEscrow(pendingId, 0n), payer), /ProposalNotTerminal/);
+    await expectFailure("105 Draft", () => send(refundEscrow(nonterminalId, 0n), payer), /ProposalNotTerminal/);
+    await send(startFunded(nonterminalId, 0n, 12n), proposer); await send(recordDecision(nonterminalId, 2, 0x6002), governance);
+    assert.equal(proposalView(await accountData(proposalAddress(nonterminalId))).state, 2);
+    await expectFailure("105 Approved", () => send(refundEscrow(nonterminalId, 0n), payer), /ProposalNotTerminal/);
+  });
+  const pendingEnd = proposalView(await accountData(pendingProposal)).end!;
+  await advancePast(pendingEnd, "phase-c-pending-expiry");
+  const expirySignature = await send(expireProposal(pendingId), payer);
+  const pendingRefundSlot = escrowView(await accountData(pendingEscrow)).refundEligible!;
+  await advanceTo(pendingRefundSlot, "phase-c-refund-exact-deadline");
+  assert.equal(BigInt(await connection.getSlot(COMMITMENT)), pendingRefundSlot, "refund boundary fixture missed exact slot");
+  await fails(106, "refund at refund_eligible_slot is rejected; eligibility begins strictly after that slot", /RefundDeadlineNotReached/, () => send(refundEscrow(pendingId, 0n), payer));
+  await advancePast(pendingRefundSlot, "phase-c-refund-after-deadline");
+
+  const outsiderAta = await createAta(payer, outsider.publicKey, setup.mint.publicKey);
+  const pendingBeforeSubstitution = Buffer.from(await accountData(pendingEscrow));
+  const pendingVaultBalances = await Promise.all([bountyVaultAddress(pendingProposal), feeVaultAddress(pendingProposal), penaltyVaultAddress(pendingProposal)].map(v => tokenAmount(connection, v)));
+  await check(107, "substituting the funder ATA or rent recipient is rejected atomically without changing escrow or vault balances", async () => {
+    await expectFailure("107 destination substitution", () => send(refundEscrow(pendingId, 0n, payer.publicKey, outsiderAta), payer), /NonCanonicalTokenAccount/);
+    await expectFailure("107 rent substitution", () => send(refundEscrow(pendingId, 0n, payer.publicKey, setup.proposerAta, outsider.publicKey), payer), /WrongRentRecipient/);
+    assert.deepEqual(await accountData(pendingEscrow), pendingBeforeSubstitution);
+    assert.deepEqual(await Promise.all([bountyVaultAddress(pendingProposal), feeVaultAddress(pendingProposal), penaltyVaultAddress(pendingProposal)].map(v => tokenAmount(connection, v))), pendingVaultBalances);
+  });
+  await sendMany([
+    mintTokensInstruction(setup.mint.publicKey, bountyVaultAddress(pendingProposal), 7n),
+    mintTokensInstruction(setup.mint.publicKey, feeVaultAddress(pendingProposal), 11n),
+    mintTokensInstruction(setup.mint.publicKey, penaltyVaultAddress(pendingProposal), 13n)
+  ], payer);
+  const pendingVaults = [bountyVaultAddress(pendingProposal), feeVaultAddress(pendingProposal), penaltyVaultAddress(pendingProposal)];
+  const actualPendingBalances = await Promise.all(pendingVaults.map(v => tokenAmount(connection, v)));
+  const expectedPendingRefund = actualPendingBalances.reduce((sum, value) => sum + value, 0n);
+  const pendingTokenBefore = await tokenAmount(connection, setup.proposerAta);
+  const pendingRentBefore = await connection.getBalance(proposer.publicKey, COMMITMENT);
+  const pendingVaultRent = (await Promise.all(pendingVaults.map(v => connection.getAccountInfo(v, COMMITMENT)))).reduce((sum, info) => sum + (info?.lamports ?? 0), 0);
+  const pendingRefundSignature = await send(refundEscrow(pendingId, 0n, governance.publicKey), governance);
+  await check(108, "permissionless refund transfers every actual proposal-vault token only to the original funder ATA", async () => assert.equal(await tokenAmount(connection, setup.proposerAta), pendingTokenBefore + expectedPendingRefund));
+  await check(109, "Pending bounty becomes RefundedToFunder with exact refunds_paid and a retained escrow receipt", async () => { const view = escrowView(await accountData(pendingEscrow, 370)); assert.equal(view.bountyStatus, 2); assert.equal(view.refundsPaid, expectedPendingRefund); assert(view.funder.equals(proposer.publicKey)); });
+  await check(110, "all proposal vaults close and exact lamport rent returns only to the recorded funder", async () => { for (const vault of pendingVaults) assert.equal(await connection.getAccountInfo(vault, COMMITMENT), null); assert.equal(await connection.getBalance(proposer.publicKey, COMMITMENT), pendingRentBefore + pendingVaultRent); });
+  await fails(111, "final escrow refund cannot repeat after all proposal vaults close", /AccountNotInitialized|not initialized|EscrowAlreadyRefunded/, () => send(refundEscrow(pendingId, 0n), payer));
+  console.log(`SIGNATURE refund-expiry=${expirySignature} pending-refund=${pendingRefundSignature}`);
+  console.log(`BALANCES pending_vaults=${actualPendingBalances.join(",")} pending_refund=${expectedPendingRefund}`);
+}
+
+async function runPaidRefund(): Promise<void> {
+  const params: PolicyParameters = { bounty: 700n, bond: 100n, fee: 5n, minimumStake: 20n, slash: 20n, maxChallenges: 1, feeGrace: 1n, slashGrace: 1n, cooldown: 1n };
+  const setup = await setupPhaseB("m6-phase-c-paid-refund", 2, 2, params, 1, 25n, true);
+  const violationId = 1n; await prepareFundedProposal(setup, violationId, 0, 12n, true);
+  const violationProposal = proposalAddress(violationId); const trace = sha256(Buffer.from("m6-phase-c-paid-refund-violation")); const salt = sha256(Buffer.from("m6-phase-c-paid-refund-violation-salt"));
+  const bonded = await revealBond(violationId, setup.hunters[0], setup.hunterAtas[0], trace, salt);
+  const opening = openEconomicRound(violationId, 0n, 0n, setup.hunters[0].publicKey, bonded.commitment, trace, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  const roundSignature = await send(opening.ix, payer); const receipt = sha256(Buffer.from("m6-phase-c-paid-refund-result"));
+  const resultHash = replayResultCommitment(violationProposal, invariantAddress(1n), traceAddress(violationProposal, trace), setup.buffers[0].hash, sha256(Buffer.from("spec-1")), 1, receipt);
+  await send(createReplay(opening.round, resultHash, 1, receipt), payer);
+  await sendMany(setup.verifiers.map(v => attest(v.publicKey, violationId, 0n, opening.round, trace, resultHash)), payer, setup.verifiers);
+  const finalizeSignature = await send(finalizeReplay(violationId, opening.round, resultHash), outsider);
+  const violationEnd = proposalView(await accountData(violationProposal)).end!; await advancePast(violationEnd + 1n, "phase-c-paid-refund-deadline");
+  const violationEscrow = proposalEscrowAddress(violationProposal); const violationRefundSlot = escrowView(await accountData(violationEscrow)).refundEligible!;
+  assert(BigInt(await connection.getSlot(COMMITMENT)) > violationRefundSlot);
+  const liabilitySnapshot = Buffer.from(await accountData(violationEscrow)); const violationBountyBeforeLiability = await tokenAmount(connection, bountyVaultAddress(violationProposal));
+  await check(112, "outstanding bond or round liabilities block refund and rejection rolls back escrow and vault changes", async () => {
+    const before = escrowView(liabilitySnapshot); assert.equal(before.unsettled, 1); assert.equal(before.unclosed, 1);
+    await expectFailure("112 outstanding liabilities", () => send(refundEscrow(violationId, 0n), payer), /UnsettledBondLiability|UnclosedRoundLiability/);
+    assert.deepEqual(await accountData(violationEscrow), liabilitySnapshot);
+    assert.equal(await tokenAmount(connection, bountyVaultAddress(violationProposal)), violationBountyBeforeLiability);
+  });
+  const closeSignature = await send(closeFinalized(violationId, opening.round), payer);
+  const acceptedSignature = await send(settleAccepted(violationId, 0n, setup.hunters[0].publicKey, bonded.commitment, trace, setup.hunterAtas[0]), payer);
+  await sendMany([
+    mintTokensInstruction(setup.mint.publicKey, bountyVaultAddress(violationProposal), 17n),
+    mintTokensInstruction(setup.mint.publicKey, feeVaultAddress(violationProposal), 19n),
+    mintTokensInstruction(setup.mint.publicKey, penaltyVaultAddress(violationProposal), 23n)
+  ], payer);
+  const paidVaults = [bountyVaultAddress(violationProposal), feeVaultAddress(violationProposal), penaltyVaultAddress(violationProposal)];
+  const paidBalances = await Promise.all(paidVaults.map(v => tokenAmount(connection, v))); const expectedPaidRefund = paidBalances.reduce((sum, value) => sum + value, 0n);
+  const paidTokenBefore = await tokenAmount(connection, setup.proposerAta);
+  const paidRefundSignature = await send(refundEscrow(violationId, 0n, outsider.publicKey), outsider);
+  await check(113, "PaidToHunter remains unchanged while residual bounty, fee, and penalty balances refund only to the funder", async () => { const view = escrowView(await accountData(violationEscrow, 370)); assert.equal(view.bountyStatus, 1); assert.equal(view.bountyPaid, params.bounty); assert.equal(view.refundsPaid, expectedPaidRefund); assert.equal(await tokenAmount(connection, setup.proposerAta), paidTokenBefore + expectedPaidRefund); for (const vault of paidVaults) assert.equal(await connection.getAccountInfo(vault, COMMITMENT), null); });
+  console.log(`SIGNATURE violation-round=${roundSignature} violation-finalize=${finalizeSignature} violation-close=${closeSignature} accepted=${acceptedSignature} paid-residual-refund=${paidRefundSignature}`);
+  console.log(`BALANCES paid_residual_vaults=${paidBalances.join(",")} paid_residual_refund=${expectedPaidRefund}`);
+}
+
+async function runRevealedUnopened(): Promise<void> {
+  const params: PolicyParameters = { bounty: 700n, bond: 100n, fee: 5n, minimumStake: 20n, slash: 20n, maxChallenges: 3, feeGrace: 1n, slashGrace: 1n, cooldown: 1n };
+  const setup = await setupPhaseB("m6-phase-c-unopened", 1, 1, params, 3, 25n, true);
+  const afterEndId = 1n; const terminalId = 2n; const openedId = 3n;
+  await prepareFundedProposal(setup, afterEndId, 0, 16n, true);
+  await prepareFundedProposal(setup, terminalId, 1, 32n, true);
+  await prepareFundedProposal(setup, openedId, 2, 32n, true);
+  const traceA = sha256(Buffer.from("m6-phase-c-unopened-after-end")); const saltA = sha256(Buffer.from("m6-phase-c-unopened-after-end-salt"));
+  const traceB = sha256(Buffer.from("m6-phase-c-unopened-terminal")); const saltB = sha256(Buffer.from("m6-phase-c-unopened-terminal-salt"));
+  const traceC = sha256(Buffer.from("m6-phase-c-unopened-round")); const saltC = sha256(Buffer.from("m6-phase-c-unopened-round-salt"));
+  const a = bondedCommit(afterEndId, 0n, setup.hunters[0].publicKey, setup.hunterAtas[0], traceA, saltA);
+  const b = bondedCommit(terminalId, 0n, setup.hunters[1].publicKey, setup.hunterAtas[1], traceB, saltB);
+  const c = bondedCommit(openedId, 0n, setup.hunters[2].publicKey, setup.hunterAtas[2], traceC, saltC);
+  await send(a.ix, setup.hunters[0]); await send(b.ix, setup.hunters[1]); await send(c.ix, setup.hunters[2]);
+  const revealSlot = [a, b, c].map(value => value.commit).map(async address => commitView(await accountData(address)).earliest);
+  await advanceTo((await Promise.all(revealSlot)).reduce((left, right) => left > right ? left : right), "phase-c-unopened-reveal");
+  await send(reveal(afterEndId, setup.hunters[0].publicKey, a.commitment, traceA, saltA), setup.hunters[0]);
+  await send(reveal(terminalId, setup.hunters[1].publicKey, b.commitment, traceB, saltB), setup.hunters[1]);
+  await send(reveal(openedId, setup.hunters[2].publicKey, c.commitment, traceC, saltC), setup.hunters[2]);
+  const opened = openEconomicRound(openedId, 0n, 0n, setup.hunters[2].publicKey, c.commitment, traceC, setup.canonical.map(v => stakeAddress(setup.ep, v)));
+  const openedSignature = await send(opened.ix, payer);
+
+  await fails(114, "early revealed-unopened settlement is rejected", /RevealedUnopenedNotEligible/, () => send(settleRevealedUnopened(afterEndId, 0n, setup.hunters[0].publicKey, a.commitment, traceA, setup.hunterAtas[0]), payer));
+  await fails(115, "settlement is rejected when the canonical VerificationRound or RoundEconomicState exists", /RoundAlreadyExists/, () => send(settleRevealedUnopened(openedId, 0n, setup.hunters[2].publicKey, c.commitment, traceC, setup.hunterAtas[2]), payer));
+  const afterEndProposal = proposalAddress(afterEndId); const afterEndEscrow = proposalEscrowAddress(afterEndProposal); const afterEnd = proposalView(await accountData(afterEndProposal)).end!;
+  await advancePast(afterEnd, "phase-c-unopened-after-end");
+  const wrongDestinationSnapshot = Buffer.from(await accountData(afterEndEscrow));
+  let destinationSubstitutionProved = false;
+  await expectFailure("118 wrong hunter ATA", () => send(settleRevealedUnopened(afterEndId, 0n, setup.hunters[0].publicKey, a.commitment, traceA, setup.hunterAtas[1]), payer), /NonCanonicalTokenAccount/);
+  assert.deepEqual(await accountData(afterEndEscrow), wrongDestinationSnapshot); assert.equal(bondView(await accountData(bondAddress(a.commit))).status, 0); destinationSubstitutionProved = true;
+  const aTokenBefore = await tokenAmount(connection, setup.hunterAtas[0]); const aRentBefore = await connection.getBalance(setup.hunters[0].publicKey, COMMITMENT); const aVaultInfo = await connection.getAccountInfo(bondVaultAddress(a.commit), COMMITMENT); assert(aVaultInfo);
+  const aSettlement = await send(settleRevealedUnopened(afterEndId, 0n, setup.hunters[0].publicKey, a.commitment, traceA, setup.hunterAtas[0]), payer);
+  await check(116, "a revealed unopened challenge receives a full refund after challenge end", async () => { const bond = bondView(await accountData(bondAddress(a.commit), 211)); assert.equal(bond.status, 6); assert.equal(bond.refunded, params.bond); assert.equal(bond.forfeited, 0n); assert.equal(await tokenAmount(connection, setup.hunterAtas[0]), aTokenBefore + params.bond); assert.equal(await connection.getBalance(setup.hunters[0].publicKey, COMMITMENT), aRentBefore + aVaultInfo.lamports); });
+
+  const terminalProposal = proposalAddress(terminalId); const terminalEnd = proposalView(await accountData(terminalProposal)).end!; assert(BigInt(await connection.getSlot(COMMITMENT)) <= terminalEnd);
+  const rejectionSignature = await send(recordRejected(terminalId), governance);
+  const bTokenBefore = await tokenAmount(connection, setup.hunterAtas[1]); const bSettlement = await send(settleRevealedUnopened(terminalId, 0n, setup.hunters[1].publicKey, b.commitment, traceB, setup.hunterAtas[1]), payer);
+  await check(117, "a revealed unopened challenge receives a full refund after unrelated terminal rejection", async () => { assert.equal(proposalView(await accountData(terminalProposal)).state, 3); assert(BigInt(await connection.getSlot(COMMITMENT)) <= terminalEnd); const bond = bondView(await accountData(bondAddress(b.commit))); assert.equal(bond.status, 6); assert.equal(bond.refunded, params.bond); assert.equal(await tokenAmount(connection, setup.hunterAtas[1]), bTokenBefore + params.bond); });
+  await check(118, "hunter destination substitution is rejected", () => assert(destinationSubstitutionProved));
+  await fails(119, "duplicate revealed-unopened settlement is rejected", /BondNotPending|AccountNotInitialized|not initialized/, () => send(settleRevealedUnopened(afterEndId, 0n, setup.hunters[0].publicKey, a.commitment, traceA, setup.hunterAtas[0]), payer));
+  await check(120, "unsettled_bonds decrements exactly once without changing unrelated counters or vaults", async () => {
+    for (const [id, bonded, trace] of [[afterEndId, a, traceA], [terminalId, b, traceB]] as const) {
+      const escrow = escrowView(await accountData(proposalEscrowAddress(proposalAddress(id)))); assert.equal(escrow.committed, 1); assert.equal(escrow.unsettled, 0); assert.equal(escrow.unclosed, 0);
+      assert((await connection.getAccountInfo(bonded.commit, COMMITMENT))?.owner.equals(gate)); assert((await connection.getAccountInfo(traceAddress(proposalAddress(id), trace), COMMITMENT))?.owner.equals(gate)); assert.equal(await connection.getAccountInfo(bondVaultAddress(bonded.commit), COMMITMENT), null);
+      assert.equal(await tokenAmount(connection, bountyVaultAddress(proposalAddress(id))), params.bounty); assert.equal(await tokenAmount(connection, feeVaultAddress(proposalAddress(id))), params.fee * 8n * BigInt(params.maxChallenges)); assert.equal(await tokenAmount(connection, penaltyVaultAddress(proposalAddress(id))), 0n);
+    }
+    await expectFailure("120 terminal bond blocks future round", () => send(openEconomicRound(afterEndId, 0n, 0n, setup.hunters[0].publicKey, a.commitment, traceA, setup.canonical.map(v => stakeAddress(setup.ep, v))).ix, payer), /BondNotPending/);
+    assert.equal(await connection.getAccountInfo(roundAddress(traceAddress(afterEndProposal, traceA)), COMMITMENT), null); assert.equal(await connection.getAccountInfo(roundEconomicsAddress(roundAddress(traceAddress(afterEndProposal, traceA))), COMMITMENT), null);
+  });
+  console.log(`SIGNATURE unopened-round=${openedSignature} after-end=${aSettlement} terminal-rejection=${rejectionSignature} terminal-refund=${bSettlement}`);
+}
+
 async function main(): Promise<void> {
   const index = process.argv.indexOf("--shard"); const shard = process.argv[index + 1] as Shard | undefined;
-  if (!shard || !["policy-funding", "stakes-withdrawal", "bonds-hold", "violation-fees", "bond-outcomes", "objective-slashing"].includes(shard)) throw new Error("expected a supported economic-settlement shard");
+  if (!shard || !["policy-funding", "stakes-withdrawal", "bonds-hold", "violation-fees", "bond-outcomes", "objective-slashing", "pending-refund", "paid-refund", "revealed-unopened"].includes(shard)) throw new Error("expected a supported economic-settlement shard");
   if (process.env.FAULTLINE_ECONOMIC_SHARD !== shard) throw new Error("runner shard environment does not match requested shard");
   if (!process.env.FAULTLINE_ECONOMIC_GENESIS || await connection.getGenesisHash() !== process.env.FAULTLINE_ECONOMIC_GENESIS) throw new Error("refusing validator not owned by the Milestone 6 runner");
   try {
@@ -936,8 +1100,12 @@ async function main(): Promise<void> {
     else if (shard === "bonds-hold") await runBondsHold();
     else if (shard === "violation-fees") await runViolationFees();
     else if (shard === "bond-outcomes") await runBondOutcomes();
-    else await runObjectiveSlashing();
-    console.log(`MILESTONE-6 ${shard === "policy-funding" || shard === "stakes-withdrawal" ? "PHASE-A" : "PHASE-B"} SHARD ${shard} PASSED`);
+    else if (shard === "objective-slashing") await runObjectiveSlashing();
+    else if (shard === "pending-refund") await runPendingRefund();
+    else if (shard === "paid-refund") await runPaidRefund();
+    else await runRevealedUnopened();
+    const phase = shard === "policy-funding" || shard === "stakes-withdrawal" ? "A" : shard === "pending-refund" || shard === "paid-refund" || shard === "revealed-unopened" ? "C" : "B";
+    console.log(`MILESTONE-6 PHASE-${phase} SHARD ${shard} PASSED`);
   } catch (error) {
     console.error(`FIRST REAL FAILURE shard=${shard} assertion=${activeAssertion || "setup"}`);
     throw error;

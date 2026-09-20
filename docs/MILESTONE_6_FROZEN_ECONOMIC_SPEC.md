@@ -131,15 +131,31 @@ Proposals created before the registry's immutable enforcement slot are historica
 
 The instruction returns the entire bond to the hunter's pre-existing canonical ATA, applies no penalty, bounty, verifier fee, or verifier slash, decrements `ProposalEscrow.unsettled_bonds` exactly once, closes BondVault to the recorded hunter rent recipient, and retains ChallengeBond with status `RevealedUnopenedReturned`. It rejects a noncanonical trace, an early call, any existing round, destination substitution, a previously settled bond, and counter underflow.
 
+## Validation numbering erratum
+
+This section corrects validation numbering only. It makes the already-frozen final-refund and revealed-but-unopened checks explicit and changes no account schema, instruction, authorization rule, state transition, deadline, token flow, rent destination, or other protocol semantic.
+
+Final proposal-escrow refund and cleanup assertions are:
+
+105. Draft, ChallengeActive, and Approved proposals are nonterminal and cannot refund proposal escrow.
+106. Refund at `refund_eligible_slot` is rejected; eligibility begins strictly after that slot.
+107. Substituting either the original funder's canonical ATA or recorded rent recipient is rejected atomically without changing escrow bytes or vault balances.
+108. A permissionless refund transfers every actual BountyVault, FeeVault, and PenaltyVault token, including unsolicited surplus, only to the original funder's canonical ATA.
+109. Refunding a Pending bounty records `BountyStatus::RefundedToFunder`, the exact checked `refunds_paid`, and retains ProposalEscrow as the permanent accounting receipt.
+110. A successful refund closes all three empty proposal vaults and returns their exact lamport rent only to the recorded original funder.
+111. Final escrow refund cannot be repeated, including after all three vaults have closed.
+112. Outstanding bond or round liabilities block final refund; rejection leaves escrow state and vault balances unchanged until settlement ordering clears both counters.
+113. If the bounty was already `PaidToHunter`, that status and the configured bounty payment remain unchanged; only residual bounty surplus and all remaining fee and penalty balances refund to the original funder.
+
 Required adversarial assertions are:
 
-121. Early revealed-unopened settlement is rejected.
-122. Settlement is rejected when the canonical VerificationRound or RoundEconomicState exists.
-123. A revealed unopened challenge receives a full refund after challenge end.
-124. A revealed unopened challenge receives a full refund after unrelated terminal rejection.
-125. Hunter destination substitution is rejected.
-126. Duplicate revealed-unopened settlement is rejected.
-127. `unsettled_bonds` decrements exactly once without changing unrelated counters or vaults.
+114. Early revealed-unopened settlement is rejected.
+115. Settlement is rejected when the canonical VerificationRound or RoundEconomicState exists.
+116. A revealed unopened challenge receives a full refund after challenge end.
+117. A revealed unopened challenge receives a full refund after unrelated terminal rejection.
+118. Hunter destination substitution is rejected.
+119. Duplicate revealed-unopened settlement is rejected.
+120. `unsettled_bonds` decrements exactly once without changing unrelated counters or vaults.
 
 ## Pass boundaries
 
