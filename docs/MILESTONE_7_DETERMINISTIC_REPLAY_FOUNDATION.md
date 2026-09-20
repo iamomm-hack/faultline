@@ -597,6 +597,129 @@ The table is authoritative for Solana `1.18.22`: it is derived directly from `so
 | `IllegalOwner` | `MaxAccountsDataAllocationsExceeded` | `MaxAccountsExceeded` |
 | `MaxInstructionTraceLengthExceeded` | `BuiltinProgramsMustConsumeComputeUnits` | |
 
+#### 7.8.2 Normative receipt digest preimages
+
+The following rules are normative for every runtime-derived Checkpoint 3 receipt digest.
+
+##### Common framing rules
+
+- SHA-256 is applied to the exact byte concatenations defined below.
+- Domain strings are uppercase ASCII bytes with no trailing NUL.
+- `u32be(n)` is an unsigned 32-bit big-endian integer.
+- `u64be(n)` is an unsigned 64-bit big-endian integer.
+- Hash values embedded in another preimage are their raw 32 bytes, never lowercase hexadecimal text.
+- Public keys are their decoded raw 32-byte values, never base58 text.
+- Text is validated UTF-8 and used byte-for-byte.
+- No separators, JSON serialization, platform newlines, trimming, whitespace rewriting, or implicit conversions are permitted unless explicitly specified.
+- Any overflow, missing value, unsupported selector/type, malformed encoding, or inconsistent count fails closed.
+
+##### Selector state-value hashes
+
+Each entry in `pre_state_hashes` and `post_state_hashes` hashes the typed scalar value produced by that selector, not the complete containing account bytes.
+
+```text
+state_value_hash = SHA256(
+    "FAULTLINE_STATE_VALUE_V1"
+    || u32be(selector_name_utf8.length)
+    || selector_name_utf8
+    || type_tag
+    || u32be(value_bytes.length)
+    || value_bytes
+)
+```
+
+The Checkpoint 3 selector encoding table is frozen as follows:
+
+- `original_admin`
+  - `type_tag = 0x01`
+  - `value_bytes = decoded 32-byte public key`
+- `treasury_vault_base_units`
+  - `type_tag = 0x02`
+  - `value_bytes = u64be(amount)`
+- `attacker_base_units`
+  - `type_tag = 0x02`
+  - `value_bytes = u64be(amount)`
+
+The receipt schema's already-frozen selector IDs remain `attacker_balance`, `original_admin`, and `treasury_vault_balance`. Their typed scalar inputs are `attacker_base_units`, `original_admin`, and `treasury_vault_base_units`, respectively. In the preimage above, `selector_name_utf8` is the UTF-8 name from the Checkpoint 3 selector encoding table: `attacker_base_units`, `original_admin`, or `treasury_vault_base_units`. This mapping clarifies the digest input without renaming or reordering the receipt schema's selector IDs.
+
+The same selector name and scalar value must produce the same hash in pre-state and post-state. The pre/post position is represented by the containing receipt field and is not included in the selector hash.
+
+Every selector required by the frozen invariant manifest must appear exactly once in both state-hash arrays. Entries remain in the schema's frozen canonical selector-ID order: `attacker_balance`, `original_admin`, `treasury_vault_balance`. Missing, duplicate, additional, unsupported, or misordered selectors fail closed.
+
+##### Return-data hash
+
+Absence of Solana return data:
+
+```text
+return_data_sha256 = SHA256(
+    "FAULTLINE_RETURN_DATA_V1"
+    || 0x00
+)
+```
+
+Presence of Solana return data `(program_id, data)`:
+
+```text
+return_data_sha256 = SHA256(
+    "FAULTLINE_RETURN_DATA_V1"
+    || 0x01
+    || program_id_raw_32_bytes
+    || u32be(data.length)
+    || data
+)
+```
+
+An explicit empty return-data payload is therefore distinct from no return data. If the payload length cannot fit in `u32`, construction fails closed.
+
+##### Per-transaction log hash
+
+For the exact ordered runtime log vector `logs[0..N]`:
+
+```text
+logs_sha256 = SHA256(
+    "FAULTLINE_TX_LOGS_V1"
+    || u32be(N)
+    || for each log in runtime order:
+         u32be(log_utf8.length)
+         || log_utf8
+)
+```
+
+- Preserve transaction-local runtime order.
+- Preserve each emitted log string byte-for-byte.
+- Do not append CR, LF, NUL, or another separator.
+- Do not trim, case-fold, redact, parse, or rewrite program IDs, compute-unit messages, error messages, or other log contents.
+- An empty log vector is valid and hashes the domain followed by `u32be(0)`.
+
+##### Aggregate normalized-log hash
+
+For receipt transactions in frozen transaction/step order:
+
+```text
+normalized_logs_sha256 = SHA256(
+    "FAULTLINE_NORMALIZED_LOGS_V1"
+    || u32be(transaction_count)
+    || for each transaction in receipt order:
+         raw_32_byte_logs_sha256
+)
+```
+
+The aggregate is constructed from the raw per-transaction log hashes defined above, not their hexadecimal representation and not by joining log text. Transaction grouping and order are therefore preserved.
+
+A transaction without logs contributes the valid empty-log-vector digest. A missing per-transaction log digest fails closed.
+
+##### Checkpoint 1 vector status
+
+- Existing Checkpoint 1 receipts and unsigned worker outputs are format/schema/hash vectors only.
+- They are not evidence of VM execution and are not authoritative Checkpoint 3 runtime receipts.
+- Checkpoint 3 must create runtime-derived golden evidence using the newly frozen nested digest rules.
+- Arbitrary Checkpoint 1 digest values must not be silently reinterpreted as runtime-derived values.
+- The canonical serialization and outer hash algorithms frozen in Checkpoint 1 remain unchanged.
+
+##### Scope and assertion clarification
+
+These definitions unblock Checkpoint 3 assertions 17–23. Assertions 13–16 remain assigned to later failure-handling and worker work, and assertions 24–28 remain assigned to worker isolation, agreement, and closeout. No assertion is renumbered or reinterpreted by this clarification.
+
 Worker identity, process ID, host timing, memory use, and signature are excluded from the receipt.
 
 ### 7.9 `faultline.worker-output.v1`
