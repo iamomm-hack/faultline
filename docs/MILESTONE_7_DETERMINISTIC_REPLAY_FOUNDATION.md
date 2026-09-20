@@ -187,6 +187,8 @@ crates/
 
 manifests/
   auth-001-invariant.json
+  programs/
+    spl-token-3.5.0.so
   treasury-v2-build.json
   treasury-v3-build.json
   treasury-runner.json
@@ -196,7 +198,7 @@ scripts/
   run-replay-foundation-tests.ps1
 ```
 
-The root workspace adds only `crates/faultline-replay`. That crate has no dependency path to `faultline_gate` or `faultline_treasury`; it reads SBF artifacts as bytes. Existing policy, trace, fixture, and SBF files remain inputs; they are not silently rewritten.
+The root workspace adds only `crates/faultline-replay`. That crate has no dependency path to `faultline_gate` or `faultline_treasury`; it reads SBF artifacts as bytes. Existing policy, trace, logical fixture, and treasury SBF files remain inputs; they are not silently rewritten. Checkpoint 1 additionally tracks the exact Tokenkeg SBF bytes embedded by LiteSVM 0.1.0 at `manifests/programs/spl-token-3.5.0.so`, as specified in Section 7.4.3.
 
 ---
 
@@ -251,7 +253,9 @@ All hashes are lowercase 64-character SHA-256 hex. All Solana public keys are ca
 
 > **Revision note — Checkpoint 1 schema clarification (2026-09-20):** This section replaces underspecified schema shorthand with the complete closed input formats. It does not change evaluator behavior, hash domains, runtime pins, or checkpoint boundaries. Unless a field is explicitly marked optional or nullable, it is required. Every object at every depth is closed: missing required fields, duplicate keys, and unknown fields are invalid. Nested objects do not carry independent schema discriminators; they are valid only inside their declared parent schema. Strings and keys obey Section 6, decimal strings obey Section 6.3, and arrays obey the cardinality, uniqueness, and ordering rules stated below.
 
-The tracked Milestone 2 policy, fixture, trace, resolved-fixture outputs, and artifact build-manifest JSON were reviewed as source/provenance records. The new files under `manifests/` are the Milestone 7 trust-path manifests defined here; historical fixture and artifact JSON are not silently reinterpreted or rewritten as those manifests even where a legacy `schema` string is shared. The build manifests transcribe the existing artifact path, digest, feature, program ID, and toolchain provenance into the closed Section 7.2 shape. The fixture manifest transcribes resolved public state into the candidate-independent Section 7.4 shape. The tracked policy supplies the exact Section 7.5 values, while the tracked trace itself is parsed directly under Section 7.6.
+> **Revision note — deterministic fixture genesis (2026-09-20):** The Milestone 7 fixture is an authored synthetic genesis snapshot, not a transcription of a validator run. Its complete state is constructed from the constants and binary recipes in Sections 7.4.1–7.4.3, the tracked logical fixture and trace, the tracked program ID and layout, Solana 1.18.22 `Rent::default()`, and the SPL Token 3.5.0 layouts. Live RPC state, validator ledgers, ignored resolved-fixture outputs, wall-clock time, random key generation, machine paths, host rent queries, and other untracked state are forbidden inputs. Historical resolved-fixture files are non-authoritative provenance aids only. This erratum does not change any hash domain, assertion meaning, dependency plane, or checkpoint boundary.
+
+The tracked Milestone 2 policy, logical fixture, trace, program source, milestone evidence, and artifact build-manifest JSON were reviewed as source/provenance records. The new files under `manifests/` are the Milestone 7 trust-path manifests defined here; historical fixture and artifact JSON are not silently reinterpreted or rewritten as those manifests even where a legacy `schema` string is shared. The build manifests transcribe the existing artifact path, digest, feature, program ID, and toolchain provenance into the closed Section 7.2 shape. The fixture manifest is generated solely from the synthetic-genesis constants and recipes in Section 7.4. The tracked policy supplies the exact Section 7.5 values, while the tracked trace itself is parsed directly under Section 7.6.
 
 ### 7.1 Common manifest fields
 
@@ -327,13 +331,13 @@ The closed `clock` object has exactly `slot`, a canonical `u64` decimal string e
 The fixture is candidate-independent. Its `programs` array contains exactly:
 
 - one closed target entry with `kind` = `target`, `alias` = `faultline_treasury`, and `program_id` = the canonical treasury public key; and
-- one closed bundled entry with `kind` = `bundled`, `alias` = `spl_token`, `program_id` = the canonical Tokenkeg public key, `bundle_name` = `spl-token-3.5.0`, and `executable_sha256` = the SHA-256 of the bundled executable.
+- one closed bundled entry with `kind` = `bundled`, `alias` = `spl_token`, `program_id` = the canonical Tokenkeg public key, `bundle_name` = `spl-token-3.5.0`, `artifact_path` = `manifests/programs/spl-token-3.5.0.so`, `executable_sha256` = `18264f491c7e0ad056dd36f42f8de6d1fedf9f044d1f521e714b4dc6b61594b6`, `source_crate` = `litesvm`, `source_crate_version` = `0.1.0`, `source_crate_sha256` = `0963e4df461a414763f0348b73eb284a734534a53558fcae35f984a0c16a6e6c`, and `source_member_path` = `src/spl/programs/spl_token-3.5.0.so`.
 
 The target entry contains no executable hash or build-manifest hash. `candidate_executable_sha256` and `build_manifest_hash` exist only in `faultline.replay-job.v1`; selecting v2 versus v3 therefore changes the replay-job hash but not the fixture hash. Bundled external programs remain independently hash-bound by the fixture.
 
 Each closed `accounts` entry has exactly these required fields: `alias` (nonempty string), `pubkey` (canonical public key), `owner` (canonical public key), `lamports` (canonical `u64` decimal string), `executable` (Boolean), `rent_epoch` (canonical `u64` decimal string), and `data_base64` (canonical RFC 4648 standard-alphabet padded Base64 string). Account-array order is canonical alias order; aliases and public keys are each unique.
 
-Each closed `signers` entry has exactly `alias` (nonempty string) and `pubkey` (canonical public key). Signer-array order is canonical alias order; aliases and public keys are each unique. Private key bytes are never present in the fixture manifest. Deterministic test keypairs are derived in the trusted coordinator from a test-only seed domain and are not accepted from evidence.
+Each closed `signers` entry has exactly `alias` (nonempty string), `pubkey` (canonical public key), and `lamports` (canonical `u64` decimal string fixed to `10000000000`). Signer-array order is canonical alias order; aliases and public keys are each unique. Private key bytes are never present in the fixture manifest. Validation recomputes the public key from the alias using Section 7.4.1 and rejects a mismatch.
 
 The closed `initial_state` object has exactly these required fields:
 
@@ -350,7 +354,81 @@ The closed `initial_state` object has exactly these required fields:
 
 Missing, duplicate, or unknown `initial_state` fields are invalid.
 
-#### 7.4.1 Shared raw transaction input
+#### 7.4.1 Synthetic identities and fixed genesis metadata
+
+The fixture has `base_slot` = `"1"`, `clock` = `{ "slot": "1", "unix_timestamp": "0" }`, and `setup_transactions` = `[]`. The tracked exploit trace needs no setup transaction because all required state is already present in the snapshot. When Checkpoint 2 installs the corresponding Solana `Clock`, the fields not represented in the fixture are fixed to `epoch_start_timestamp = 0`, `epoch = 0`, and `leader_schedule_epoch = 0`; no host clock is consulted.
+
+Signer seeds are exactly:
+
+```text
+seed = SHA256(ASCII("FAULTLINE_TEST_SIGNER_V1") || BYTE(0x00) || UTF8(alias))
+```
+
+The 32-byte digest is passed as the Ed25519 keypair seed using Solana's standard seed-to-keypair operation. The fixture contains exactly these signers in canonical alias order:
+
+| Alias | Frozen public key | Lamports |
+| --- | --- | ---: |
+| `attacker` | `Dvci5BTD5CkwYCQh6pC6UumLWF9LHSinJ5doS8PS9hV6` | `10000000000` |
+| `treasury-admin` | `564Gpg3mVA7LwcW7hVQkeATttbaRRMTntp9eV2AGNpbd` | `10000000000` |
+| `user` | `58aVWrJhcixCdUrm8wVdfUVZiC5Y7QzpFQuoQbJHMV4i` | `10000000000` |
+
+These aliases come from the tracked logical fixture; only `attacker` signs the tracked exploit trace. At runtime each signer is materialized as a System Program-owned, non-executable, zero-data account with `rent_epoch = 0` and the manifest's lamports. These publicly derivable identities are test-only. They must never be accepted as production verifier, payer, governance, deployment, or upgrade-authority identities.
+
+Non-PDA fixture keypairs use a separate domain:
+
+```text
+seed = SHA256(ASCII("FAULTLINE_TEST_ACCOUNT_V1") || BYTE(0x00) || UTF8(keypair_alias))
+```
+
+The resulting 32 bytes are the Ed25519 keypair seed and only the derived public key enters the manifest. The complete alias closure is:
+
+| Logical or trace alias | Derivation and frozen public key | Owner | Executable | Data bytes | Lamports | Writable during replay | Logical source |
+| --- | --- | --- | --- | ---: | ---: | --- | --- |
+| `attacker` | signer alias `attacker`; `Dvci5BTD5CkwYCQh6pC6UumLWF9LHSinJ5doS8PS9hV6` | System Program | false | 0 | `10000000000` | no | trace signer and fixture token authority |
+| `legitimate_admin` | signer alias `treasury-admin`; `564Gpg3mVA7LwcW7hVQkeATttbaRRMTntp9eV2AGNpbd` | System Program | false | 0 | `10000000000` | no | fixture original administrator |
+| `user` | signer alias `user`; `58aVWrJhcixCdUrm8wVdfUVZiC5Y7QzpFQuoQbJHMV4i` | System Program | false | 0 | `10000000000` | no | fixture depositor identity; not referenced by the exploit trace |
+| `treasury_pda` | Solana PDA for seed tuple `[UTF8("treasury")]` and program `46zDmEZAYrpwi3k6FsKFf1rPWZDbZEKM21SFzMKzb1a4`, canonical bump 255; `EiRj7VptpwZTy2uRMbHeqCU45fmbPFd4FrGGbQ2MZfi2` | treasury program | false | 210 | `2352480` | yes | tracked `TreasuryState` layout and fixture state |
+| `payment_mint` | account seed alias `payment-mint`; `2cmmKxvd7YMFYhfqSFb45Q7zVYyhqsgoswxbvVeThgkG` | Tokenkeg | false | 82 | `1461600` | no | fixture decimals and aggregate supply |
+| `treasury_vault` | account seed alias `treasury-vault-token`; `E1wvHDQMjFVw8hZgdsLzo5tXqSttrvHB56Du1oD1roDY` | Tokenkeg | false | 165 | `2039280` | yes | fixture mint, PDA authority, and `1000000000` balance |
+| `attacker_token_account` | account seed alias `attacker-token`; `3DUXuoksqpratbjmysGEKQQUUb1mZRR4y3GWNjSiNTPP` | Tokenkeg | false | 165 | `2039280` | yes | fixture mint, attacker authority, and `0` balance |
+| `spl_token` | fixture program alias; `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` | loaded program | true | 133352-byte SBF artifact | loader-derived | no | tracked trace and Section 7.4.3 |
+| `programs.faultline_treasury` | target program alias; `46zDmEZAYrpwi3k6FsKFf1rPWZDbZEKM21SFzMKzb1a4` | loaded program | true | selected v2 or v3 artifact | loader-derived | invoked | tracked program ID and replay-job candidate binding |
+
+Only the four non-program, non-signer state accounts (`attacker_token_account`, `payment_mint`, `treasury_pda`, and `treasury_vault`) appear in the fixture `accounts` array, in that canonical alias order. The three signer identities appear only in `signers`. Account references resolve across the `accounts`, `signers`, and `programs` namespaces as permitted by Section 7.4.4. `faultline_gate` from the historical logical fixture is not included because neither the tracked trace nor synthetic genesis depends on it.
+
+The System Program public key is `11111111111111111111111111111111`; the treasury and Tokenkeg owners are the program IDs shown above. Every synthetic non-executable state account has `rent_epoch` = `"0"`. Rent-exempt lamports are the literal constants in the table, computed once with Solana 1.18.22 `Rent::default().minimum_balance(data_length)`: `lamports_per_byte_year = 3480`, `exemption_threshold = 2.0`, and storage overhead = 128 bytes. Thus the exact integer rule is `(128 + data_length) * 3480 * 2`, yielding `1461600` for 82 bytes, `2039280` for 165 bytes, and `2352480` for 210 bytes. Generators emit these constants and never query a host or RPC rent value.
+
+The closed `initial_state` values are: `original_admin` = `564Gpg3mVA7LwcW7hVQkeATttbaRRMTntp9eV2AGNpbd`, `treasury_state` = `EiRj7VptpwZTy2uRMbHeqCU45fmbPFd4FrGGbQ2MZfi2`, `treasury_vault` = `E1wvHDQMjFVw8hZgdsLzo5tXqSttrvHB56Du1oD1roDY`, `attacker_token_account` = `3DUXuoksqpratbjmysGEKQQUUb1mZRR4y3GWNjSiNTPP`, `payment_mint` = `2cmmKxvd7YMFYhfqSFb45Q7zVYyhqsgoswxbvVeThgkG`, `mint_decimals` = 6, `treasury_vault_base_units` = `"1000000000"`, and `attacker_base_units` = `"0"`.
+
+#### 7.4.2 Frozen binary account encodings
+
+All public-key fields below are the raw 32 bytes decoded from their frozen canonical Base58 strings. All unused bytes are zero. Multi-byte integers are unsigned little-endian. Final `data_base64` uses canonical padded RFC 4648 standard-alphabet Base64.
+
+- **System-owned signers (0 bytes):** empty account data; ownership, funding, executable flag, and rent epoch are supplied by Section 7.4.1 rather than an `accounts` entry.
+- **SPL Token mint (82 bytes):** bytes 0–3 are the `COption<Pubkey>` mint-authority tag 0 and bytes 4–35 are zero; bytes 36–43 are supply `1000000000` as `u64`, exactly the sum of the synthetic vault and attacker token balances; byte 44 is decimals 6; byte 45 is initialization Boolean 1; bytes 46–49 are the freeze-authority tag 0 and bytes 50–81 are zero. The synthetic fixed-supply mint deliberately has neither mint nor freeze authority because the tracked logical fixture declares neither authority and replay performs no mint operation.
+- **SPL Token accounts (165 bytes):** bytes 0–31 are the payment mint; bytes 32–63 are the token authority; bytes 64–71 are amount as `u64`; bytes 72–75 are delegate tag 0 and bytes 76–107 are zero; byte 108 is state `Initialized` = 1; bytes 109–112 are native-option tag 0 and bytes 113–120 are zero; bytes 121–128 are delegated amount 0; bytes 129–132 are close-authority tag 0 and bytes 133–164 are zero. The vault authority and amount are the treasury PDA and `1000000000`; the attacker account authority and amount are the attacker signer and `0`.
+- **`TreasuryState` (210 bytes):** bytes 0–7 are the Anchor discriminator, first eight bytes of `SHA256(UTF8("account:TreasuryState"))` = `f038e29e8af44f9a`; byte 8 is `schema_version` 1; bytes 9–40 are original admin; bytes 41–72 are treasury vault; bytes 73–80 are `total_deposited` `1000000000` as `u64`; byte 81 is PDA bump 255; bytes 82–209 are the tracked 128-byte reserved field, with payment mint in bytes 82–113 and bytes 114–209 zero. This is derived from the tracked v1 layout (`8 + TreasuryState::LEN`, where `TreasuryState::LEN = 202`) without importing an on-chain crate.
+
+The required canonical account payloads are:
+
+| Alias | `data_base64` | Data SHA-256 |
+| --- | --- | --- |
+| `attacker_token_account` | `GAWhXr8Te/HwStVu41Wu9UUeK+Ud7g6hhKgs1Sevr8nACGa81c5JSZROzXi+2CO1zF/+Sin+SX3UwmQpgS8XzQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA` | `e094f0d1d58669afcf6f576d05c1acda6ffec11ca45d5feee8b0b1f68a4e737f` |
+| `payment_mint` | `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMqaOwAAAAAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==` | `e5871cb75e1a408fe8a3830c2b0c84abe831f86909d8d8c3cff2b4d0cd001846` |
+| `treasury_pda` | `8Djinor0T5oBPLpaMOkYW/wulgNMC9NraYAtzOWhHbRY4P2y6gN1AozBZgbW3vEnrKAemtF7WtHzOeyN6IxMMWvHvaAkJ25D9wDKmjsAAAAA/xgFoV6/E3vx8ErVbuNVrvVFHivlHe4OoYSoLNUnr6/JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA` | `c58208ee116dbc2140d342fb876f04a9aef1683c1de165c2b3a9aba41fd4b155` |
+| `treasury_vault` | `GAWhXr8Te/HwStVu41Wu9UUeK+Ud7g6hhKgs1Sevr8nLxLN5V+YZLpuK9pdX5gk3kBxU5SrQY4Xi/nw8e/dqQwDKmjsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA` | `d1801a802d583187730d51ea26a1aac2a1388de3d2ec24869b712a8c0643167f` |
+
+Validation decodes each payload, requires its exact length, reconstructs it independently from the frozen logical inputs, and requires byte equality and the listed SHA-256. The fixture is invalid if a serialized field disagrees with `initial_state` or the frozen public-key table.
+
+#### 7.4.3 Tokenkeg executable provenance
+
+LiteSVM 0.1.0 does not execute Tokenkeg through a native Rust processor. `LiteSVM::new()` calls `with_spl_programs()`, whose `load_spl_programs` passes `include_bytes!("programs/spl_token-3.5.0.so")` to `add_program` for the Tokenkeg program ID. Tokenkeg therefore executes as actual SBF bytes in the pinned Solana 1.18.22 loader/runtime.
+
+The authoritative source package is the non-yanked crates.io `litesvm` 0.1.0 crate from `registry+https://github.com/rust-lang/crates.io-index`, checksum `0963e4df461a414763f0348b73eb284a734534a53558fcae35f984a0c16a6e6c`, corresponding to the already pinned upstream commit `5cda1d2dcfae16714a6ff808b58f0c087b21bd42`. Its member `src/spl/programs/spl_token-3.5.0.so` is exactly 133352 bytes with SHA-256 `18264f491c7e0ad056dd36f42f8de6d1fedf9f044d1f521e714b4dc6b61594b6`. The replay crate's exact `litesvm = "=0.1.0"` dependency and the package source/checksum in `Cargo.lock`, together with the runner manifest's engine version and `token_program_bundle`, bind that implementation; no separate native `spl-token` processor dependency is used for execution.
+
+Checkpoint 1 extracts those bytes without modification into the tracked repository-relative file `manifests/programs/spl-token-3.5.0.so`. Generation rejects any crate-checksum, member-length, member-hash, tracked-file-hash, program-ID, or runner-version mismatch. Checkpoint 2 uses LiteSVM's embedded copy and first verifies that the tracked mirror has the same frozen hash; the fixture manifest binds the tracked path, source identity, and executable hash. Neither a local Solana distribution nor a separately downloaded SPL artifact is authoritative.
+
+#### 7.4.4 Shared raw transaction input
 
 `faultline.trace.v1.transactions` and `faultline.fixture.v1.setup_transactions` use this same raw, closed input structure. These bytes are the pre-normalization input. Alias resolution, account-meta resolution, and runtime normalization remain Checkpoint 2 work.
 
@@ -557,6 +635,39 @@ The signed form is a separate closed wrapper with exactly these required keys:
 | `signature` | string | canonical Base58 encoding of exactly 64 signature bytes |
 
 The wrapper is not part of Checkpoint 1 implementation. Signed parsing, signature generation, and verification remain deferred to the receipt/signing and worker checkpoints. The signature preimage contains only canonical serialized `output`; no wrapper field is included.
+
+### 7.11 Checkpoint 1 provenance closure and vector-only identities
+
+Every Checkpoint 1 generated field has one authoritative source and one deterministic validation rule:
+
+| Output | Authoritative source | Deterministic derivation and validation |
+| --- | --- | --- |
+| v2/v3 build manifests | tracked Milestone 2 program ID and artifact-hash evidence; existing artifact bytes and build manifests | transcribe the exact Section 7.2 constants; independently hash the artifact and require the frozen digest |
+| runner manifest | Sections 3, 7.3, and the replay-plane lockfile | emit exact constants; audit all replay-reachable versions and Tokenkeg provenance |
+| fixture manifest | tracked logical fixture and trace plus Sections 7.4.1–7.4.3 | reconstruct every key and byte; validate all cross-field relationships, lengths, rents, hashes, ordering, and aliases |
+| invariant manifest | tracked `policies/invariants/AUTH-001.json` | preserve every tracked semantic field and add only the common canonicalization string; validate exact values from Section 7.5 |
+| trace bytes and hash | tracked `fixtures/exploits/auth-001-v2-authority-takeover.json` | parse that file directly under Section 7.6, canonicalize it, and apply Section 8.2; ignored materializations are forbidden inputs |
+| replay-job vectors | generated manifest hashes, canonical trace hash, actual candidate artifact digest, and the vector-only identifiers below | construct each Section 7.7 field explicitly and apply Section 8.3; v2 and v3 differ only in candidate/build bindings |
+| receipt schema vectors | the corresponding replay-job vector and fixed vector-only transaction/state/log values | validate Section 7.8 cross-field rules and apply Section 8.4; these are schema/hash vectors, not claims of VM execution |
+| unsigned worker-output vectors | receipt vectors plus the fixed verifier identity and nonce below | validate all Section 7.9 conditional fields and apply Section 8.5; no signing occurs in Checkpoint 1 |
+| Milestone 5 result vector | tracked Milestone 5 repeated-byte vector | preserve the Section 8.6 preimage and expected result unchanged |
+| Tokenkeg artifact and hash | crates.io `litesvm` 0.1.0 package and member fixed by Section 7.4.3 | require package checksum, member length/hash, tracked mirror hash, program ID, and runner binding |
+
+For Checkpoint 1 job, receipt, and worker schema vectors only, the following frozen raw 32-byte values and canonical Base58 encodings are used. They are test data, not protocol identities and not a new hash domain:
+
+| Field | Raw bytes | Canonical Base58 |
+| --- | --- | --- |
+| `verification_round` | `0x11` repeated 32 times | `29d2S7vB453rNYFdR5Ycwt7y9haRT5fwVwL9zTmBhfV2` |
+| `proposal` | `0x12` repeated 32 times | `2DYKaRPBeNM5WdW8rNsYEktjPrnd89Mm4Lzp3qonSzoj` |
+| `invariant_account` | `0x13` repeated 32 times | `2HTciirCEfeJeikeHgCTXdfVe1zpoD3ackfU7DrPCL8S` |
+| `trace_claim` | `0x14` repeated 32 times | `2MNus2KCpxwXnp19iyXNpWSFtBD2UGjQBAL8AbtywfT9` |
+| `verifier_pubkey` | `0x15` repeated 32 times | `2RJD1KnDRGEkvuFfAGrJ7PD28LRE9LRDjZznDywagzmr` |
+
+The vector `coordinator_nonce` is `0x16` repeated 32 times and encoded as 64 lowercase hexadecimal characters. Any other placeholder SHA-256 field in a receipt or worker schema vector is `SHA256(ASCII("FAULTLINE_CP1_VECTOR_V1") || BYTE(0x00) || U16BE(byte_length(UTF8(field_path))) || UTF8(field_path))`, where `field_path` is its unique lowercase dotted JSON path recorded beside the vector constructor. This is only a reproducible source of syntactically valid vector data; production trust-path hashing still uses only Section 8. The replay-job vector's `candidate_buffer_hash` and `candidate_executable_sha256` are the selected real artifact hash, its `invariant_specification_hash` is SHA-256 of the exact tracked policy-file bytes (`b63f9fccb4731d21ea15c254634ba9f569ed3ff305e6e5c16bfab3dfc53dec7c`), and all five manifest/trace bindings are their actual Section 8 hashes rather than placeholders.
+
+The positive receipt schema vector contains one closed transaction result with `index` = 0, `status` = `success`, `error` = `null`, `compute_units` = 1, `return_data_sha256` = `null`, and a path-derived `logs_sha256`; its three pre-state and three post-state hashes use the required selector order and path-derived digests. It has `normalized_logs_sha256` from the same rule, `classification` = `Preserved`, `result_code` = 0, and `total_compute_units` = `"1"`. This is deliberately a format vector rather than an execution receipt. The positive unsigned worker vector uses ordinal 0, the frozen verifier public key, `classification` = `Preserved`, `result_code` = 0, `verdict_u8` = 0, `process_peak_memory_bytes` = `"1"`, `elapsed_milliseconds` = `"1"`, the actual positive receipt hash, the Section 8.6 commitment computed from the vector job bindings, and a matching attestation intent. Negative vectors make one specified mutation at a time; they do not introduce additional source data.
+
+Derived JSON files are pretty-printed only for repository review and end with exactly one LF. Their hashes always use re-parsed Section 6 canonical bytes, which contain no trailing newline. The generator runs twice in Checkpoint 1 and the second run must produce byte-for-byte identical manifests, binary mirror, and vectors.
 
 ---
 
