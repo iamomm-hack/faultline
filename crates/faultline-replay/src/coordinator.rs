@@ -5,6 +5,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,90 @@ pub struct Coordinator {
     worker_executable: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliedJobLimits {
+    pub active_process_limit: u32,
+    pub process_memory_limit_bytes: u64,
+    pub job_memory_limit_bytes: u64,
+    pub user_mode_cpu_limit_100ns: u64,
+    pub wall_timeout_milliseconds: u64,
+    pub cleanup_grace_milliseconds: u64,
+    pub stdout_limit_bytes: u64,
+    pub stderr_limit_bytes: u64,
+    pub queried_back_from_job_object: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminationCause {
+    Completed,
+    SetupFailure,
+    AbnormalExit,
+    WallTimeout,
+    CpuLimit,
+    ProcessMemoryLimit,
+    JobMemoryLimit,
+    ActiveProcessLimit,
+    OutputLimit,
+    Cancelled,
+    CleanupFailure,
+}
+
+impl TerminationCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::SetupFailure => "setup_failure",
+            Self::AbnormalExit => "abnormal_exit",
+            Self::WallTimeout => "wall_timeout",
+            Self::CpuLimit => "cpu_limit",
+            Self::ProcessMemoryLimit => "process_memory_limit",
+            Self::JobMemoryLimit => "job_memory_limit",
+            Self::ActiveProcessLimit => "active_process_limit",
+            Self::OutputLimit => "output_limit",
+            Self::Cancelled => "cancelled",
+            Self::CleanupFailure => "cleanup_failure",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerRunTelemetry {
+    pub worker_ordinal: u8,
+    pub owned_pid: Option<u32>,
+    pub exit_status_u32: Option<u32>,
+    pub peak_process_memory_bytes: Option<u64>,
+    pub peak_job_memory_bytes: Option<u64>,
+    pub launch_to_exit_elapsed_milliseconds: u64,
+    pub cleanup_elapsed_milliseconds: u64,
+    pub applied_limits: Option<AppliedJobLimits>,
+    pub termination_cause: TerminationCause,
+    pub cleanup_verified: bool,
+    pub collection_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardTelemetry {
+    pub launch_attempts: u8,
+    pub retry_attempts: u8,
+    pub workers: Vec<WorkerRunTelemetry>,
+    pub run_directory_removed: bool,
+    pub all_owned_processes_exited: bool,
+    pub all_owned_handles_closed: bool,
+}
+
+impl ShardTelemetry {
+    fn no_launches() -> Self {
+        Self {
+            launch_attempts: 0,
+            retry_attempts: 0,
+            workers: Vec::new(),
+            run_directory_removed: true,
+            all_owned_processes_exited: true,
+            all_owned_handles_closed: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ShardOutcome {
     pub classification: Classification,
@@ -46,6 +131,7 @@ pub struct ShardOutcome {
     pub process_ids: Vec<u32>,
     pub diagnostics: Vec<String>,
     pub launch_attempts: usize,
+    pub telemetry: ShardTelemetry,
 }
 
 impl ShardOutcome {
@@ -58,6 +144,7 @@ impl ShardOutcome {
             process_ids: Vec::new(),
             diagnostics,
             launch_attempts: 0,
+            telemetry: ShardTelemetry::no_launches(),
         }
     }
 }
@@ -213,22 +300,26 @@ impl Coordinator {
         for (request, request_frame, signing_frame) in prepared {
             let repository = Arc::clone(&repository);
             let executable = Arc::clone(&executable);
-            joins.push(std::thread::spawn(move || {
-                let observation = run_isolated(
-                    executable.as_path(),
-                    repository.as_path(),
-                    request_frame,
-                    signing_frame,
-                );
-                (request, observation)
-            }));
+            let thread_request = request.clone();
+            joins.push((
+                request,
+                std::thread::spawn(move || {
+                    run_isolated(
+                        thread_request.worker_ordinal,
+                        executable.as_path(),
+                        repository.as_path(),
+                        request_frame,
+                        signing_frame,
+                    )
+                }),
+            ));
         }
         let mut observations = Vec::new();
-        for join in joins {
+        for (request, join) in joins {
             match join.join() {
-                Ok(value) => observations.push(value),
+                Ok(value) => observations.push((request, value)),
                 Err(_) => observations.push((
-                    impossible_request(&job, &paths),
+                    request,
                     Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "coordinator runner thread panicked",
@@ -241,16 +332,37 @@ impl Coordinator {
         let mut process_ids = Vec::new();
         let mut failures = Vec::new();
         let mut signed = Vec::new();
+        let mut telemetry = Vec::new();
+        let mut handle_status = Vec::new();
         for (request, observation) in observations {
             let observation = match observation {
                 Ok(value) => value,
                 Err(error) => {
                     diagnostics.push(error.to_string());
                     failures.push((Classification::RunnerFault, RUNNER_ISOLATION_SETUP));
+                    telemetry.push((
+                        WorkerRunTelemetry {
+                            worker_ordinal: request.worker_ordinal,
+                            owned_pid: None,
+                            exit_status_u32: None,
+                            peak_process_memory_bytes: None,
+                            peak_job_memory_bytes: None,
+                            launch_to_exit_elapsed_milliseconds: 0,
+                            cleanup_elapsed_milliseconds: 0,
+                            applied_limits: None,
+                            termination_cause: TerminationCause::SetupFailure,
+                            cleanup_verified: false,
+                            collection_error: Some(error.to_string()),
+                        },
+                        None,
+                    ));
+                    handle_status.push(true);
                     continue;
                 }
             };
             process_ids.push(observation.process_id);
+            telemetry.push((observation.telemetry, Some(observation.cleanup_started)));
+            handle_status.push(observation.all_owned_handles_closed);
             if !observation.stderr.is_empty() {
                 diagnostics.push(String::from_utf8_lossy(&observation.stderr).into_owned());
             }
@@ -269,15 +381,11 @@ impl Coordinator {
                 ));
                 continue;
             }
-            let response = parse_response(&observation.response);
-            let response = match response {
+            let response = match parse_response_or_failure(&observation.response) {
                 Ok(value) => value,
-                Err(error) => {
-                    diagnostics.push(error.to_string());
-                    failures.push((
-                        Classification::RunnerFault,
-                        RUNNER_OUTPUT_LIMIT_OR_MALFORMED_OUTPUT,
-                    ));
+                Err((classification, result_code, diagnostic)) => {
+                    diagnostics.push(diagnostic);
+                    failures.push((classification, result_code));
                     continue;
                 }
             };
@@ -310,7 +418,25 @@ impl Coordinator {
             signed.push(value);
         }
 
-        if !cleanup_run_directory(&run_root) {
+        let directory_cleanup_started = Instant::now();
+        let run_directory_removed = cleanup_run_directory(&run_root);
+        let directory_cleanup_elapsed = milliseconds(directory_cleanup_started.elapsed());
+        for (value, started) in &mut telemetry {
+            value.cleanup_elapsed_milliseconds = started
+                .map(|instant| milliseconds(instant.elapsed()))
+                .unwrap_or(directory_cleanup_elapsed);
+        }
+        telemetry.sort_by_key(|(value, _)| value.worker_ordinal);
+        let workers: Vec<_> = telemetry.into_iter().map(|(value, _)| value).collect();
+        let shard_telemetry = ShardTelemetry {
+            launch_attempts: 3,
+            retry_attempts: 0,
+            all_owned_processes_exited: workers.iter().all(|value| value.cleanup_verified),
+            all_owned_handles_closed: handle_status.into_iter().all(|value| value),
+            workers,
+            run_directory_removed,
+        };
+        if !run_directory_removed {
             failures.push((Classification::RunnerFault, RUNNER_CLEANUP));
         }
         if !failures.is_empty() {
@@ -323,6 +449,7 @@ impl Coordinator {
                 process_ids,
                 diagnostics,
                 launch_attempts: 3,
+                telemetry: shard_telemetry,
             };
         }
         match agree(signed) {
@@ -330,6 +457,7 @@ impl Coordinator {
                 outcome.process_ids = process_ids;
                 outcome.diagnostics = diagnostics;
                 outcome.launch_attempts = 3;
+                outcome.telemetry = shard_telemetry;
                 outcome
             }
             Err((classification, code)) => ShardOutcome {
@@ -340,6 +468,7 @@ impl Coordinator {
                 process_ids,
                 diagnostics,
                 launch_attempts: 3,
+                telemetry: shard_telemetry,
             },
         }
     }
@@ -417,6 +546,19 @@ fn parse_response(frame: &[u8]) -> Result<WorkerResponse> {
     )
     .map_err(|error| Error::Validation(format!("invalid response frame: {error:?}")))?;
     ipc::parse_canonical(&payload)
+}
+
+#[cfg(windows)]
+pub(crate) fn parse_response_or_failure(
+    frame: &[u8],
+) -> std::result::Result<WorkerResponse, (Classification, u32, String)> {
+    parse_response(frame).map_err(|error| {
+        (
+            Classification::RunnerFault,
+            RUNNER_OUTPUT_LIMIT_OR_MALFORMED_OUTPUT,
+            error.to_string(),
+        )
+    })
 }
 
 fn verify_authenticated(
@@ -555,7 +697,12 @@ fn agree(
         process_ids: Vec::new(),
         diagnostics: Vec::new(),
         launch_attempts: 3,
+        telemetry: ShardTelemetry::no_launches(),
     })
+}
+
+fn milliseconds(duration: std::time::Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn highest_precedence(failures: &[(Classification, u32)]) -> (Classification, u32) {
@@ -620,19 +767,6 @@ fn reparse(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn reparse(_: &fs::Metadata) -> bool {
     false
-}
-
-#[cfg(windows)]
-fn impossible_request(job: &ReplayJob, paths: &InputPaths) -> WorkerRequest {
-    WorkerRequest {
-        schema: "faultline.worker-request.v1".into(),
-        canonicalization: crate::schema::CANONICALIZATION.into(),
-        coordinator_nonce: "00".repeat(32),
-        worker_ordinal: 0,
-        expected_verifier_pubkey: "11111111111111111111111111111111".into(),
-        replay_job: job.clone(),
-        input_paths: paths.clone(),
-    }
 }
 
 #[cfg(test)]

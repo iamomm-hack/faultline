@@ -3,11 +3,72 @@
 use std::{fs, path::Path};
 
 use faultline_replay::{
-    coordinator::{Coordinator, IdentityMode},
+    coordinator::{Coordinator, IdentityMode, ShardOutcome, TerminationCause},
     hash,
     ipc::InputPaths,
     schema::{parse_validated, Classification, ReplayJob},
 };
+
+fn assert_success_telemetry(outcome: &ShardOutcome, candidate: &str) {
+    let telemetry = &outcome.telemetry;
+    assert_eq!(telemetry.launch_attempts, 3);
+    assert_eq!(telemetry.retry_attempts, 0);
+    assert_eq!(telemetry.workers.len(), 3);
+    assert!(telemetry.run_directory_removed);
+    assert!(telemetry.all_owned_processes_exited);
+    assert!(telemetry.all_owned_handles_closed);
+    assert_eq!(
+        telemetry
+            .workers
+            .iter()
+            .map(|value| value.worker_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    for worker in &telemetry.workers {
+        assert!(worker.owned_pid.is_some());
+        assert_eq!(worker.exit_status_u32, Some(0));
+        assert!(worker
+            .peak_process_memory_bytes
+            .is_some_and(|value| value > 0));
+        assert!(worker.peak_job_memory_bytes.is_some_and(|value| value > 0));
+        assert!(worker.launch_to_exit_elapsed_milliseconds > 0);
+        assert!(worker.cleanup_elapsed_milliseconds > 0);
+        assert_eq!(worker.termination_cause, TerminationCause::Completed);
+        assert!(worker.cleanup_verified);
+        assert_eq!(worker.collection_error, None);
+        let limits = worker.applied_limits.as_ref().expect("applied Job limits");
+        assert_eq!(limits.active_process_limit, 1);
+        assert_eq!(limits.process_memory_limit_bytes, 512 * 1024 * 1024);
+        assert_eq!(limits.job_memory_limit_bytes, 512 * 1024 * 1024);
+        assert_eq!(limits.user_mode_cpu_limit_100ns, 25 * 10_000_000);
+        assert_eq!(limits.wall_timeout_milliseconds, 30_000);
+        assert_eq!(limits.cleanup_grace_milliseconds, 5_000);
+        assert_eq!(limits.stdout_limit_bytes, 8 * 1024 * 1024);
+        assert_eq!(limits.stderr_limit_bytes, 1024 * 1024);
+        assert!(limits.queried_back_from_job_object);
+        println!(
+            "telemetry candidate={candidate} ordinal={} pid={} exit={} peak_process_bytes={} peak_job_bytes={} execution_ms={} cleanup_ms={} cause={} limits_queried_back={} cleanup_verified={}",
+            worker.worker_ordinal,
+            worker.owned_pid.unwrap(),
+            worker.exit_status_u32.unwrap(),
+            worker.peak_process_memory_bytes.unwrap(),
+            worker.peak_job_memory_bytes.unwrap(),
+            worker.launch_to_exit_elapsed_milliseconds,
+            worker.cleanup_elapsed_milliseconds,
+            worker.termination_cause.as_str(),
+            limits.queried_back_from_job_object,
+            worker.cleanup_verified
+        );
+    }
+    assert!(
+        outcome
+            .signed_outputs
+            .iter()
+            .all(|value| value.output.process_peak_memory_bytes == "0"),
+        "signed sentinel must remain outside measured telemetry"
+    );
+}
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -152,4 +213,48 @@ fn assertion_25_real_three_worker_v3_consensus() {
             value.output.replay_result_commitment.as_deref().unwrap()
         );
     }
+}
+
+#[test]
+fn assertion_28_real_v2_v3_production_workers_leave_no_owned_residue() {
+    let coordinator = Coordinator::new(root()).unwrap();
+    let v2 = coordinator.run_repository_candidate("v2", IdentityMode::Production);
+    assert_eq!(
+        v2.classification,
+        Classification::Violated,
+        "{:?}",
+        v2.diagnostics
+    );
+    assert_eq!(v2.signed_outputs.len(), 3);
+    assert_eq!(v2.attestation_intents.len(), 3);
+    assert_success_telemetry(&v2, "v2");
+
+    let v3 = coordinator.run_repository_candidate("v3", IdentityMode::Production);
+    assert_eq!(
+        v3.classification,
+        Classification::Preserved,
+        "{:?}",
+        v3.diagnostics
+    );
+    assert_eq!(v3.signed_outputs.len(), 3);
+    assert_eq!(v3.attestation_intents.len(), 3);
+    assert_success_telemetry(&v3, "v3");
+
+    let baseline = "633a46fb44a034484d14349cd62af4e6a548dcb9";
+    let diff = std::process::Command::new("git")
+        .current_dir(root())
+        .args(["diff", "--quiet", baseline, "--", "programs"])
+        .status()
+        .unwrap();
+    assert!(diff.success(), "production Solana source changed");
+    let untracked = std::process::Command::new("git")
+        .current_dir(root())
+        .args(["status", "--porcelain", "--", "programs"])
+        .output()
+        .unwrap();
+    assert!(untracked.status.success());
+    assert!(
+        untracked.stdout.is_empty(),
+        "untracked production Solana source"
+    );
 }

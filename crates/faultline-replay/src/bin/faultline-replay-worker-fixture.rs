@@ -75,6 +75,7 @@ fn main() {
             let _ = std::io::stdout().write_all(&frame);
         }
         11 => {}
+        12 => std::process::exit(79),
         _ => std::process::exit(65),
     }
 }

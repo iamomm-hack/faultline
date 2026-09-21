@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn assertion_15_internal_worker_failure_is_runner_fault_without_evidence() {
+    fn failure_response_schema_has_no_signed_evidence() {
         let response = WorkerResponse {
             schema: "faultline.worker-response.v1".into(),
             canonicalization: CANONICALIZATION.into(),

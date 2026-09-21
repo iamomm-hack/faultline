@@ -40,7 +40,10 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::ipc::{MAX_RESPONSE_BYTES, MAX_STDERR_BYTES};
+use crate::{
+    coordinator::{AppliedJobLimits, TerminationCause, WorkerRunTelemetry},
+    ipc::{MAX_RESPONSE_BYTES, MAX_STDERR_BYTES},
+};
 
 const MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 const CPU_100NS: i64 = 25 * 10_000_000;
@@ -63,9 +66,10 @@ pub struct RunObservation {
     pub process_id: u32,
     pub response: Vec<u8>,
     pub stderr: Vec<u8>,
-    #[allow(dead_code)]
-    pub exit_code: u32,
     pub fault: Option<RunFault>,
+    pub telemetry: WorkerRunTelemetry,
+    pub(crate) cleanup_started: Instant,
+    pub all_owned_handles_closed: bool,
 }
 
 struct OwnedHandle(HANDLE);
@@ -129,11 +133,13 @@ impl Pipe {
 }
 
 pub fn run_isolated(
+    worker_ordinal: u8,
     executable: &Path,
     repository: &Path,
     request_frame: Vec<u8>,
     signing_frame: Vec<u8>,
 ) -> std::io::Result<RunObservation> {
+    let launch_started = Instant::now();
     let mut stdin_pipe = Pipe::create()?;
     let mut stdout_pipe = Pipe::create()?;
     let mut stderr_pipe = Pipe::create()?;
@@ -267,35 +273,91 @@ pub fn run_isolated(
     );
 
     let wait = unsafe { WaitForSingleObject(process_handle.raw(), WALL_MILLISECONDS) };
+    let cleanup_started = Instant::now();
     let wall_timeout = wait == WAIT_TIMEOUT;
     let wait_failed = wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT;
+    let mut process_termination_confirmed = wait == WAIT_OBJECT_0;
     if wall_timeout || wait_failed {
         unsafe { TerminateJobObject(job.raw(), 0xF17E_0003) };
-        unsafe { WaitForSingleObject(process_handle.raw(), CLEANUP_GRACE.as_millis() as u32) };
+        process_termination_confirmed =
+            unsafe { WaitForSingleObject(process_handle.raw(), CLEANUP_GRACE.as_millis() as u32) }
+                == WAIT_OBJECT_0;
     }
+    let launch_to_exit_elapsed_milliseconds = milliseconds(launch_started.elapsed());
     let _ = request_writer.join();
     let _ = signing_writer.join();
     let response = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
 
-    let mut exit_code = u32::MAX;
-    unsafe { GetExitCodeProcess(process_handle.raw(), &mut exit_code) };
+    let mut collection_errors = Vec::new();
+    let exit_code = if process_termination_confirmed {
+        let mut value = 0_u32;
+        if unsafe { GetExitCodeProcess(process_handle.raw(), &mut value) } == 0 {
+            collection_errors.push(format!(
+                "GetExitCodeProcess failed: {}",
+                std::io::Error::last_os_error()
+            ));
+            None
+        } else {
+            Some(value)
+        }
+    } else {
+        collection_errors
+            .push("process termination was not confirmed before telemetry query".into());
+        None
+    };
     let violations = limit_violations(job.raw());
-    let (peak_job_memory, total_user_time) = job_usage(job.raw());
+    let extended = match extended_job_information(job.raw()) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            collection_errors.push(format!(
+                "Job Object extended telemetry query failed: {error}"
+            ));
+            None
+        }
+    };
+    let peak_process_memory = extended
+        .as_ref()
+        .map(|value| value.PeakProcessMemoryUsed as u64);
+    let peak_job_memory = extended
+        .as_ref()
+        .map(|value| value.PeakJobMemoryUsed as u64);
+    let applied_limits = extended.as_ref().map(|value| {
+        let matched = queried_limits_match(value);
+        if !matched {
+            collection_errors
+                .push("queried Job Object limits do not match the applied frozen limits".into());
+        }
+        frozen_limits(matched)
+    });
+    let total_user_time = match total_user_time(job.raw()) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            collection_errors.push(format!("Job Object accounting query failed: {error}"));
+            None
+        }
+    };
+    let exit_code_for_fault = exit_code.unwrap_or(u32::MAX);
     #[cfg(test)]
-    let fixture_active_process_violation = exit_code == 77;
+    let fixture_active_process_violation = exit_code == Some(77);
     #[cfg(not(test))]
     let fixture_active_process_violation = false;
-    let cleanup_failed = !wait_for_job_empty(job.raw(), CLEANUP_GRACE);
+    #[cfg(test)]
+    let fixture_internal_failure = exit_code == Some(79);
+    #[cfg(not(test))]
+    let fixture_internal_failure = false;
+    let job_empty = wait_for_job_empty(job.raw(), CLEANUP_GRACE);
+    let cleanup_failed = !process_termination_confirmed || !job_empty;
     let fault = if cleanup_failed {
         Some(RunFault::Cleanup)
     } else if violations & (JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY) != 0
-        || (exit_code != 0 && peak_job_memory >= MEMORY_LIMIT.saturating_sub(32 * 1024 * 1024))
+        || (exit_code_for_fault != 0
+            && peak_job_memory.unwrap_or(0) >= MEMORY_LIMIT.saturating_sub(32 * 1024 * 1024) as u64)
     {
         Some(RunFault::Memory)
     } else if wall_timeout
         || violations & JOB_OBJECT_LIMIT_PROCESS_TIME != 0
-        || total_user_time >= CPU_100NS.saturating_sub(10_000_000)
+        || total_user_time.unwrap_or(0) >= CPU_100NS.saturating_sub(10_000_000)
     {
         Some(RunFault::Timeout)
     } else if violations & JOB_OBJECT_LIMIT_ACTIVE_PROCESS != 0 || fixture_active_process_violation
@@ -303,12 +365,55 @@ pub fn run_isolated(
         Some(RunFault::Isolation)
     } else if exceeded.load(Ordering::SeqCst) {
         Some(RunFault::Output)
-    } else if wait_failed {
+    } else if wait_failed || fixture_internal_failure {
         Some(RunFault::Internal)
-    } else if exit_code != 0 {
+    } else if exit_code_for_fault != 0 {
         Some(RunFault::Crash)
     } else {
         None
+    };
+
+    let termination_cause = if cleanup_failed {
+        TerminationCause::CleanupFailure
+    } else if violations & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0 {
+        TerminationCause::ProcessMemoryLimit
+    } else if violations & JOB_OBJECT_LIMIT_JOB_MEMORY != 0
+        || matches!(fault, Some(RunFault::Memory))
+    {
+        TerminationCause::JobMemoryLimit
+    } else if wall_timeout {
+        TerminationCause::WallTimeout
+    } else if violations & JOB_OBJECT_LIMIT_PROCESS_TIME != 0
+        || total_user_time.unwrap_or(0) >= CPU_100NS.saturating_sub(10_000_000)
+    {
+        TerminationCause::CpuLimit
+    } else if violations & JOB_OBJECT_LIMIT_ACTIVE_PROCESS != 0 || fixture_active_process_violation
+    {
+        TerminationCause::ActiveProcessLimit
+    } else if exceeded.load(Ordering::SeqCst) {
+        TerminationCause::OutputLimit
+    } else if fault.is_some() {
+        TerminationCause::AbnormalExit
+    } else {
+        TerminationCause::Completed
+    };
+
+    let telemetry = WorkerRunTelemetry {
+        worker_ordinal,
+        owned_pid: Some(process_id),
+        exit_status_u32: exit_code,
+        peak_process_memory_bytes: peak_process_memory,
+        peak_job_memory_bytes: peak_job_memory,
+        launch_to_exit_elapsed_milliseconds,
+        cleanup_elapsed_milliseconds: milliseconds(cleanup_started.elapsed()),
+        applied_limits,
+        termination_cause,
+        cleanup_verified: process_termination_confirmed && job_empty,
+        collection_error: if collection_errors.is_empty() {
+            None
+        } else {
+            Some(collection_errors.join("; "))
+        },
     };
 
     drop(process_handle);
@@ -317,8 +422,10 @@ pub fn run_isolated(
         process_id,
         response,
         stderr,
-        exit_code,
         fault,
+        telemetry,
+        cleanup_started,
+        all_owned_handles_closed: true,
     })
 }
 
@@ -398,9 +505,9 @@ fn limit_violations(job: HANDLE) -> u32 {
     }
 }
 
-fn job_usage(job: HANDLE) -> (usize, i64) {
+fn extended_job_information(job: HANDLE) -> std::io::Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> {
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
-    let limits_ok = unsafe {
+    let ok = unsafe {
         QueryInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
@@ -409,8 +516,16 @@ fn job_usage(job: HANDLE) -> (usize, i64) {
             null_mut(),
         )
     };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(limits)
+    }
+}
+
+fn total_user_time(job: HANDLE) -> std::io::Result<i64> {
     let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
-    let accounting_ok = unsafe {
+    let ok = unsafe {
         QueryInformationJobObject(
             job,
             JobObjectBasicAccountingInformation,
@@ -419,18 +534,42 @@ fn job_usage(job: HANDLE) -> (usize, i64) {
             null_mut(),
         )
     };
-    (
-        if limits_ok == 0 {
-            0
-        } else {
-            limits.PeakJobMemoryUsed
-        },
-        if accounting_ok == 0 {
-            0
-        } else {
-            accounting.TotalUserTime
-        },
-    )
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(accounting.TotalUserTime)
+    }
+}
+
+fn queried_limits_match(value: &JOBOBJECT_EXTENDED_LIMIT_INFORMATION) -> bool {
+    let required_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        | JOB_OBJECT_LIMIT_JOB_MEMORY
+        | JOB_OBJECT_LIMIT_PROCESS_TIME;
+    value.BasicLimitInformation.LimitFlags & required_flags == required_flags
+        && value.BasicLimitInformation.ActiveProcessLimit == 1
+        && value.BasicLimitInformation.PerProcessUserTimeLimit == CPU_100NS
+        && value.ProcessMemoryLimit == MEMORY_LIMIT
+        && value.JobMemoryLimit == MEMORY_LIMIT
+}
+
+fn frozen_limits(queried_back_from_job_object: bool) -> AppliedJobLimits {
+    AppliedJobLimits {
+        active_process_limit: 1,
+        process_memory_limit_bytes: MEMORY_LIMIT as u64,
+        job_memory_limit_bytes: MEMORY_LIMIT as u64,
+        user_mode_cpu_limit_100ns: CPU_100NS as u64,
+        wall_timeout_milliseconds: WALL_MILLISECONDS as u64,
+        cleanup_grace_milliseconds: CLEANUP_GRACE.as_millis() as u64,
+        stdout_limit_bytes: MAX_RESPONSE_BYTES as u64,
+        stderr_limit_bytes: MAX_STDERR_BYTES as u64,
+        queried_back_from_job_object,
+    }
+}
+
+fn milliseconds(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn wait_for_job_empty(job: HANDLE, grace: Duration) -> bool {
@@ -480,6 +619,7 @@ fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
 #[cfg(all(test, feature = "test-helper"))]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
 
     fn root() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -498,39 +638,102 @@ mod tests {
     }
 
     fn run(mode: u8) -> RunObservation {
-        run_isolated(&helper(), &root(), vec![mode], Vec::new()).unwrap()
+        static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = SERIAL.get_or_init(|| Mutex::new(())).lock().unwrap();
+        run_isolated(0, &helper(), &root(), vec![mode], Vec::new()).unwrap()
     }
 
     #[test]
-    fn assertion_15_crash_memory_output_and_active_process_limits_are_runner_faults() {
+    fn assertion_15_crash_is_runner_fault() {
         assert_eq!(run(0).fault, Some(RunFault::Crash));
+    }
+
+    #[test]
+    fn assertion_15_panic_is_runner_fault() {
         assert_eq!(run(1).fault, Some(RunFault::Crash));
+    }
+
+    #[test]
+    fn assertion_15_memory_limit_is_runner_fault() {
         assert_eq!(run(4).fault, Some(RunFault::Memory));
+    }
+
+    #[test]
+    fn assertion_15_internal_worker_failure_is_executed_and_is_runner_fault() {
+        let observation = run(12);
+        assert_eq!(observation.telemetry.exit_status_u32, Some(79));
+        assert_eq!(observation.fault, Some(RunFault::Internal));
+        assert_eq!(
+            observation.telemetry.termination_cause,
+            TerminationCause::AbnormalExit
+        );
+    }
+
+    #[test]
+    fn stdout_limit_is_runner_fault() {
         assert_eq!(run(5).fault, Some(RunFault::Output));
+    }
+
+    #[test]
+    fn stderr_limit_is_runner_fault() {
         assert_eq!(run(6).fault, Some(RunFault::Output));
+    }
+
+    #[test]
+    fn active_process_limit_is_runner_fault() {
         assert_eq!(run(9).fault, Some(RunFault::Isolation));
     }
 
     #[test]
-    fn assertion_16_wall_and_cpu_expiration_are_timeout_runner_faults() {
+    fn assertion_16_wall_expiration_is_timeout_runner_fault() {
         assert_eq!(run(2).fault, Some(RunFault::Timeout));
+    }
+
+    #[test]
+    fn cpu_limit_is_timeout_runner_fault() {
         assert_eq!(run(3).fault, Some(RunFault::Timeout));
     }
 
     #[test]
-    fn malformed_partial_and_trailing_outputs_are_bounded_for_coordinator_rejection() {
+    fn partial_output_is_bounded_for_coordinator_rejection() {
         let partial = run(7);
         assert_eq!(partial.fault, None);
         assert_eq!(partial.response, b"FLTWORK1");
+        assert_coordinator_rejects_output(&partial.response);
+    }
+
+    #[test]
+    fn trailing_output_is_bounded_for_coordinator_rejection() {
         let trailing = run(8);
         assert_eq!(trailing.fault, None);
         assert!(trailing.response.ends_with(&[1]));
+        assert_coordinator_rejects_output(&trailing.response);
+    }
+
+    #[test]
+    fn malformed_output_is_bounded_for_coordinator_rejection() {
         let malformed = run(10);
         assert_eq!(malformed.fault, None);
         assert!(malformed.response.starts_with(b"FLTWORK1"));
+        assert_coordinator_rejects_output(&malformed.response);
+    }
+
+    #[test]
+    fn missing_output_is_bounded_for_coordinator_rejection() {
         let missing = run(11);
         assert_eq!(missing.fault, None);
         assert!(missing.response.is_empty());
+        assert_coordinator_rejects_output(&missing.response);
+    }
+
+    fn assert_coordinator_rejects_output(response: &[u8]) {
+        let (classification, result_code, _) =
+            crate::coordinator::parse_response_or_failure(response).unwrap_err();
+        assert_eq!(classification, crate::schema::Classification::RunnerFault);
+        assert_eq!(
+            result_code,
+            crate::ipc::RUNNER_OUTPUT_LIMIT_OR_MALFORMED_OUTPUT
+        );
     }
 
     #[test]
