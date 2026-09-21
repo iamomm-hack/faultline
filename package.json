@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "bootstrap:ids": "tsx scripts/bootstrap-ids.ts",
     "build:programs": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-programs.ps1",
@@ -18,7 +21,10 @@
     "test": "npm run demo:guard",
     "test:guard": "npm run demo:guard",
     "test:treasury-versions": "npm run demo:exploit-v2 && npm run demo:patch-v3",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "typecheck:m8-c1": "tsc -p packages/faultline-idl/tsconfig.json --noEmit && tsc -p packages/faultline-sdk/tsconfig.json --noEmit",
+    "test:m8-c1": "tsx --test --test-concurrency=1 packages/faultline-sdk/tests/checkpoint1.test.ts",
+    "verify:m8-idl": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-milestone-8-idl.ps1 -Check"
   },
   "devDependencies": {
     "@solana/web3.js": "1.98.4",

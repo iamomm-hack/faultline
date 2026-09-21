@@ -1,0 +1,18 @@
+{
+  "schema": "faultline.public-idl-provenance.v1",
+  "source_commit": "efb47101f55180bc19009cb1a38e8d50475b014c",
+  "generator": "anchor-cli 0.30.1",
+  "rust_toolchain": "rustc 1.89.0",
+  "generator_compatibility_patch": "strip Anchor 0.30.1 obsolete procmacro2_semver_exempt RUSTFLAGS for locked proc-macro2 1.0.106",
+  "formatting": "JSON.parse plus JSON.stringify(value, null, 2) plus LF",
+  "programs": {
+    "faultline_gate": {
+      "program_id": "9PFPNC6TMNKBCVsm4RoCgVYmqTJJTwnHHuRcysosSCCe",
+      "sha256": "f2431edbd2c919e717af0691ddc48eb04ecb1433bdba9ba5ff2075b43d30f046"
+    },
+    "faultline_treasury": {
+      "program_id": "46zDmEZAYrpwi3k6FsKFf1rPWZDbZEKM21SFzMKzb1a4",
+      "sha256": "0bb137f23061d24348119da6c9a4b1c8c7c191de591ba32dc25050ef4b28b97b"
+    }
+  }
+}

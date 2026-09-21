@@ -1,0 +1,496 @@
+{
+  "address": "46zDmEZAYrpwi3k6FsKFf1rPWZDbZEKM21SFzMKzb1a4",
+  "metadata": {
+    "name": "faultline_treasury",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Faultline demo treasury target with safe, vulnerable, and patched builds"
+  },
+  "instructions": [
+    {
+      "name": "admin_withdraw",
+      "discriminator": [
+        160,
+        166,
+        147,
+        222,
+        46,
+        220,
+        75,
+        224
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true
+        },
+        {
+          "name": "treasury_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  101,
+                  97,
+                  115,
+                  117,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_token_account",
+          "writable": true
+        },
+        {
+          "name": "destination_token_account",
+          "writable": true
+        },
+        {
+          "name": "payment_mint"
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "deposit",
+      "discriminator": [
+        242,
+        35,
+        198,
+        137,
+        82,
+        225,
+        242,
+        182
+      ],
+      "accounts": [
+        {
+          "name": "depositor",
+          "signer": true
+        },
+        {
+          "name": "treasury_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  101,
+                  97,
+                  115,
+                  117,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "depositor_token_account",
+          "writable": true
+        },
+        {
+          "name": "vault_token_account",
+          "writable": true
+        },
+        {
+          "name": "payment_mint"
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "initialize_treasury",
+      "discriminator": [
+        124,
+        186,
+        211,
+        195,
+        85,
+        165,
+        129,
+        166
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "admin",
+          "signer": true
+        },
+        {
+          "name": "treasury_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  101,
+                  97,
+                  115,
+                  117,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_token_account"
+        },
+        {
+          "name": "payment_mint"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "initialize_version",
+      "discriminator": [
+        58,
+        139,
+        131,
+        234,
+        203,
+        80,
+        203,
+        203
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "version_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  101,
+                  114,
+                  115,
+                  105,
+                  111,
+                  110
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "migrate_authority",
+      "discriminator": [
+        208,
+        84,
+        72,
+        24,
+        205,
+        144,
+        51,
+        86
+      ],
+      "accounts": [
+        {
+          "name": "treasury_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  114,
+                  101,
+                  97,
+                  115,
+                  117,
+                  114,
+                  121
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "current_admin"
+        },
+        {
+          "name": "new_admin",
+          "signer": true
+        },
+        {
+          "name": "vault_token_account"
+        },
+        {
+          "name": "payment_mint"
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "refresh_version",
+      "discriminator": [
+        2,
+        234,
+        48,
+        150,
+        229,
+        93,
+        243,
+        182
+      ],
+      "accounts": [
+        {
+          "name": "version_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  101,
+                  114,
+                  115,
+                  105,
+                  111,
+                  110
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    }
+  ],
+  "accounts": [
+    {
+      "name": "TreasuryState",
+      "discriminator": [
+        240,
+        56,
+        226,
+        158,
+        138,
+        244,
+        79,
+        154
+      ]
+    },
+    {
+      "name": "VersionState",
+      "discriminator": [
+        157,
+        121,
+        106,
+        239,
+        219,
+        57,
+        247,
+        78
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "ArithmeticOverflow",
+      "msg": "Arithmetic overflow or underflow"
+    },
+    {
+      "code": 6001,
+      "name": "InvalidAmount",
+      "msg": "Amount must be non-zero"
+    },
+    {
+      "code": 6002,
+      "name": "InvalidTokenAccount",
+      "msg": "SPL Token account layout or initialized state is invalid"
+    },
+    {
+      "code": 6003,
+      "name": "MigrationUnavailable",
+      "msg": "Migration is unavailable in v1"
+    },
+    {
+      "code": 6004,
+      "name": "CurrentAdminMustSign",
+      "msg": "The current admin signer is required"
+    },
+    {
+      "code": 6005,
+      "name": "UnauthorizedAdmin",
+      "msg": "Unauthorized treasury admin"
+    },
+    {
+      "code": 6006,
+      "name": "UnauthorizedTokenOwner",
+      "msg": "Token account owner is not the transaction signer"
+    },
+    {
+      "code": 6007,
+      "name": "UnexpectedSchemaVersion",
+      "msg": "Unexpected treasury schema version"
+    },
+    {
+      "code": 6008,
+      "name": "InvalidNewAdmin",
+      "msg": "New admin cannot be the default pubkey"
+    },
+    {
+      "code": 6009,
+      "name": "WrongAccountOwner",
+      "msg": "Token account is owned by the wrong program"
+    },
+    {
+      "code": 6010,
+      "name": "WrongTokenProgram",
+      "msg": "Wrong Tokenkeg program"
+    },
+    {
+      "code": 6011,
+      "name": "WrongTokenMint",
+      "msg": "Wrong token mint"
+    },
+    {
+      "code": 6012,
+      "name": "WrongVault",
+      "msg": "Wrong treasury vault account"
+    },
+    {
+      "code": 6013,
+      "name": "WrongVaultAuthority",
+      "msg": "Treasury vault token authority is wrong"
+    },
+    {
+      "code": 6014,
+      "name": "VaultMustStartEmpty",
+      "msg": "Treasury vault must start empty"
+    }
+  ],
+  "types": [
+    {
+      "name": "TreasuryState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "schema_version",
+            "type": "u8"
+          },
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault_token_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "total_deposited",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                128
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "VersionState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u16"
+          },
+          {
+            "name": "marker",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    }
+  ]
+}

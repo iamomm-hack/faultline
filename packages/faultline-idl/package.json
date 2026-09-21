@@ -1,0 +1,17 @@
+{
+  "name": "@faultline/idl",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./faultline_gate.json": "./idl/faultline_gate.json",
+    "./faultline_treasury.json": "./idl/faultline_treasury.json",
+    "./provenance.json": "./provenance.json"
+  },
+  "files": [
+    "idl",
+    "provenance.json",
+    "src"
+  ]
+}
