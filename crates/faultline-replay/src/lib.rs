@@ -4,6 +4,7 @@ pub mod generator;
 pub mod hash;
 pub mod invariant;
 pub mod ipc;
+pub mod operator;
 pub mod paths;
 pub mod receipt;
 pub mod runner;

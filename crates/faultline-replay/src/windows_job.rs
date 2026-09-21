@@ -256,7 +256,7 @@ pub fn run_isolated(
     let stdout_file = unsafe { File::from_raw_handle(stdout_pipe.read.take()) };
     let stderr_file = unsafe { File::from_raw_handle(stderr_pipe.read.take()) };
     let request_writer = thread::spawn(move || write_and_close(stdin_file, request_frame));
-    let signing_writer = thread::spawn(move || write_and_close(signing_file, signing_frame));
+    let signing_writer = thread::spawn(move || write_clear_and_close(signing_file, signing_frame));
 
     let exceeded = Arc::new(AtomicBool::new(false));
     let stdout_reader = spawn_bounded_reader(
@@ -485,6 +485,15 @@ fn spawn_bounded_reader(
 fn write_and_close(mut file: File, bytes: Vec<u8>) {
     let _ = file.write_all(&bytes);
     let _ = file.flush();
+}
+
+fn write_clear_and_close(mut file: File, mut bytes: Vec<u8>) {
+    let _ = file.write_all(&bytes);
+    let _ = file.flush();
+    for byte in &mut bytes {
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
 fn limit_violations(job: HANDLE) -> u32 {

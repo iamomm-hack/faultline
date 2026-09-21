@@ -33,6 +33,7 @@ unicode-normalization = "=0.1.25"
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
@@ -46,6 +47,10 @@ path = "src/bin/generate-formats.rs"
 [[bin]]
 name = "faultline-replay-worker"
 path = "src/bin/faultline-replay-worker.rs"
+
+[[bin]]
+name = "faultline"
+path = "src/bin/faultline.rs"
 
 [[bin]]
 name = "faultline-replay-worker-fixture"

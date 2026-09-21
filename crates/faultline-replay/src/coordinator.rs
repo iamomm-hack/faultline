@@ -134,6 +134,21 @@ pub struct ShardOutcome {
     pub telemetry: ShardTelemetry,
 }
 
+#[derive(Clone, Debug)]
+pub struct SingleWorkerOutcome {
+    pub classification: Classification,
+    pub result_code: u32,
+    pub signed_output: Option<SignedWorkerOutput>,
+    pub attestation_intent: Option<AttestationIntent>,
+    pub process_id: Option<u32>,
+    pub diagnostics: Vec<String>,
+    pub launch_attempts: u8,
+    pub retry_attempts: u8,
+    pub telemetry: Option<WorkerRunTelemetry>,
+    pub run_directory_removed: bool,
+    pub all_owned_handles_closed: bool,
+}
+
 impl ShardOutcome {
     fn failure(classification: Classification, result_code: u32, diagnostics: Vec<String>) -> Self {
         Self {
@@ -223,6 +238,226 @@ impl Coordinator {
         #[cfg(windows)]
         {
             self.run_windows(job, paths, mode)
+        }
+    }
+
+    /// Launches exactly one production worker for a caller-supplied verifier seed.
+    /// This is the Milestone 8 single-operator integration boundary; it does not
+    /// change the frozen request, response, signature, or consensus schemas.
+    pub fn run_one(&self, request: WorkerRequest, seed: &mut [u8; 32]) -> SingleWorkerOutcome {
+        #[cfg(not(windows))]
+        {
+            let _ = (request, seed);
+            return SingleWorkerOutcome {
+                classification: Classification::UnsupportedEnvironment,
+                result_code: ipc::UNSUPPORTED_ENGINE_OR_RUNTIME,
+                signed_output: None,
+                attestation_intent: None,
+                process_id: None,
+                diagnostics: vec!["Windows Job Object isolation is required".into()],
+                launch_attempts: 0,
+                retry_attempts: 0,
+                telemetry: None,
+                run_directory_removed: true,
+                all_owned_handles_closed: true,
+            };
+        }
+        #[cfg(windows)]
+        {
+            self.run_one_windows(request, seed)
+        }
+    }
+
+    #[cfg(windows)]
+    fn run_one_windows(&self, request: WorkerRequest, seed: &mut [u8; 32]) -> SingleWorkerOutcome {
+        use crate::windows_job::{run_isolated, RunFault};
+
+        let failure = |classification, result_code, diagnostics| SingleWorkerOutcome {
+            classification,
+            result_code,
+            signed_output: None,
+            attestation_intent: None,
+            process_id: None,
+            diagnostics,
+            launch_attempts: 0,
+            retry_attempts: 0,
+            telemetry: None,
+            run_directory_removed: true,
+            all_owned_handles_closed: true,
+        };
+        if let Err(error) = request.validate() {
+            return failure(
+                Classification::InvalidEvidence,
+                ipc::INVALID_SCHEMA_OR_VERSION,
+                vec![error.to_string()],
+            );
+        }
+        let signer = match keypair_from_seed(seed) {
+            Ok(value) if value.pubkey().to_string() == request.expected_verifier_pubkey => value,
+            _ => {
+                return failure(
+                    Classification::InvalidEvidence,
+                    INVALID_SIGNATURE_OR_IDENTITY,
+                    vec!["configured verifier identity mismatch".into()],
+                )
+            }
+        };
+        drop(signer);
+        let job_hash = match hash::replay_job_hash(&request.replay_job) {
+            Ok(value) => value,
+            Err(error) => {
+                return failure(
+                    Classification::InvalidEvidence,
+                    ipc::INVALID_SCHEMA_OR_VERSION,
+                    vec![error.to_string()],
+                )
+            }
+        };
+        let request_payload = match canonical::serialize_typed(&request) {
+            Ok(value) => value,
+            Err(error) => {
+                return failure(
+                    Classification::InvalidEvidence,
+                    ipc::INVALID_SCHEMA_OR_VERSION,
+                    vec![error.to_string()],
+                )
+            }
+        };
+        let request_frame =
+            match ipc::encode_frame(REQUEST_KIND, &request_payload, MAX_REQUEST_BYTES) {
+                Ok(value) => value,
+                Err(error) => {
+                    return failure(
+                        Classification::InvalidEvidence,
+                        ipc::INVALID_BOUNDS,
+                        vec![format!("request frame rejected: {error:?}")],
+                    )
+                }
+            };
+        let signing_frame = ipc::encode_frame(SIGNING_SEED_KIND, seed, SIGNING_SEED_BYTES)
+            .expect("fixed-size seed frame");
+        for byte in seed.iter_mut() {
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        let mut entropy = Keypair::new().to_bytes();
+        let run_name = format!(
+            "faultline-operator-run-{}",
+            hash::hex(&hash::sha256(&entropy))
+        );
+        entropy.fill(0);
+        let run_root = self.repository.join("tmp").join(run_name);
+        if let Err(error) = fs::create_dir(&run_root) {
+            return failure(
+                Classification::RunnerFault,
+                RUNNER_ISOLATION_SETUP,
+                vec![format!("run directory creation: {error}")],
+            );
+        }
+        let observation = run_isolated(
+            request.worker_ordinal,
+            &self.worker_executable,
+            &self.repository,
+            request_frame,
+            signing_frame,
+        );
+        let directory_removed = cleanup_run_directory(&run_root);
+        let observation = match observation {
+            Ok(value) => value,
+            Err(error) => {
+                return SingleWorkerOutcome {
+                    classification: Classification::RunnerFault,
+                    result_code: if directory_removed {
+                        RUNNER_ISOLATION_SETUP
+                    } else {
+                        RUNNER_CLEANUP
+                    },
+                    signed_output: None,
+                    attestation_intent: None,
+                    process_id: None,
+                    diagnostics: vec![error.to_string()],
+                    launch_attempts: 1,
+                    retry_attempts: 0,
+                    telemetry: None,
+                    run_directory_removed: directory_removed,
+                    all_owned_handles_closed: true,
+                };
+            }
+        };
+        let mut diagnostics = Vec::new();
+        if !observation.stderr.is_empty() {
+            diagnostics.push(String::from_utf8_lossy(&observation.stderr).into_owned());
+        }
+        let process_id = Some(observation.process_id);
+        let telemetry = Some(observation.telemetry);
+        let handles_closed = observation.all_owned_handles_closed;
+        let result = if !directory_removed {
+            (Classification::RunnerFault, RUNNER_CLEANUP, None)
+        } else if let Some(fault) = observation.fault {
+            let code = match fault {
+                RunFault::Cleanup => RUNNER_CLEANUP,
+                RunFault::Memory => RUNNER_MEMORY_LIMIT,
+                RunFault::Timeout => RUNNER_TIMEOUT,
+                RunFault::Isolation => RUNNER_ISOLATION_SETUP,
+                RunFault::Output => RUNNER_OUTPUT_LIMIT_OR_MALFORMED_OUTPUT,
+                RunFault::Crash => RUNNER_CRASH,
+                RunFault::Internal => RUNNER_INTERNAL,
+            };
+            (Classification::RunnerFault, code, None)
+        } else {
+            match parse_response_or_failure(&observation.response) {
+                Err((classification, code, diagnostic)) => {
+                    diagnostics.push(diagnostic);
+                    (classification, code, None)
+                }
+                Ok(response)
+                    if response.coordinator_nonce != request.coordinator_nonce
+                        || response.worker_ordinal != request.worker_ordinal =>
+                {
+                    (
+                        Classification::InvalidEvidence,
+                        INVALID_SIGNATURE_OR_IDENTITY,
+                        None,
+                    )
+                }
+                Ok(response) if response.status == "failure" => (
+                    response.classification.expect("validated failure"),
+                    response.result_code.expect("validated failure"),
+                    None,
+                ),
+                Ok(response) => {
+                    let signed = response.signed_worker_output.expect("validated success");
+                    match authenticate_signed_output(&signed, &request, &job_hash) {
+                        Ok(()) => (
+                            signed.output.classification.clone(),
+                            signed.output.result_code,
+                            Some(signed),
+                        ),
+                        Err(_) => (
+                            Classification::InvalidEvidence,
+                            INVALID_SIGNATURE_OR_IDENTITY,
+                            None,
+                        ),
+                    }
+                }
+            }
+        };
+        let intent = result
+            .2
+            .as_ref()
+            .and_then(|value| value.output.attestation_intent.clone());
+        SingleWorkerOutcome {
+            classification: result.0,
+            result_code: result.1,
+            signed_output: result.2,
+            attestation_intent: intent,
+            process_id,
+            diagnostics,
+            launch_attempts: 1,
+            retry_attempts: 0,
+            telemetry,
+            run_directory_removed: directory_removed,
+            all_owned_handles_closed: handles_closed,
         }
     }
 
@@ -408,7 +643,7 @@ impl Coordinator {
             let value = response
                 .signed_worker_output
                 .expect("validated signed response");
-            if verify_authenticated(&value, &request, &job_hash).is_err() {
+            if authenticate_signed_output(&value, &request, &job_hash).is_err() {
                 failures.push((
                     Classification::InvalidEvidence,
                     INVALID_SIGNATURE_OR_IDENTITY,
@@ -561,7 +796,7 @@ pub(crate) fn parse_response_or_failure(
     })
 }
 
-fn verify_authenticated(
+pub fn authenticate_signed_output(
     signed: &SignedWorkerOutput,
     request: &WorkerRequest,
     job_hash: &[u8; 32],
@@ -579,6 +814,46 @@ fn verify_authenticated(
         ));
     }
     Ok(())
+}
+
+/// Authenticates exactly three request/output pairs in ordinal order and then
+/// applies the frozen identity-independent Milestone 7 consensus projection.
+pub fn agree_authenticated(
+    requests: &[WorkerRequest],
+    values: Vec<SignedWorkerOutput>,
+) -> std::result::Result<ShardOutcome, (Classification, u32)> {
+    if requests.len() != 3 || values.len() != 3 {
+        return Err((
+            Classification::InvalidEvidence,
+            INVALID_SIGNATURE_OR_IDENTITY,
+        ));
+    }
+    let mut job_hash: Option<[u8; 32]> = None;
+    for (index, (request, value)) in requests.iter().zip(&values).enumerate() {
+        if request.worker_ordinal != index as u8 || value.output.worker_ordinal != index as u8 {
+            return Err((
+                Classification::InvalidEvidence,
+                INVALID_SIGNATURE_OR_IDENTITY,
+            ));
+        }
+        let current = hash::replay_job_hash(&request.replay_job).map_err(|_| {
+            (
+                Classification::InvalidEvidence,
+                ipc::INVALID_SCHEMA_OR_VERSION,
+            )
+        })?;
+        if job_hash.is_some_and(|expected| expected != current) {
+            return Err((Classification::WorkerDisagreement, WORKER_DISAGREEMENT));
+        }
+        job_hash = Some(current);
+        authenticate_signed_output(value, request, &current).map_err(|_| {
+            (
+                Classification::InvalidEvidence,
+                INVALID_SIGNATURE_OR_IDENTITY,
+            )
+        })?;
+    }
+    agree(values)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -818,23 +1093,23 @@ mod tests {
         )
         .unwrap();
         let signed = sign_output(output, &signer).unwrap();
-        assert!(verify_authenticated(&signed, &request, &job_hash).is_ok());
+        assert!(authenticate_signed_output(&signed, &request, &job_hash).is_ok());
 
         let mut wrong_nonce = request.clone();
         wrong_nonce.coordinator_nonce = "00".repeat(32);
-        assert!(verify_authenticated(&signed, &wrong_nonce, &job_hash).is_err());
+        assert!(authenticate_signed_output(&signed, &wrong_nonce, &job_hash).is_err());
         let mut wrong_ordinal = request.clone();
         wrong_ordinal.worker_ordinal = 1;
-        assert!(verify_authenticated(&signed, &wrong_ordinal, &job_hash).is_err());
+        assert!(authenticate_signed_output(&signed, &wrong_ordinal, &job_hash).is_err());
         let other = keypair_from_seed(&identities[1].seed).unwrap();
         let mut wrong_identity = request.clone();
         wrong_identity.expected_verifier_pubkey = other.pubkey().to_string();
-        assert!(verify_authenticated(&signed, &wrong_identity, &job_hash).is_err());
+        assert!(authenticate_signed_output(&signed, &wrong_identity, &job_hash).is_err());
         let mut altered_signature = signed.clone();
         altered_signature.signature = solana_sdk::signature::Signature::default().to_string();
-        assert!(verify_authenticated(&altered_signature, &request, &job_hash).is_err());
+        assert!(authenticate_signed_output(&altered_signature, &request, &job_hash).is_err());
         let wrong_job = [0_u8; 32];
-        assert!(verify_authenticated(&signed, &request, &wrong_job).is_err());
+        assert!(authenticate_signed_output(&signed, &request, &wrong_job).is_err());
     }
 
     #[test]
