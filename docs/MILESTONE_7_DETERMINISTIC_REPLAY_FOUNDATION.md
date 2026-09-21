@@ -1245,6 +1245,98 @@ Checkpoint 4 implements assertions 13–16 and 24–27. Checkpoint 5 retains ass
 - Preserve hashes, classifications, process identities, memory, and timing evidence.
 - Confirm no production Solana source or semantics changed.
 
+### Phase F.1 — Checkpoint 5 closeout-telemetry authorization
+
+Checkpoint 5 may add the narrow coordinator-owned runtime telemetry required to prove Assertion 28. Permitted production changes are limited to:
+
+- retaining an already-observed worker process exit status;
+- querying and retaining actual peak process memory;
+- querying and retaining actual peak Job Object memory;
+- querying back and retaining the applied Job Object limits;
+- retaining worker launch-to-exit elapsed time;
+- measuring and retaining cleanup duration;
+- exposing the owned process identifier and cleanup status to the trusted closeout runner; and
+- returning this information through an internal coordinator telemetry structure.
+
+This authorization is observability remediation only. It does not authorize new replay, evaluator, worker, signing, consensus, retry, networking, transaction, or on-chain behavior. No other production behavior change is authorized.
+
+#### Non-protocol boundary
+
+Telemetry is coordinator-owned and out-of-band. It is not part of `faultline.worker-output.v1`, `faultline.signed-worker-output.v1`, `faultline.worker-response.v1`, replay receipts, replay-job hashes, receipt hashes, worker-message digests, signatures, attestation intents, Milestone 5 commitments, consensus projections, or on-chain data.
+
+Telemetry must not alter an eligible or ineligible protocol classification. A telemetry-collection failure is recorded explicitly and causes the Checkpoint 5 closeout assertion to fail, but it must not silently rewrite replay results. No telemetry field may be supplied by or trusted from worker stdout. Machine-specific telemetry is never used as deterministic golden-vector input. Existing Checkpoint 1–4 hashes and signatures remain unchanged.
+
+The signed `process_peak_memory_bytes = "0"` value is the frozen deterministic **not measured in signed payload** sentinel. It must not be reported as actual measured memory. Actual memory evidence comes only from trusted coordinator-side Windows telemetry.
+
+#### Internal telemetry structures
+
+Checkpoint 5 may add an internal, non-canonical structure equivalent to the following closed records.
+
+`AppliedJobLimits` contains exactly:
+
+- `active_process_limit: u32`;
+- `process_memory_limit_bytes: u64`;
+- `job_memory_limit_bytes: u64`;
+- `user_mode_cpu_limit_100ns: u64`;
+- `wall_timeout_milliseconds: u64`;
+- `cleanup_grace_milliseconds: u64`;
+- `stdout_limit_bytes: u64`;
+- `stderr_limit_bytes: u64`; and
+- `queried_back_from_job_object: bool`.
+
+`queried_back_from_job_object` may be `true` only when `QueryInformationJobObject` returns values matching the values applied through `SetInformationJobObject`.
+
+`WorkerRunTelemetry` contains exactly:
+
+- `worker_ordinal: u8`;
+- `owned_pid: Option<u32>`;
+- `exit_status_u32: Option<u32>`;
+- `peak_process_memory_bytes: Option<u64>`;
+- `peak_job_memory_bytes: Option<u64>`;
+- `launch_to_exit_elapsed_milliseconds: u64`;
+- `cleanup_elapsed_milliseconds: u64`;
+- `applied_limits: Option<AppliedJobLimits>`;
+- `termination_cause`;
+- `cleanup_verified: bool`; and
+- `collection_error: Option<String>`.
+
+`termination_cause` is the closed internal enum `completed`, `setup_failure`, `abnormal_exit`, `wall_timeout`, `cpu_limit`, `process_memory_limit`, `job_memory_limit`, `active_process_limit`, `output_limit`, `cancelled`, or `cleanup_failure`.
+
+`ShardTelemetry` contains exactly:
+
+- exactly three launch records in ordinal order for a normal three-worker shard;
+- `launch_attempts: u8`;
+- `retry_attempts: u8`;
+- `workers: Vec<WorkerRunTelemetry>`;
+- `run_directory_removed: bool`;
+- `all_owned_processes_exited: bool`; and
+- `all_owned_handles_closed: bool`.
+
+For the successful v2 and v3 closeout shards, `launch_attempts` must equal `3`, `retry_attempts` must equal `0`, all three workers must have process identifiers and exit status `0`, all three must expose queried-back applied limits, both peak-memory values must be present and nonzero, cleanup must be verified, the run directory must be removed, all owned processes must have exited, and all owned handles must be closed.
+
+For setup failures before process creation, the process identifier, exit status, and memory fields may be absent, but `collection_error` or the exact setup cause must explain the absence. For killed workers, exit status and memory are retained when Windows exposes them. Unavailable values remain absent and must never be fabricated as zero.
+
+#### Authoritative Windows measurement sources
+
+- Exit status comes from `GetExitCodeProcess` after confirmed process termination.
+- Peak process memory comes from `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.PeakProcessMemoryUsed`.
+- Peak Job Object memory comes from `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.PeakJobMemoryUsed`.
+- Applied limits are queried back from the assigned Job Object.
+- Elapsed time comes from the coordinator monotonic clock.
+- Cleanup duration comes from the coordinator monotonic clock from cleanup initiation until owned-process, handle, and run-directory verification completes.
+
+Telemetry is queried before closing the final Job Object or process handles wherever Windows requires those handles.
+
+#### Assertion 28 evidence effect
+
+Assertion 28 requires genuine telemetry from at least one successful real v2 three-worker shard and one successful real v3 three-worker shard. Constants-only, mocked, constructed, or fixture-worker telemetry cannot satisfy Assertion 28. Adversarial fixture-worker telemetry may support failure-path evidence but cannot replace successful production-worker telemetry.
+
+Missing, zero-fabricated, internally inconsistent, or non-queried-back telemetry fails Assertion 28. Checkpoint 5 may add tests, a runner, an assertion ledger, sanitized evidence and reporting, and the narrowly authorized telemetry plumbing. It may correct the Assertion 15 internal-failure test so that it executes a real failure, and it may split combined resource tests into separately bounded shards.
+
+#### Evidence privacy and repository rules
+
+Runtime process identifiers, absolute paths, temporary directories, raw secrets, and signing seeds remain untracked. Sanitized tracked evidence may contain limits, elapsed durations, peak byte counts, exit codes, hashes, public keys, signatures, and classifications. Evidence must not contain signing seeds, environment secrets, usernames, drive-specific paths, or temporary-directory names. Raw logs remain ignored unless this specification explicitly requires a sanitized tracked derivative.
+
 ---
 
 ## 13. Frozen validation assertions
