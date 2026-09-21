@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+test-helper = []
+
 [workspace]
 resolver = "2"
 
@@ -26,6 +29,25 @@ solana_rbpf = "=0.8.3"
 thiserror = "=1.0.69"
 unicode-normalization = "=0.1.25"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [[bin]]
 name = "generate-formats"
 path = "src/bin/generate-formats.rs"
+
+[[bin]]
+name = "faultline-replay-worker"
+path = "src/bin/faultline-replay-worker.rs"
+
+[[bin]]
+name = "faultline-replay-worker-fixture"
+path = "src/bin/faultline-replay-worker-fixture.rs"
+required-features = ["test-helper"]

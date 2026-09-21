@@ -1,12 +1,18 @@
 pub mod canonical;
+pub mod coordinator;
 pub mod generator;
 pub mod hash;
 pub mod invariant;
+pub mod ipc;
+pub mod paths;
 pub mod receipt;
 pub mod runner;
 pub mod schema;
 pub mod trace;
 pub mod worker;
+
+#[cfg(windows)]
+mod windows_job;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

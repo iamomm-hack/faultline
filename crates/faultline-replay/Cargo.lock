@@ -1029,6 +1029,7 @@ dependencies = [
  "solana_rbpf",
  "thiserror",
  "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

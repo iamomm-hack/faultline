@@ -788,6 +788,7 @@ pub enum Classification {
     InvalidEvidence,
     UnsupportedEnvironment,
     RunnerFault,
+    WorkerDisagreement,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

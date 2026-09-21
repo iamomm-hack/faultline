@@ -124,7 +124,7 @@ pub fn replay_repository_candidate(root: &Path, candidate: &str) -> Result<Repla
     )
 }
 
-fn execute(
+pub(crate) fn execute(
     candidate: &str,
     candidate_bytes: &[u8],
     build: &BuildManifest,
