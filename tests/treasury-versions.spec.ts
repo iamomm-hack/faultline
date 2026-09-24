@@ -24,6 +24,7 @@ import {
   loadIds,
   loadKeypair,
   loaderAuthority,
+  loaderBufferExecutableHash,
   programDataAddress,
   send,
   setLoaderAuthorityInstruction
@@ -304,7 +305,7 @@ async function guardedUpgradeToScenario(): Promise<void> {
   const [claim] = PublicKey.findProgramAddressSync([Buffer.from("faultline"), Buffer.from("buffer"), selectedBuffer.toBuffer()], gateProgram);
   const bufferInfo = await connection.getAccountInfo(selectedBuffer, COMMITMENT);
   assert(bufferInfo, "candidate buffer missing for canonical proposal");
-  const candidateHash = createHash("sha256").update(bufferInfo.data).digest();
+  const candidateHash = loaderBufferExecutableHash(bufferInfo);
   console.log(`Proposal PDA: ${proposal}`);
   console.log(`Create ${scenario} proposal: ${await send(connection, anchorInstruction(gateProgram, "create_upgrade_proposal", [
     { pubkey: proposer.publicKey, isSigner: true, isWritable: true }, { pubkey: guardPda, isSigner: false, isWritable: true },

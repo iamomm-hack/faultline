@@ -8,7 +8,7 @@ import {
 } from "@solana/web3.js";
 import {
   COMMITMENT, LOADER_V3, ROOT, SYSVAR_CLOCK, SYSVAR_RENT, anchorInstruction,
-  expectFailure, loadIds, loadKeypair, loaderUpgradeInstruction, loaderWriteInstruction,
+  expectFailure, loadIds, loadKeypair, loaderBufferExecutableHash, loaderUpgradeInstruction, loaderWriteInstruction,
   programDataAddress, setLoaderAuthorityInstruction
 } from "../scripts/lib/solana.js";
 import { transferUpgradeAuthority } from "../scripts/transfer-upgrade-authority.js";
@@ -262,7 +262,7 @@ function expire(id: bigint): TransactionInstruction { return anchorInstruction(g
 ]); }
 async function advancePast(end: bigint): Promise<void> { while (BigInt(await connection.getSlot(COMMITMENT)) <= end) await send(SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: outsider.publicKey, lamports: 1 }), payer); }
 async function proposalEnd(proposal: PublicKey): Promise<bigint> { const info = await connection.getAccountInfo(proposal, COMMITMENT); assert(info); return info.data.readBigUInt64LE(226); }
-async function lockBuffer(buffer: PublicKey): Promise<Buffer> { await send(setLoaderAuthorityInstruction(buffer, proposer.publicKey, guard), payer, [proposer]); const info = await connection.getAccountInfo(buffer, COMMITMENT); assert(info); return sha256(info.data); }
+async function lockBuffer(buffer: PublicKey): Promise<Buffer> { await send(setLoaderAuthorityInstruction(buffer, proposer.publicKey, guard), payer, [proposer]); const info = await connection.getAccountInfo(buffer, COMMITMENT); assert(info); return loaderBufferExecutableHash(info); }
 function decodeGate(raw: Buffer) { return { proposal: new PublicKey(raw.subarray(8, 40)), pending: raw.readUInt16LE(40), violation: raw[42] === 1, last: raw[43] === 1 ? new PublicKey(raw.subarray(44, 76)) : null, bump: raw[76] }; }
 function decodeRound(raw: Buffer) { return { policy: new PublicKey(raw.subarray(8, 40)), proposal: new PublicKey(raw.subarray(40, 72)), invariant: new PublicKey(raw.subarray(72, 104)), traceClaim: new PublicKey(raw.subarray(104, 136)), traceHash: Buffer.from(raw.subarray(136, 168)), candidateHash: Buffer.from(raw.subarray(168, 200)), specificationHash: Buffer.from(raw.subarray(200, 232)), epoch: new PublicKey(raw.subarray(232, 264)), threshold: raw[264], status: raw[265], finalized: raw[274] === 1 ? raw.readBigUInt64LE(275) : null, winner: raw[283] === 1 ? new PublicKey(raw.subarray(284, 316)) : null }; }
 function decodeResult(raw: Buffer) { return { round: new PublicKey(raw.subarray(8, 40)), hash: Buffer.from(raw.subarray(40, 72)), verdict: raw[72], receipt: Buffer.from(raw.subarray(73, 105)), votes: raw[105] }; }

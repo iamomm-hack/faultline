@@ -8,7 +8,7 @@ import {
 } from "@solana/web3.js";
 import {
   COMMITMENT, LOADER_V3, ROOT, anchorInstruction, discriminator, expectFailure,
-  loadIds, loadKeypair, programDataAddress, setLoaderAuthorityInstruction
+  loadIds, loadKeypair, loaderBufferExecutableHash, programDataAddress, setLoaderAuthorityInstruction
 } from "../scripts/lib/solana.js";
 import {
   MINT_SIZE, TOKEN_ACCOUNT_AMOUNT_OFFSET, TOKEN_ACCOUNT_SIZE, TOKEN_PROGRAM_ID,
@@ -192,7 +192,7 @@ async function createLoaderBuffer(seed: string, batchAuthority = false): Promise
   await sendMany(instructions, payer, [keypair, proposer]);
   if (!batchAuthority) await send(setLoaderAuthorityInstruction(keypair.publicKey, proposer.publicKey, guard), payer, [proposer]);
   const info = await connection.getAccountInfo(keypair.publicKey, COMMITMENT); assert(info);
-  return { key: keypair.publicKey, hash: sha256(info.data) };
+  return { key: keypair.publicKey, hash: loaderBufferExecutableHash(info) };
 }
 
 function initializeGuard() { return anchorInstruction(gate, "initialize_guard", [

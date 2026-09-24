@@ -16,6 +16,7 @@ import {
 export const ROOT = resolve(import.meta.dirname, "..", "..");
 export const RPC_URL = process.env.FAULTLINE_RPC_URL ?? "http://127.0.0.1:8899";
 export const LOADER_V3 = new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111");
+export const LOADER_V3_BUFFER_METADATA_SIZE = 37;
 export const SYSVAR_RENT = new PublicKey("SysvarRent111111111111111111111111111111111");
 export const SYSVAR_CLOCK = new PublicKey("SysvarC1ock11111111111111111111111111111111");
 export const COMMITMENT: Commitment = "confirmed";
@@ -150,6 +151,17 @@ export async function loaderAuthorityOptional(
   if (info.data[optionOffset] === 0) return null;
   if (info.data[optionOffset] !== 1) throw new Error(`${account.toBase58()} has an invalid authority option`);
   return new PublicKey(info.data.subarray(optionOffset + 1, optionOffset + 33));
+}
+
+export function loaderBufferPayload(info: { owner: PublicKey; data: Buffer }): Buffer {
+  if (!info.owner.equals(LOADER_V3)) throw new Error("candidate buffer is not owned by loader-v3");
+  if (info.data.length < LOADER_V3_BUFFER_METADATA_SIZE) throw new Error("candidate buffer metadata is truncated");
+  if (info.data.readUInt32LE(0) !== 1) throw new Error("candidate loader state is not Buffer");
+  return info.data.subarray(LOADER_V3_BUFFER_METADATA_SIZE);
+}
+
+export function loaderBufferExecutableHash(info: { owner: PublicKey; data: Buffer }): Buffer {
+  return createHash("sha256").update(loaderBufferPayload(info)).digest();
 }
 
 export function setLoaderAuthorityInstruction(

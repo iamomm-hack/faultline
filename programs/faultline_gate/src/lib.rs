@@ -3972,12 +3972,11 @@ fn programdata_authority(program_data: &AccountInfo) -> Result<Pubkey> {
     }
 }
 fn buffer_authority(buffer: &AccountInfo) -> Result<Pubkey> {
-    require_keys_eq!(
-        *buffer.owner,
-        bpf_loader_upgradeable::id(),
-        FaultlineError::WrongAccountOwner
-    );
-    match loader_state(buffer)? {
+    let data = buffer.try_borrow_data()?;
+    loader_buffer_authority(buffer.owner, &data)
+}
+fn loader_buffer_authority(owner: &Pubkey, data: &[u8]) -> Result<Pubkey> {
+    match loader_buffer_state(owner, data)? {
         UpgradeableLoaderState::Buffer {
             authority_address: Some(authority),
         } => Ok(authority),
@@ -3988,8 +3987,31 @@ fn buffer_authority(buffer: &AccountInfo) -> Result<Pubkey> {
     }
 }
 fn candidate_buffer_hash(buffer: &AccountInfo) -> Result<[u8; 32]> {
+    // Authority remains an independent lifecycle check. The executable digest
+    // intentionally excludes every loader-v3 metadata byte, including authority.
     buffer_authority(buffer)?;
-    Ok(hash(&buffer.try_borrow_data()?).to_bytes())
+    let data = buffer.try_borrow_data()?;
+    Ok(hash(loader_buffer_payload(buffer.owner, &data)?).to_bytes())
+}
+fn loader_buffer_state(owner: &Pubkey, data: &[u8]) -> Result<UpgradeableLoaderState> {
+    require_keys_eq!(
+        *owner,
+        bpf_loader_upgradeable::id(),
+        FaultlineError::WrongAccountOwner
+    );
+    require!(
+        data.len() >= UpgradeableLoaderState::size_of_buffer_metadata(),
+        FaultlineError::InvalidLoaderState
+    );
+    bincode::deserialize(data).map_err(|_| error!(FaultlineError::InvalidLoaderState))
+}
+fn loader_buffer_payload<'a>(owner: &Pubkey, data: &'a [u8]) -> Result<&'a [u8]> {
+    match loader_buffer_state(owner, data)? {
+        UpgradeableLoaderState::Buffer { .. } => {
+            Ok(&data[UpgradeableLoaderState::size_of_buffer_metadata()..data.len()])
+        }
+        _ => err!(FaultlineError::InvalidLoaderState),
+    }
 }
 pub fn challenge_commitment(
     proposal: &Pubkey,
@@ -5331,6 +5353,119 @@ pub enum FaultlineError {
 mod tests {
     use super::*;
     use anchor_lang::Discriminator;
+
+    fn loader_buffer_data(authority: Option<Pubkey>, payload: &[u8]) -> Vec<u8> {
+        let encoded = bincode::serialize(&UpgradeableLoaderState::Buffer {
+            authority_address: authority,
+        })
+        .unwrap();
+        let metadata_len = UpgradeableLoaderState::size_of_buffer_metadata();
+        assert!(encoded.len() <= metadata_len);
+        let mut data = vec![0u8; metadata_len];
+        data[..encoded.len()].copy_from_slice(&encoded);
+        data.extend_from_slice(payload);
+        data
+    }
+
+    #[test]
+    fn loader_buffer_payload_hash_matches_exact_payload() {
+        let authority = Pubkey::new_unique();
+        let payload = b"exact executable bytes\0with trailing zero\0";
+        let data = loader_buffer_data(Some(authority), payload);
+        assert_eq!(
+            loader_buffer_payload(&bpf_loader_upgradeable::id(), &data).unwrap(),
+            payload
+        );
+        assert_eq!(
+            hash(loader_buffer_payload(&bpf_loader_upgradeable::id(), &data).unwrap()),
+            hash(payload)
+        );
+    }
+
+    #[test]
+    fn loader_buffer_metadata_is_excluded_but_authority_is_still_validated() {
+        let first_authority = Pubkey::new_unique();
+        let second_authority = Pubkey::new_unique();
+        let payload = b"same executable payload";
+        let first = loader_buffer_data(Some(first_authority), payload);
+        let second = loader_buffer_data(Some(second_authority), payload);
+        assert_ne!(hash(&first), hash(&second));
+        assert_eq!(
+            hash(loader_buffer_payload(&bpf_loader_upgradeable::id(), &first).unwrap()),
+            hash(loader_buffer_payload(&bpf_loader_upgradeable::id(), &second).unwrap())
+        );
+        assert_eq!(
+            loader_buffer_authority(&bpf_loader_upgradeable::id(), &first).unwrap(),
+            first_authority
+        );
+        assert_eq!(
+            loader_buffer_authority(&bpf_loader_upgradeable::id(), &second).unwrap(),
+            second_authority
+        );
+    }
+
+    #[test]
+    fn loader_buffer_payload_mutation_changes_digest() {
+        let authority = Pubkey::new_unique();
+        let original = loader_buffer_data(Some(authority), b"payload-a");
+        let mutated = loader_buffer_data(Some(authority), b"payload-b");
+        assert_ne!(
+            hash(loader_buffer_payload(&bpf_loader_upgradeable::id(), &original).unwrap()),
+            hash(loader_buffer_payload(&bpf_loader_upgradeable::id(), &mutated).unwrap())
+        );
+    }
+
+    #[test]
+    fn loader_buffer_rejects_truncated_metadata() {
+        let truncated = vec![0u8; UpgradeableLoaderState::size_of_buffer_metadata() - 1];
+        assert!(loader_buffer_payload(&bpf_loader_upgradeable::id(), &truncated).is_err());
+    }
+
+    #[test]
+    fn loader_buffer_rejects_wrong_owner() {
+        let data = loader_buffer_data(Some(Pubkey::new_unique()), b"payload");
+        assert!(loader_buffer_payload(&Pubkey::new_unique(), &data).is_err());
+    }
+
+    #[test]
+    fn loader_buffer_rejects_wrong_loader_state() {
+        let encoded = bincode::serialize(&UpgradeableLoaderState::Uninitialized).unwrap();
+        let mut data = vec![0u8; UpgradeableLoaderState::size_of_buffer_metadata()];
+        data[..encoded.len()].copy_from_slice(&encoded);
+        data.extend_from_slice(b"payload");
+        assert!(loader_buffer_payload(&bpf_loader_upgradeable::id(), &data).is_err());
+    }
+
+    #[test]
+    fn loader_buffer_extra_trailing_bytes_are_hash_significant() {
+        let authority = Pubkey::new_unique();
+        let exact = loader_buffer_data(Some(authority), b"payload");
+        let with_capacity_bytes = loader_buffer_data(Some(authority), b"payload\0\0");
+        assert_ne!(
+            hash(loader_buffer_payload(&bpf_loader_upgradeable::id(), &exact).unwrap()),
+            hash(
+                loader_buffer_payload(&bpf_loader_upgradeable::id(), &with_capacity_bytes).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn loader_buffer_authority_lifecycle_failure_remains_independent() {
+        let immutable = loader_buffer_data(None, b"payload");
+        assert_eq!(
+            loader_buffer_payload(&bpf_loader_upgradeable::id(), &immutable).unwrap(),
+            b"payload"
+        );
+        assert!(loader_buffer_authority(&bpf_loader_upgradeable::id(), &immutable).is_err());
+    }
+
+    #[test]
+    fn legacy_full_account_digest_is_not_payload_digest() {
+        let data = loader_buffer_data(Some(Pubkey::new_unique()), b"payload");
+        let payload_hash =
+            hash(loader_buffer_payload(&bpf_loader_upgradeable::id(), &data).unwrap());
+        assert_ne!(hash(&data), payload_hash);
+    }
 
     #[test]
     fn challenge_commitment_vector_is_stable() {

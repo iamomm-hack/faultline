@@ -6,7 +6,8 @@ import { execFileSync } from "node:child_process";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import {
   COMMITMENT, LOADER_V3, ROOT, SYSVAR_CLOCK, SYSVAR_RENT, anchorInstruction,
-  expectFailure, loadIds, loadKeypair, loaderAuthority, loaderUpgradeInstruction, loaderWriteInstruction,
+  expectFailure, loadIds, loadKeypair, loaderAuthority, loaderBufferExecutableHash, loaderBufferPayload,
+  loaderUpgradeInstruction, loaderWriteInstruction,
   programDataAddress, setLoaderAuthorityInstruction
 } from "../scripts/lib/solana.js";
 import { transferUpgradeAuthority } from "../scripts/transfer-upgrade-authority.js";
@@ -170,8 +171,13 @@ async function main() {
     const rejectedBuffer = new PublicKey(ids["candidate-approved"]);
     const uncommittedBuffer = new PublicKey(ids["candidate-rejected"]);
     for (const b of [buffer, substituteBuffer, rejectedBuffer]) await send(connection, setLoaderAuthorityInstruction(b, proposer.publicKey, guard), payer, [proposer]);
-    const lockedHash = hash((await connection.getAccountInfo(buffer))!.data);
-    const good = hash((await connection.getAccountInfo(buffer))!.data);
+    const lockedBufferInfo = await connection.getAccountInfo(buffer); assert(lockedBufferInfo);
+    const lockedFullAccountHash = hash(lockedBufferInfo.data);
+    const good = loaderBufferExecutableHash(lockedBufferInfo);
+    const executable = readFileSync(`${ROOT}/artifacts/treasury/v2/faultline_treasury.so`);
+    assert.deepEqual(loaderBufferPayload(lockedBufferInfo), executable, "staged loader payload differs from raw .so bytes");
+    assert.deepEqual(good, hash(executable), "loader payload hash differs from raw .so SHA-256");
+    assert.notDeepEqual(lockedFullAccountHash, good, "legacy full-account hash unexpectedly equals payload hash");
     // Terminal and authority assertions require a real, approved proposal but do not
     // execute policy assertions 1-14 in their independent validator sessions.
     let committedAtCreate: ReturnType<typeof proposalSnapshot> | undefined;
@@ -199,7 +205,7 @@ async function main() {
     const directRandomSig = await broadcastFailure("25 random direct upgrade", loaderUpgradeInstruction(treasury, buffer, random.publicKey, payer.publicKey), [random], /Incorrect authority/i);
     assert.equal(await versionNumber(), 1); console.log(`PASS 25 random rejected onchain: ${directRandomSig}`);
     const lockedWriteSig = await broadcastFailure("27 previous buffer authority write", loaderWriteInstruction(buffer, proposer.publicKey, Buffer.from([0x42])), [proposer], /Incorrect authority/i);
-    assert.deepEqual(hash((await connection.getAccountInfo(buffer))!.data), lockedHash); console.log(`PASS 27 locked buffer immutable: ${lockedWriteSig}`);
+    assert.deepEqual(hash((await connection.getAccountInfo(buffer))!.data), lockedFullAccountHash); console.log(`PASS 27 locked buffer immutable: ${lockedWriteSig}`);
     }
     if (shard === "policy") {
     console.log(`Policy init: ${await send(connection, initPolicy(), governance)}`); console.log("PASS 1 policy initialized");
@@ -210,7 +216,10 @@ async function main() {
     await send(connection, status(governance.publicKey, true), governance); await fails("5 paused policy create", /PolicyPaused/, () => send(connection, create(1n, buffer, good), proposer)); await send(connection, status(governance.publicKey, false), governance);
     await fails("6 target program with mismatched GuardConfig PDA is rejected", /ConstraintSeeds/, () => send(connection, create(1n, buffer, good, gate), proposer));
     await fails("7 wrong expected hash", /CandidateHashMismatch/, () => send(connection, create(1n, buffer, Buffer.alloc(32, 9)), proposer));
-    const unlockedHash = hash((await connection.getAccountInfo(uncommittedBuffer))!.data);
+    await fails("7 legacy full-account hash rejected", /CandidateHashMismatch/, () => send(connection, create(1n, buffer, lockedFullAccountHash), proposer));
+    console.log(`PASS executable payload parity: raw_so=${good.toString("hex")} full_account=${lockedFullAccountHash.toString("hex")}`);
+    const unlockedInfo = await connection.getAccountInfo(uncommittedBuffer); assert(unlockedInfo);
+    const unlockedHash = loaderBufferExecutableHash(unlockedInfo);
     await fails("8 candidate buffer not controlled by the Guard is rejected", /BufferNotLocked/, () => send(connection, create(1n, uncommittedBuffer, unlockedHash), proposer));
     assert.equal(await connection.getAccountInfo(proposalAddress(1n)), null, "failed unlocked-buffer proposal persisted");
     assert.equal(await connection.getAccountInfo(claimAddress(uncommittedBuffer)), null, "failed unlocked-buffer claim persisted");
@@ -251,7 +260,8 @@ async function main() {
     const originalAfterMissingClaim = proposalSnapshot((await connection.getAccountInfo(proposalAddress(1n)))!.data);
     assert.equal(originalAfterMissingClaim.state, originalBeforeSubstitution.state, "missing-claim attempt changed the approved proposal state");
     assert.equal(originalAfterMissingClaim.executedAt, null, "missing-claim attempt executed the approved proposal");
-    const foreignHash = hash((await connection.getAccountInfo(substituteBuffer))!.data);
+    const foreignInfo = await connection.getAccountInfo(substituteBuffer); assert(foreignInfo);
+    const foreignHash = loaderBufferExecutableHash(foreignInfo);
     await send(connection, create(5n, substituteBuffer, foreignHash), proposer);
     await substitution("29b initialized foreign candidate and BufferClaim substitution", /ConstraintHasOne/, executeWith(1n, { candidate: substituteBuffer, claim: claimAddress(substituteBuffer) }));
     const originalAfterForeignClaim = proposalSnapshot((await connection.getAccountInfo(proposalAddress(1n)))!.data);
@@ -280,7 +290,8 @@ async function main() {
     }
     if (shard !== "terminal") throw new Error(`unhandled shard ${shard}`);
     // 15-18: expiry has its own locked Buffer and complete terminal-state proof.
-    const spareHash = hash((await connection.getAccountInfo(substituteBuffer))!.data);
+    const spareInfo = await connection.getAccountInfo(substituteBuffer); assert(spareInfo);
+    const spareHash = loaderBufferExecutableHash(spareInfo);
     await send(connection, create(2n, substituteBuffer, spareHash), proposer); await send(connection, start(proposer.publicKey, 2n, 4n), proposer);
     await fails("16 expire before end", /ChallengeWindowStillActive/, () => send(connection, expire(2n), random));
     await advancePast(await endSlot(2n));
@@ -291,7 +302,8 @@ async function main() {
     await fails("18 Expired reject", /InvalidProposalTransition/, () => send(connection, decision(governance.publicKey, 2n, 3), governance));
     await fails("18 Expired restart", /InvalidProposalTransition/, () => send(connection, start(proposer.publicKey, 2n, 4n), proposer));
     // 19-20 rejected proposal.
-    const rejectedHash = hash((await connection.getAccountInfo(rejectedBuffer))!.data);
+    const rejectedInfo = await connection.getAccountInfo(rejectedBuffer); assert(rejectedInfo);
+    const rejectedHash = loaderBufferExecutableHash(rejectedInfo);
     await send(connection, create(3n, rejectedBuffer, rejectedHash), proposer); await send(connection, start(proposer.publicKey, 3n, 4n), proposer); await send(connection, decision(governance.publicKey, 3n, 3), governance); console.log("PASS 19 governance rejection");
     await fails("20 Rejected execute", /ProposalNotApproved/, () => send(connection, execute(3n, rejectedBuffer), random));
     await fails("20 Rejected approve", /InvalidProposalTransition/, () => send(connection, decision(governance.publicKey, 3n, 2), governance));
