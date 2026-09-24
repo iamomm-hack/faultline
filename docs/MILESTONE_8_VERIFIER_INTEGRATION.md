@@ -4,7 +4,9 @@
 
 **Baseline:** `041d4cafeec2a95396b1675285facdd478d29e17` (`test: complete Milestone 7 deterministic replay foundation`)
 
-**Scope rule:** Milestone 8 integrates Milestones 1-7. It changes no production Solana program, on-chain account, instruction, PDA, commitment, verdict, or economic rule.
+**Executable-hash compatibility decision baseline:** `795a2e5eba367a3fcf1afc2dc36ece3df9be874c` (completed Checkpoints 1-2; Checkpoint 3 implementation had not begun)
+
+**Scope rule:** Milestone 8 integrates Milestones 1-7 and authorizes one narrow post-migration Gate semantic correction: the legacy-named `candidate_buffer_hash` becomes the exact loader-v3 executable-payload digest. This documentation task changes no production code. The later authorized implementation changes no account layout, instruction discriminator, PDA seed, stable error code, commitment preimage, verdict, economic rule, or Milestone 7 schema/vector.
 
 ---
 
@@ -27,9 +29,9 @@ Milestone 8 is an integration and reproducible-demonstration milestone. It is no
 
 ### 1.1 Non-goals
 
-Milestone 8 does not add:
+Except for the narrow Section 2.1 correction later authorized to Checkpoint 3, Milestone 8 does not add:
 
-- any change under `programs/**`;
+- any other change under `programs/**`;
 - a verifier lifecycle account, operator account, assignment account, or reassignment account;
 - a suspension, revocation, emergency-invalidation, or historical-round cancellation instruction;
 - verifier verdict commit/reveal;
@@ -49,7 +51,7 @@ The broader verifier lifecycle described in `PRD.md` and `Architecture.md` remai
 
 ## 2. Baseline and compatibility closure
 
-Milestone 8 consumes these completed layers without reinterpreting them:
+Milestone 8 consumes these completed layers without reinterpreting them except for the explicitly authorized Milestone 3 candidate-hash correction in Section 2.1:
 
 1. Milestone 1: Guard PDA custody and the sole guarded loader-v3 upgrade route.
 2. Milestone 2: treasury v2/v3 artifacts and AUTH-001 behavior.
@@ -66,7 +68,51 @@ The two dependency planes remain separate:
 
 Milestone 8 must not merge the workspaces or introduce an on-chain program dependency into the replay crate. The public SDK uses the repository's already pinned TypeScript/Solana dependency plane. Dependency updates require a separately reviewed specification change; convenience upgrades are forbidden.
 
-### 2.1 Frozen protocol bytes
+### 2.1 Authoritative loader-v3 executable-payload binding
+
+For all post-migration proposals, the existing on-chain field named `candidate_buffer_hash` means SHA-256 of exactly:
+
+```text
+buffer_account.data[
+  UpgradeableLoaderState::size_of_buffer_metadata() ..
+  buffer_account.data.len()
+]
+```
+
+The digest excludes the complete loader-v3 state/authority header and includes every byte after that canonical metadata boundary in original order. It performs no ELF parsing, normalization, decompression, trailing-zero trimming, or padding removal; it uses no domain prefix. A staged Buffer therefore matches the raw `.so` artifact only when the payload slice has exactly the same length and contents. Extra trailing capacity or bytes are hash-significant and cannot match a shorter artifact.
+
+The frozen cross-layer equality is:
+
+```text
+SHA256(exact raw .so artifact bytes)
+== build_manifest.candidate_executable_sha256
+== Milestone 7 candidate_executable_sha256
+== SHA256(loader-v3 buffer payload slice)
+== post-migration Proposal.candidate_buffer_hash
+```
+
+`candidate_buffer_hash` is retained as a legacy field name solely for ABI/account compatibility. Its post-migration meaning is the exact executable-payload digest above; no new hash field or account-layout migration is required.
+
+Header exclusion cannot weaken loader validation. Independently of the digest, every relevant creation, verification, and execution path must require:
+
+- the Buffer account owner to be the canonical upgradeable BPF loader;
+- account data length of at least `UpgradeableLoaderState::size_of_buffer_metadata()`;
+- decoded serialized loader state exactly `UpgradeableLoaderState::Buffer`;
+- Buffer authority and state satisfying the existing Guard/`BufferClaim` lifecycle;
+- the Buffer locked against unauthorized writes before approval or execution; and
+- the exact proposal-bound Buffer account to be the Buffer later used for guarded execution.
+
+The header remains security-critical loader state even though it is excluded from the executable-content digest.
+
+#### 2.1.1 Fail-closed migration and cutover
+
+There is exactly one post-migration interpretation. A full-account digest is never accepted as an alternative to the payload digest, and no `full account hash OR payload hash` fallback or automatic stored-hash conversion is permitted. Pre-migration active proposals containing the legacy full-account digest are invalid under the corrected rule and must fail closed. They may expire or close, or be recreated after migration through the existing lifecycle. The upgrade/cutover procedure must prove that no active proposal relies on the legacy digest before the corrected Gate is activated.
+
+Historical finalized records remain readable, but their stored legacy digest must be identified as a pre-migration full-account digest and must never be represented as a Milestone 7 executable digest. The canonical fresh-ledger Milestone 8 demonstration uses only post-migration proposals. There is no transparent backward-compatibility claim for in-flight legacy proposals.
+
+This correction changes no instruction discriminator, PDA seed, stable error code, existing commitment preimage, account layout, or Milestone 7 receipt, worker-output, signature, result-commitment, or attestation schema. All existing Milestone 7 golden vectors remain byte-for-byte unchanged.
+
+### 2.2 Frozen protocol bytes
 
 Milestone 8 defines no new protocol-visible hash or signature preimage. These bytes remain exact:
 
@@ -100,7 +146,7 @@ signature = ED25519_SIGN(verifier_secret_key, worker_message_digest)
 
 `FAULTLINE_REPLAY_V1`, `FAULTLINE_WORKER_OUTPUT_V1`, every Milestone 7 canonical schema, every golden hash/vector, every existing PDA seed, account layout, instruction discriminator, stable error code, and historical epoch/round rule is byte-for-byte and semantically unchanged.
 
-### 2.2 Existing account and instruction surface
+### 2.3 Existing account and instruction surface
 
 Milestone 8 creates no account type and changes no account size. Its verifier path consumes these existing accounts exactly:
 
@@ -480,9 +526,11 @@ Before constructing `create_replay_result` or any attestation, the SDK/CLI must:
 13. require each stake to bind the same verifier and economic policy and satisfy existing active/minimum rules;
 14. recompute `replay_receipt_hash` from the canonical receipt;
 15. recompute `result_hash` from the exact 212-byte Milestone 5 preimage; and
-16. require every proposal, invariant, trace, candidate hash, specification hash, verdict, receipt, result, round, and epoch binding to match.
+16. require the proposal's legacy-named `candidate_buffer_hash`, the round snapshot, the Milestone 7 `candidate_executable_sha256`, the selected build-manifest executable digest, and SHA-256 of the exact loader-v3 payload slice from Section 2.1 all to equal SHA-256 of the exact raw `.so` artifact bytes, then require every other proposal, invariant, trace, specification hash, verdict, receipt, result, round, and epoch binding to match.
 
 Failure returns no instruction, unsigned transaction, signature request, commitment, or attestation plan.
+
+The preflight also validates the Buffer header independently: canonical upgradeable-loader owner, sufficient metadata length, exact `Buffer` state, Guard authority/write lock, valid `BufferClaim`, and exact proposal-bound account identity. A digest match cannot compensate for any header, state, authority, claim, or account-identity failure.
 
 ### 12.2 Existing instructions only
 
@@ -536,7 +584,7 @@ The v3 shard must prove this exact sequence:
 9. evidence labels the approval `temporary_governance_approval_after_hold`, never `safe`, `verified safe`, or automatic approval;
 10. guarded execution before the challenge window ends is rejected;
 11. after the window, a separate caller invokes the existing `execute_guarded_upgrade` instruction;
-12. the Guard PDA signs the real loader-v3 Upgrade only after all existing proposal, gate, ProgramData, buffer, authority, hash, and timing checks pass; and
+12. the Guard PDA signs the real loader-v3 Upgrade only after the Section 2.1 payload digest equality and every independent proposal, gate, ProgramData, Buffer owner/state/authority, `BufferClaim`, account-identity, write-lock, and timing check pass; and
 13. the target ProgramData reflects the v3 candidate and the proposal becomes `Executed`.
 
 HOLD alone never authorizes the upgrade.
@@ -715,7 +763,7 @@ Each assertion appears once and is assigned to exactly one checkpoint and one pr
 | 27 | Epoch admission and activation require existing SafetyPolicy governance; no alternate authority is accepted. | `m8_c3_only_governance_controls_epochs` |
 | 28 | Active stake and the existing epoch-economic binding are required to open the canonical economic round. | `m8_c3_epoch_economics_and_stake_are_enforced` |
 | 29 | Proposal, round, epoch, invariant, and trace substitution are rejected before signing and on chain. | `m8_c3_core_account_substitution_is_rejected` |
-| 30 | Receipt, verdict, result commitment, candidate executable, candidate buffer hash, and invariant specification mismatches are rejected. | `m8_c3_result_and_executable_bindings_are_exact` |
+| 30 | Receipt, verdict, result commitment, invariant specification, or any exact raw `.so` / build manifest / Milestone 7 executable / loader-v3 payload slice / post-migration `candidate_buffer_hash` equality mismatch is rejected; full-account fallback is impossible. | `m8_c3_result_and_executable_bindings_are_exact` |
 | 31 | One replay result is created only from the recomputed unchanged Milestone 5 commitment. | `m8_c3_replay_result_uses_frozen_commitment` |
 | 32 | Exactly three corresponding direct attestations, each signed by its matching epoch identity, raise vote count from zero to three. | `m8_c3_three_direct_attestations_reach_quorum` |
 | 33 | Duplicate attestation and equivocation by one verifier are rejected by the canonical attestation PDA. | `m8_c3_duplicate_and_equivocating_vote_is_rejected` |
@@ -750,7 +798,7 @@ Each assertion appears once and is assigned to exactly one checkpoint and one pr
 | 52 | Existing HOLD settlement applies the exact bond penalty/refund, pays no bounty, and introduces no new slash. | `m8_c5_hold_economics_are_unchanged` |
 | 53 | Only existing governance can record a separate temporary approval after HOLD, and evidence labels it accurately. | `m8_c5_governance_approval_is_separate` |
 | 54 | Guarded execution remains rejected through the inclusive challenge end slot. | `m8_c5_upgrade_waits_until_after_window` |
-| 55 | After the window, the real Guard PDA performs the sole loader-v3 upgrade route with every existing binding revalidated. | `m8_c5_real_guarded_upgrade_executes` |
+| 55 | After the window, the real Guard PDA performs the sole loader-v3 upgrade route only after revalidating the exact payload digest and the independent Buffer owner, metadata length, state, authority, lock, claim, and account identity. | `m8_c5_real_guarded_upgrade_executes` |
 | 56 | The target ProgramData contains the v3 candidate and the proposal becomes Executed; no direct-loader bypass is accepted. | `m8_c5_v3_programdata_and_state_are_final` |
 | 57 | The v3 shard cleans every owned worker, validator, handle, key file, ledger, IPC object, and run directory. | `m8_c5_v3_shard_cleans_all_owned_state` |
 
@@ -766,7 +814,7 @@ Each assertion appears once and is assigned to exactly one checkpoint and one pr
 | 63 | Reparse points, parent escapes, broad deletion targets, and unrelated historical directories are rejected or left untouched. | `m8_c6_cleanup_scope_is_confined` |
 | 64 | Raw logs are bounded/ignored and the sanitized report contains no secret, username, absolute path, key-file name, temporary name, or raw private material. | `m8_c6_sanitized_evidence_leaks_nothing` |
 | 65 | SDK/CLI source contains no hidden default key, three-key production custody, automatic retry, emergency revocation, verdict commit/reveal, or automatic HOLD approval path. | `m8_c6_production_source_boundary_audit` |
-| 66 | Program source, replay schemas, golden vectors, fixtures, artifacts, manifests, policies, program IDs, and both lockfiles remain unchanged. | `m8_c6_compatibility_hash_audit` |
+| 66 | Compatibility audit confines program/artifact drift to the authorized Gate payload-hash correction and its regenerated provenance; replay schemas, Milestone 7 golden vectors, fixtures, candidate artifacts/manifests, policies, program IDs, and lockfiles remain unchanged. | `m8_c6_compatibility_hash_audit` |
 | 67 | The assertion ledger contains assertions 1-68 exactly once, each mapped to its behavior-executing primary test and checkpoint. | `m8_c6_assertion_ledger_is_complete` |
 | 68 | The final clean rehearsal proves both canonical shards, all expected failure classes, zero automatic retries, no orphans/residue, and a clean reviewed tree. | `m8_c6_complete_closeout_rehearsal` |
 
@@ -785,6 +833,19 @@ Implement the one-key signer abstraction, production one-worker command, three-o
 ### Checkpoint 3 - Direct-attestation integration
 
 Implement chain preflight, exact result/attestation/finalization transaction construction, postcondition reads, governance epoch commands, stake/epoch-economic integration, and fresh-ledger epoch/adversarial tests. Owns assertions 26-38.
+
+Checkpoint 3 is explicitly authorized to implement the narrow Section 2.1 Gate correction before completing direct-attestation integration. That authority is limited to:
+
+- adding a narrow helper in `programs/faultline_gate/src/lib.rs` that validates canonical loader-v3 Buffer owner, minimum metadata length, exact `UpgradeableLoaderState::Buffer` state, and the existing authority/lifecycle requirements, then returns only the exact executable payload slice;
+- replacing full-account hashing with payload-only hashing at every relevant proposal creation, verification, and execution path, without changing the `candidate_buffer_hash` field, account layouts, instruction data, discriminators, PDA seeds, errors, or commitment preimages;
+- adding Rust unit tests in `programs/faultline_gate/src/lib.rs` for header exclusion, exact payload hashing, truncation, extra trailing bytes, wrong loader state, wrong owner, insufficient metadata length, and authority/state failures;
+- updating the TypeScript/local-validator parity coverage in `tests/proposal-state-machine.spec.ts`, `tests/verifier-quorum.spec.ts`, and, where the shared proposal helper requires it, `tests/treasury-versions.spec.ts`, using a genuinely staged loader-v3 Buffer;
+- regenerating `artifacts/gate/faultline_gate.so` and only its affected entry/provenance in `artifacts/manifest.json` after the implementation begins; and
+- regenerating or comparing the generated public IDL and SDK parity surfaces, with no IDL change expected unless authoritative Anchor generation proves otherwise. Any proven generated change must be limited to the affected provenance files under `packages/faultline-idl` and corresponding SDK parity evidence.
+
+The mandatory positive regression proves that a real staged Buffer whose payload is byte-for-byte and length-for-length identical to the raw `.so` produces the build-manifest/Milestone 7/proposal equality and succeeds through creation and guarded execution. Mandatory negative regressions cover a mutated or truncated payload, extra trailing capacity or bytes, inclusion or mutation of header bytes without weakening independent header validation, short data, wrong owner, non-Buffer loader state, invalid authority/write lock/`BufferClaim`, and substitution of a different Buffer account. Tests must prove the legacy full-account digest is rejected rather than accepted as a fallback, and that a pre-migration active proposal fails closed.
+
+No Milestone 7 receipt, worker-output, signature, result-commitment, attestation schema, or golden vector may be regenerated or changed. SDK/IDL verification is parity work, not authority for a protocol-surface change.
 
 ### Checkpoint 4 - v2 rejection and settlement
 

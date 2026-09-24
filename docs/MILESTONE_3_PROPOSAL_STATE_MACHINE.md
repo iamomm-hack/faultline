@@ -21,7 +21,22 @@ Exact `SafetyPolicy` fields: `authority`, `governance_authority`, `target_progra
 
 Exact `UpgradeProposal` fields: `policy`, `proposal_id`, `target_program`, `program_data`, `candidate_buffer`, `candidate_buffer_hash`, `proposer`, `created_at_slot`, `challenge_start_slot`, `challenge_end_slot`, `state`, `decision_authority`, `decision_slot`, `decision_reason_code`, `executed_at_slot`, and `bump`.
 
-The candidate hash is SHA-256 over exact loader-v3 Buffer account data. It is recomputed at creation and execution. Loader buffer authority is handed to GuardConfig before creation; Gate has no write or authority-change instruction. `BufferClaim` prevents reuse.
+The original Milestone 3 implementation and acceptance proof computed the candidate hash over the complete loader-v3 Buffer account data, including loader metadata. That statement remains historical evidence only. It is superseded for every post-migration proposal by the Milestone 8 executable-payload correction below; it must not be used as an alternate interpretation or fallback.
+
+For all post-migration proposals, the existing on-chain field named `candidate_buffer_hash` means SHA-256 of exactly:
+
+```text
+buffer_account.data[
+  UpgradeableLoaderState::size_of_buffer_metadata() ..
+  buffer_account.data.len()
+]
+```
+
+The digest excludes the complete loader-v3 state/authority header and includes every byte after that canonical metadata boundary in original order. It performs no ELF parsing, normalization, decompression, trailing-zero trimming, or padding removal; it uses no domain prefix. A staged Buffer therefore matches the raw `.so` artifact only when the payload slice has exactly the same length and contents. Extra trailing capacity or bytes are hash-significant and cannot match a shorter artifact.
+
+Header exclusion changes only the executable-content digest. The Gate must independently require the canonical upgradeable BPF loader owner, a data length at least `UpgradeableLoaderState::size_of_buffer_metadata()`, serialized state exactly `UpgradeableLoaderState::Buffer`, the existing Guard/`BufferClaim` authority lifecycle and write lock, and identity between the proposal-bound Buffer and the Buffer later used for guarded execution. Loader metadata remains security-critical state.
+
+The field name `candidate_buffer_hash` is retained as a legacy ABI/account-layout name. No account layout is changed. Milestone 8 is authoritative for the fail-closed migration boundary and the future implementation authorization.
 
 ## State and authorization
 
@@ -71,7 +86,7 @@ Solana 1.18.10 on Windows attempts a slot-100 snapshot using an unavailable syml
 | terminal | 15–23 | Late-decision and early-expiry rejection; Expired and Rejected terminal states; one real Guard loader-v3 upgrade; treasury v2 behavior; retained execution metadata; all repeated Executed transitions rejected |
 | authority | 24–39 | Direct-loader rejection; Guard and buffer locking; BufferClaim reuse; missing claim (29a); initialized foreign candidate plus claim substitution (29b); immutable commitment; policy/proposal/target/ProgramData/loader/buffer/Guard substitution; real guarded execution |
 
-Candidate integrity is enforced by SHA-256 over exact loader-v3 Buffer account data, transfer of buffer authority to the Guard before proposal creation, and a `BufferClaim` that binds one buffer to one proposal. Execution rechecks the stored buffer address and hash before the Guard PDA signs the loader-v3 CPI.
+The original acceptance proof enforced candidate integrity using the then-current full-account digest, transfer of buffer authority to the Guard before proposal creation, and a `BufferClaim` binding one buffer to one proposal. That proof remains an accurate record of the pre-migration implementation, not authority to accept that digest after the Milestone 8 cutover. Post-migration creation and execution recheck the stored Buffer address and the exact executable-payload digest defined above before the Guard PDA signs the loader-v3 CPI.
 
 Confirmed failed on-chain transactions:
 

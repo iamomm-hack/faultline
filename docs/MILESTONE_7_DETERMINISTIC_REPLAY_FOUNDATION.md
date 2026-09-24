@@ -534,6 +534,17 @@ The closed replay job has exactly these required keys:
 
 Verifier identity, worker ordinal, host path, wall-clock time, and coordinator nonce are excluded so all workers share one job hash.
 
+`candidate_executable_sha256` remains SHA-256 of the exact raw `.so` artifact bytes selected by the build manifest. Milestone 8 does not change this field, the replay-job schema, receipt schema, worker-output schema, signature schema, result-commitment preimage, attestation schema, or any Milestone 7 golden vector. For post-migration proposals, the legacy-named `candidate_buffer_hash` copied from the frozen round must equal that same raw-artifact digest because the Gate computes it from exactly:
+
+```text
+buffer_account.data[
+  UpgradeableLoaderState::size_of_buffer_metadata() ..
+  buffer_account.data.len()
+]
+```
+
+The digest excludes the complete loader-v3 state/authority header and includes every byte after that canonical metadata boundary in original order. It performs no ELF parsing, normalization, decompression, trailing-zero trimming, or padding removal; it uses no domain prefix. A staged Buffer therefore matches the raw `.so` artifact only when the payload slice has exactly the same length and contents. Extra trailing capacity or bytes are hash-significant and cannot match a shorter artifact. Loader owner, state, authority, locking, and proposal-bound account identity remain separate on-chain validations specified by Milestone 8.
+
 ### 7.8 `faultline.replay-receipt.v1`
 
 The closed receipt has exactly these required keys:
