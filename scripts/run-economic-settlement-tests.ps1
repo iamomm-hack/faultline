@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('policy-funding', 'stakes-withdrawal', 'bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing', 'pending-refund', 'paid-refund', 'revealed-unopened', 'direct-attestation')]
+  [ValidateSet('policy-funding', 'stakes-withdrawal', 'bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing', 'pending-refund', 'paid-refund', 'revealed-unopened', 'direct-attestation', 'v2-violation')]
   [string]$Shard
 )
 
@@ -83,7 +83,7 @@ function Invoke-OwnedProcess {
   $stdoutTask = $process.StandardOutput.ReadToEndAsync()
   $stderrTask = $process.StandardError.ReadToEndAsync()
   Write-Stage $Evidence "STAGE PROCESS name=$Stage owned_pid=$($process.Id)"
-  $nextHeartbeat = 30
+  $nextHeartbeat = 15
   try {
     while ($true) {
       $process.Refresh()
@@ -125,7 +125,7 @@ function Invoke-OwnedProcess {
       }
       if ($watch.Elapsed.TotalSeconds -ge $nextHeartbeat) {
         Write-Stage $Evidence "STAGE HEARTBEAT name=$Stage elapsed_seconds=$([math]::Floor($watch.Elapsed.TotalSeconds)) owned_pid=$($process.Id) $(Get-SlotEvidence)"
-        $nextHeartbeat += 30
+        $nextHeartbeat += 15
       }
       [void]$process.WaitForExit(250)
     }
@@ -176,8 +176,8 @@ foreach ($currentShard in $shards) {
     Remove-Item -LiteralPath $ledger -Recurse -Force
   }
   New-Item -ItemType Directory -Path $ledger | Out-Null
-  $phase = if ($currentShard -eq 'direct-attestation') { 'M8-C3' } elseif ($currentShard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($currentShard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
-  Set-Content -LiteralPath $evidence -Value "Milestone 6 Phase $phase shard=$currentShard"
+  $phase = if ($currentShard -eq 'direct-attestation') { 'M8-C3' } elseif ($currentShard -eq 'v2-violation') { 'M8-C4' } elseif ($currentShard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($currentShard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
+  Set-Content -LiteralPath $evidence -Value "Faultline shard phase=$phase shard=$currentShard"
   try {
     $flags = '--reset --rpc-port 8899 --faucet-port 9900 --ticks-per-slot 1024 --log'
     Write-Stage $evidence "STAGE START name=validator-readiness timeout_seconds=45 flags=$flags"
@@ -223,14 +223,17 @@ foreach ($currentShard in $shards) {
     Write-Stage $evidence "STAGE START name=test-start timeout_seconds=15 $(Get-SlotEvidence)"
     if (-not (Test-TcpPortListening 8899)) { throw "Validator stopped listening before test start for $currentShard" }
     Write-Stage $evidence "STAGE COMPLETE name=test-start elapsed_ms=0 $(Get-SlotEvidence)"
+    $shardTimeout = if ($currentShard -eq 'v2-violation') { 2100 } else { 2400 }
     Invoke-OwnedProcess -Evidence $evidence -Stage "typescript-$currentShard" -FilePath $nodeExe -Arguments @(
       'node_modules/tsx/dist/cli.mjs', 'tests/economic-settlement.spec.ts', '--shard', $currentShard
-    ) -TimeoutSeconds 2400 -ProcessStdout (Join-Path $localRoot "economic-settlement-$currentShard.test.stdout.log") -ProcessStderr (Join-Path $localRoot "economic-settlement-$currentShard.test.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
+    ) -TimeoutSeconds $shardTimeout -ProcessStdout (Join-Path $localRoot "economic-settlement-$currentShard.test.stdout.log") -ProcessStderr (Join-Path $localRoot "economic-settlement-$currentShard.test.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
     $finalConfirmedSlot = Get-ValidatorSlot 'confirmed'
     $finalFinalizedSlot = Get-ValidatorSlot 'finalized'
     if ($phase -in @('B', 'C') -and [int]$finalConfirmedSlot -ge 90) { throw "Phase $phase shard $currentShard exceeded confirmed-slot budget: $finalConfirmedSlot" }
+    if ($currentShard -eq 'v2-violation' -and [int]$finalConfirmedSlot -ge 140) { throw "Milestone 8 Checkpoint 4 exceeded confirmed-slot budget: $finalConfirmedSlot" }
     Write-Stage $evidence "SHARD COMPLETE name=$currentShard confirmed_final_slot=$finalConfirmedSlot finalized_final_slot=$finalFinalizedSlot"
   } finally {
+    if ($currentShard -eq 'v2-violation') { Write-Stage $evidence 'ASSERT ACTIVE number=48 behavior=owned-state-cleanup' }
     Remove-Item Env:FAULTLINE_ECONOMIC_GENESIS -ErrorAction SilentlyContinue
     Remove-Item Env:FAULTLINE_ECONOMIC_SHARD -ErrorAction SilentlyContinue
     if ($validator) {
@@ -248,18 +251,24 @@ foreach ($currentShard in $shards) {
       Start-Sleep -Milliseconds 100
     }
     if (Test-TcpPortListening 8899) { throw "Port 8899 remained occupied after owned cleanup for $currentShard" }
-    if ($currentShard -eq 'direct-attestation' -and (Test-Path -LiteralPath $ledger)) {
-      if ((Get-Item -LiteralPath $ledger).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing linked Checkpoint 3 ledger cleanup' }
+    if ($currentShard -in @('direct-attestation', 'v2-violation') -and (Test-Path -LiteralPath $ledger)) {
+      if ((Get-Item -LiteralPath $ledger).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing linked Milestone 8 ledger cleanup for $currentShard" }
       Remove-Item -LiteralPath $ledger -Recurse -Force
-      Remove-Item -LiteralPath (Join-Path $localRoot 'economic-settlement-direct-attestation.pid') -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath (Join-Path $localRoot "economic-settlement-$currentShard.pid") -Force -ErrorAction SilentlyContinue
     }
     Write-Stage $evidence "CLEANUP COMPLETE shard=$currentShard port_8899_free=true elapsed_ms=$($cleanupWatch.ElapsedMilliseconds)"
+    if ($currentShard -eq 'v2-violation') {
+      $ownedResidue = @(Get-ChildItem -LiteralPath $localRoot -Force | Where-Object { $_.Name -like 'm8-c4-owned-*' -or $_.Name -like 'm8-c4-*.ipc' })
+      if ($ownedResidue.Count -ne 0 -or (Test-Path -LiteralPath $ledger) -or (Test-Path -LiteralPath (Join-Path $localRoot "economic-settlement-$currentShard.pid"))) { throw 'Checkpoint 4 owned runtime residue survived cleanup' }
+      Write-Stage $evidence 'ASSERT 48 PASS v2 shard cleaned owned workers validator handles key files ledger IPC and run directory'
+    }
   }
 }
 
 if ($Shard) {
-  $reportedPhase = if ($Shard -eq 'direct-attestation') { 'M8-C3' } elseif ($Shard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($Shard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
-  Write-Output "$(if ($Shard -eq 'direct-attestation') { 'MILESTONE-8 CHECKPOINT-3' } else { "MILESTONE-6 PHASE-$reportedPhase" }) SHARD PASSED: $Shard"
+  $reportedPhase = if ($Shard -eq 'direct-attestation') { 'M8-C3' } elseif ($Shard -eq 'v2-violation') { 'M8-C4' } elseif ($Shard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($Shard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
+  $label = if ($Shard -eq 'direct-attestation') { 'MILESTONE-8 CHECKPOINT-3' } elseif ($Shard -eq 'v2-violation') { 'MILESTONE-8 CHECKPOINT-4' } else { "MILESTONE-6 PHASE-$reportedPhase" }
+  Write-Output "$label SHARD PASSED: $Shard"
 } else {
   Write-Output 'MILESTONE-6 PHASE-B ASSERTIONS 61-104 PASSED'
 }
