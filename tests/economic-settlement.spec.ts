@@ -1,7 +1,8 @@
 /* Milestone 6 dedicated fresh-ledger validation, Phase A, B and C assertions. */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { appendFileSync, readFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
   Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SYSVAR_RENT_PUBKEY,
   SystemProgram, Transaction, TransactionInstruction
@@ -14,8 +15,11 @@ import {
   MINT_SIZE, TOKEN_ACCOUNT_AMOUNT_OFFSET, TOKEN_ACCOUNT_SIZE, TOKEN_PROGRAM_ID,
   tokenAmount
 } from "../scripts/lib/spl-token-lite.js";
+import { canonicalJson, preflightDirectAttestation, validateAttestationPlan } from "../packages/faultline-sdk/src/index.js";
+import { bindCheckpoint3ReplayJob } from "./milestone-8-checkpoint3-fixture.js";
+import { createAssertionTracker } from "./assertion-tracker.js";
 
-type Shard = "policy-funding" | "stakes-withdrawal" | "bonds-hold" | "violation-fees" | "bond-outcomes" | "objective-slashing" | "pending-refund" | "paid-refund" | "revealed-unopened";
+type Shard = "policy-funding" | "stakes-withdrawal" | "bonds-hold" | "violation-fees" | "bond-outcomes" | "objective-slashing" | "pending-refund" | "paid-refund" | "revealed-unopened" | "direct-attestation";
 type PolicyParameters = {
   bounty: bigint; bond: bigint; fee: bigint; minimumStake: bigint; slash: bigint;
   maxChallenges: number; feeGrace: bigint; slashGrace: bigint; cooldown: bigint;
@@ -76,20 +80,12 @@ const replayResultAddress = (round: PublicKey, resultHash: Buffer) => PublicKey.
 const feeClaimAddress = (round: PublicKey, verifier: PublicKey) => PublicKey.findProgramAddressSync([Buffer.from("verifier-fee-claim"), round.toBuffer(), verifier.toBuffer()], gate)[0];
 const REPLAY_DOMAIN = Buffer.from("FAULTLINE_REPLAY_V1", "ascii");
 
-let activeAssertion = 0;
-function pass(number: number, message: string, detail = ""): void {
-  assert.equal(number, activeAssertion, `assertion sequencing error: active=${activeAssertion} pass=${number}`);
-  console.log(`ASSERT ${number} PASS ${message}${detail ? ` ${detail}` : ""}`);
-}
+const assertionTracker = createAssertionTracker(message => console.log(message));
 async function check(number: number, message: string, operation: () => Promise<void> | void): Promise<void> {
-  activeAssertion = number;
-  await operation();
-  pass(number, message);
+  await assertionTracker.run(number, message, operation);
 }
 async function fails(number: number, message: string, expected: RegExp, operation: () => Promise<unknown>): Promise<void> {
-  activeAssertion = number;
-  await expectFailure(`${number} ${message}`, operation, expected);
-  pass(number, message, `expected=${expected.source}`);
+  await assertionTracker.run(number, message, () => expectFailure(`${number} ${message}`, operation, expected), `expected=${expected.source}`);
 }
 
 async function send(ix: TransactionInstruction, feePayer: Keypair, signers: Keypair[] = []): Promise<string> {
@@ -218,10 +214,10 @@ function initializeEconomicPolicy(configId: bigint, mint: PublicKey, params: Pol
   { pubkey: economicRegistry, isSigner: false, isWritable: true }, { pubkey: mint, isSigner: false, isWritable: false },
   { pubkey: economicPolicyAddress(configId), isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
 ], Buffer.concat([u64(configId), encodePolicyParameters(params)])); }
-function initializeInvariant(id = 1n) { return anchorInstruction(gate, "initialize_invariant", [
+function initializeInvariant(id = 1n, specificationHash = sha256(Buffer.from(`spec-${id}`))) { return anchorInstruction(gate, "initialize_invariant", [
   { pubkey: governance.publicKey, isSigner: true, isWritable: true }, { pubkey: policy, isSigner: false, isWritable: false },
   { pubkey: invariantAddress(id), isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
-], Buffer.concat([u64(id), Buffer.from([0]), sha256(Buffer.from(`AUTH-${id}`)), sha256(Buffer.from(`spec-${id}`))])); }
+], Buffer.concat([u64(id), Buffer.from([0]), sha256(Buffer.from(`AUTH-${id}`)), specificationHash])); }
 function createProposal(id: bigint, buffer: PublicKey, hash: Buffer) { const proposal = proposalAddress(id); return anchorInstruction(gate, "create_upgrade_proposal", [
   { pubkey: proposer.publicKey, isSigner: true, isWritable: true }, { pubkey: guard, isSigner: false, isWritable: true },
   { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: treasury, isSigner: false, isWritable: false },
@@ -356,22 +352,22 @@ function slashNonReveal(id: bigint, configId: bigint, epochId: bigint, round: Pu
   { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
 ]); }
 
-async function bootstrap(): Promise<void> {
+async function bootstrap(invariantSpecificationHash?: Buffer): Promise<void> {
   for (const actor of [governance, proposer, outsider, hunter]) {
     await send(SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: actor.publicKey, lamports: 8 * LAMPORTS_PER_SOL }), payer);
   }
   await send(initializeGuard(), governance);
   await send(setLoaderAuthorityInstruction(treasuryData, payer.publicKey, guard), payer);
   await send(initializeSafetyPolicy(), governance);
-  await send(initializeInvariant(), governance);
+  await send(initializeInvariant(1n, invariantSpecificationHash), governance);
 }
-async function bootstrapBatched(): Promise<void> {
+async function bootstrapBatched(invariantSpecificationHash?: Buffer): Promise<void> {
   await sendMany([
     ...[governance, proposer, outsider, hunter].map(actor => SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: actor.publicKey, lamports: 8 * LAMPORTS_PER_SOL })),
     initializeGuard(),
     setLoaderAuthorityInstruction(treasuryData, payer.publicKey, guard),
     initializeSafetyPolicy(),
-    initializeInvariant()
+    initializeInvariant(1n, invariantSpecificationHash)
   ], payer, [governance]);
 }
 function registryView(raw: Buffer) { return { safetyPolicy: new PublicKey(raw.subarray(8, 40)), governance: new PublicKey(raw.subarray(40, 72)), next: raw.readBigUInt64LE(72), enforcement: raw.readBigUInt64LE(80), created: raw.readBigUInt64LE(88), bump: raw[96] }; }
@@ -512,7 +508,8 @@ async function dust(address: PublicKey): Promise<void> { const lamports = await 
 
 type PhaseBSetup = { registry: ReturnType<typeof registryView>; mint: Keypair; ep: PublicKey; params: PolicyParameters; verifiers: Keypair[]; verifierAtas: PublicKey[]; canonical: PublicKey[]; proposerAta: PublicKey; hunters: Keypair[]; hunterAtas: PublicKey[]; buffers: { key: PublicKey; hash: Buffer }[] };
 async function setupPhaseB(name: string, verifierCount: number, threshold: number, params: PolicyParameters, bufferCount: number, stakeAmount: bigint, batched = false): Promise<PhaseBSetup> {
-  await (batched ? bootstrapBatched() : bootstrap());
+  const invariantSpecificationHash = name === "m8-c3" ? sha256(readFileSync(`${ROOT}/policies/invariants/AUTH-001.json`)) : undefined;
+  await (batched ? bootstrapBatched(invariantSpecificationHash) : bootstrap(invariantSpecificationHash));
   await send(initializeEconomicRegistry(governance.publicKey), governance);
   const registry = registryView(await accountData(economicRegistry));
   const mint = Keypair.fromSeed(sha256(Buffer.from(`${name}-mint`)));
@@ -520,7 +517,7 @@ async function setupPhaseB(name: string, verifierCount: number, threshold: numbe
   const ep = economicPolicyAddress(0n); configMint.set(ep.toBase58(), mint.publicKey);
   if (batched) await sendMany([initializeEconomicPolicy(0n, mint.publicKey, params), initializeVerifierRegistry()], governance);
   else { await send(initializeEconomicPolicy(0n, mint.publicKey, params), governance); await send(initializeVerifierRegistry(), governance); }
-  const verifiers = Array.from({ length: verifierCount }, (_, i) => Keypair.fromSeed(sha256(Buffer.from(`${name}-verifier-${i}`))));
+  const verifiers = Array.from({ length: verifierCount }, (_, i) => name === "m8-c3" ? Keypair.generate() : Keypair.fromSeed(sha256(Buffer.from(`${name}-verifier-${i}`))));
   const hunters = [hunter, ...Array.from({ length: 3 }, (_, i) => Keypair.fromSeed(sha256(Buffer.from(`${name}-hunter-${i}`))))];
   let verifierAtas: PublicKey[]; let hunterAtas: PublicKey[]; let proposerAta: PublicKey;
   if (batched) {
@@ -1089,13 +1086,172 @@ async function runRevealedUnopened(): Promise<void> {
   console.log(`SIGNATURE unopened-round=${openedSignature} after-end=${aSettlement} terminal-rejection=${rejectionSignature} terminal-refund=${bSettlement}`);
 }
 
+async function runDirectAttestation(): Promise<void> {
+  const owned = `${ROOT}/.localnet/m8-c3-owned-${process.pid}`;
+  mkdirSync(owned, { recursive: false });
+  try {
+    const setup = await setupPhaseB("m8-c3", 3, 3, goodParams, 1, 100n, true);
+    const executablePath = `${ROOT}/artifacts/treasury/v2/faultline_treasury.so`;
+    const manifestPath = `${ROOT}/manifests/treasury-v2-build.json`;
+    const rawExecutable = readFileSync(executablePath);
+    const realBuffer = Keypair.generate();
+    const bufferKeyPath = `${owned}/candidate.json`;
+    const bufferSecret = [...realBuffer.secretKey]; writeFileSync(bufferKeyPath, JSON.stringify(bufferSecret)); bufferSecret.fill(0);
+    execFileSync("solana.exe", ["program", "write-buffer", executablePath, "--buffer", bufferKeyPath, "--buffer-authority", `${ROOT}/.localnet/proposer.json`, "--fee-payer", `${ROOT}/.localnet/payer.json`, "--keypair", `${ROOT}/.localnet/payer.json`, "--url", RPC, "--commitment", COMMITMENT], { cwd: ROOT, stdio: "pipe", timeout: 12 * 60_000 });
+    await send(setLoaderAuthorityInstruction(realBuffer.publicKey, proposer.publicKey, guard), payer, [proposer]);
+    const realBufferInfo = await connection.getAccountInfo(realBuffer.publicKey, COMMITMENT); assert(realBufferInfo);
+    const executableHash = sha256(rawExecutable); const payloadHash = loaderBufferExecutableHash(realBufferInfo); const fullHash = sha256(realBufferInfo.data);
+    assert.deepEqual(payloadHash, executableHash); assert.notDeepEqual(fullHash, executableHash);
+
+    const id = 1n; const proposal = proposalAddress(id);
+    await sendMany([createProposal(id, realBuffer.publicKey, executableHash), fundEscrow(id, 0n, proposer.publicKey, setup.proposerAta), startFunded(id, 0n, 120n)], proposer);
+    const proposalLifecycle = proposalView(await accountData(proposal));
+    const claimLifecycle = new Cursor(await accountData(bufferClaimAddress(realBuffer.publicKey)));
+    const claimProposal = claimLifecycle.pubkey(); const claimCandidate = claimLifecycle.pubkey();
+    console.log(`CANDIDATE LIFECYCLE address=${realBuffer.publicKey.toBase58()} owner=${realBufferInfo.owner.toBase58()} variant=Buffer authority_option=Some authority=${guard.toBase58()} metadata_length=37 payload_length=${realBufferInfo.data.length - 37} proposal_candidate=${proposalLifecycle.candidate.toBase58()} claim_proposal=${claimProposal.toBase58()} claim_candidate=${claimCandidate.toBase58()}`);
+    const vectors = JSON.parse(readFileSync(`${ROOT}/manifests/checkpoint-1-vectors.json`, "utf8"));
+    const templateJob = vectors.replay_jobs[0] as Record<string, unknown>;
+    const invariantSpecificationHash = sha256(readFileSync(`${ROOT}/policies/invariants/AUTH-001.json`));
+    const trace = Buffer.from(String(templateJob.trace_hash), "hex"); const salt = sha256(Buffer.from("m8-c3-salt"));
+    const bonded = await revealBond(id, setup.hunters[0], setup.hunterAtas[0], trace, salt);
+    const opening = openEconomicRound(id, 0n, 0n, setup.hunters[0].publicKey, bonded.commitment, trace, setup.canonical.map(value => stakeAddress(setup.ep, value)));
+    await send(opening.ix, payer);
+    const traceClaim = traceAddress(proposal, trace);
+    const baseJob = bindCheckpoint3ReplayJob(templateJob, {
+      verificationRound: opening.round.toBase58(), proposal: proposal.toBase58(), invariantAccount: invariantAddress(1n).toBase58(), traceClaim: traceClaim.toBase58(),
+      candidateExecutableSha256: executableHash.toString("hex"), invariantSpecificationHash: invariantSpecificationHash.toString("hex")
+    });
+
+    await check(26, "canonical epoch is immutable three-of-three", async () => {
+      const raw = await accountData(epochAddress(0n)); const view = new Cursor(raw); view.pubkey(); view.pubkey(); assert.equal(view.u64(), 0n); const count = raw.readUInt32LE(80); assert.equal(count, 3); assert.equal(raw[84 + 32 * count], 3); assert.equal(new Set(setup.verifiers.map(value => value.publicKey.toBase58())).size, 3);
+    });
+    await fails(27, "only governance controls epoch admission", /UnauthorizedGovernance/, () => send(anchorInstruction(gate, "create_verifier_epoch", [
+      { pubkey: outsider.publicKey, isSigner: true, isWritable: true }, { pubkey: policy, isSigner: false, isWritable: false }, { pubkey: verifierRegistry, isSigner: false, isWritable: true }, { pubkey: epochAddress(1n), isSigner: false, isWritable: true }, { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+    ], Buffer.concat([u64(1n), u32(3), ...[setup.verifiers[1], setup.verifiers[2], outsider].map(value => value.publicKey.toBuffer()), Buffer.from([3])])), outsider));
+
+    const keyPaths: string[] = []; const requestPaths: string[] = []; const outputPaths: string[] = [];
+    for (let ordinal = 0; ordinal < 3; ordinal++) {
+      const keyPath = `${owned}/operator-${ordinal}.json`; const bytes = [...setup.verifiers[ordinal].secretKey]; writeFileSync(keyPath, JSON.stringify(bytes)); bytes.fill(0); keyPaths.push(keyPath);
+      const request = { schema: "faultline.worker-request.v1", canonicalization: "faultline.canonical-json.v1", coordinator_nonce: sha256(Buffer.from(`m8-c3-nonce-${ordinal}`)).toString("hex"), worker_ordinal: ordinal, expected_verifier_pubkey: setup.verifiers[ordinal].publicKey.toBase58(), replay_job: baseJob, input_paths: { candidate_build_manifest: "manifests/treasury-v2-build.json", runner_manifest: "manifests/treasury-runner.json", fixture_manifest: "manifests/treasury-v1-fixture.json", invariant_manifest: "manifests/auth-001-invariant.json", trace: "fixtures/exploits/auth-001-v2-authority-takeover.json", candidate_executable: "artifacts/treasury/v2/faultline_treasury.so" } };
+      const requestPath = `${owned}/request-${ordinal}.json`; const outputPath = `${owned}/output-${ordinal}.json`; writeFileSync(requestPath, canonicalJson(request)); requestPaths.push(requestPath); outputPaths.push(outputPath);
+      execFileSync(`${ROOT}/crates/faultline-replay/target/debug/faultline.exe`, ["verifier", "run", "--repository", ROOT, "--request", requestPath, "--keypair", keyPath, "--epoch-member", setup.verifiers[ordinal].publicKey.toBase58(), "--stake-identity", setup.verifiers[ordinal].publicKey.toBase58(), "--worker-signer", setup.verifiers[ordinal].publicKey.toBase58(), "--attestation-signer", setup.verifiers[ordinal].publicKey.toBase58(), "--output", outputPath, "--demo-owned-run", owned], { cwd: ROOT, stdio: "pipe", timeout: 120_000 });
+    }
+    const disagreeJob = structuredClone(vectors.replay_jobs[1]) as Record<string, unknown>; Object.assign(disagreeJob, { verification_round: opening.round.toBase58(), proposal: proposal.toBase58(), invariant_account: invariantAddress(1n).toBase58(), trace_claim: traceClaim.toBase58() });
+    const disagreeRequest = { schema: "faultline.worker-request.v1", canonicalization: "faultline.canonical-json.v1", coordinator_nonce: sha256(Buffer.from("m8-c3-disagreement")).toString("hex"), worker_ordinal: 2, expected_verifier_pubkey: setup.verifiers[2].publicKey.toBase58(), replay_job: disagreeJob, input_paths: { candidate_build_manifest: "manifests/treasury-v3-build.json", runner_manifest: "manifests/treasury-runner.json", fixture_manifest: "manifests/treasury-v1-fixture.json", invariant_manifest: "manifests/auth-001-invariant.json", trace: "fixtures/exploits/auth-001-v2-authority-takeover.json", candidate_executable: "artifacts/treasury/v3/faultline_treasury.so" } };
+    const disagreeRequestPath = `${owned}/request-disagree.json`; const disagreeOutputPath = `${owned}/output-disagree.json`; writeFileSync(disagreeRequestPath, canonicalJson(disagreeRequest));
+    execFileSync(`${ROOT}/crates/faultline-replay/target/debug/faultline.exe`, ["verifier", "run", "--repository", ROOT, "--request", disagreeRequestPath, "--keypair", keyPaths[2], "--epoch-member", setup.verifiers[2].publicKey.toBase58(), "--stake-identity", setup.verifiers[2].publicKey.toBase58(), "--worker-signer", setup.verifiers[2].publicKey.toBase58(), "--attestation-signer", setup.verifiers[2].publicKey.toBase58(), "--output", disagreeOutputPath, "--demo-owned-run", owned], { cwd: ROOT, stdio: "pipe", timeout: 120_000 });
+    const planPath = `${owned}/plan.json`; const genesis = await connection.getGenesisHash();
+    const quorumArgs = ["quorum", "verify", ...requestPaths.flatMap(value => ["--request", value]), ...outputPaths.flatMap(value => ["--signed-output", value]), "--gate-program-id", gate.toBase58(), "--expected-genesis-hash", genesis, "--verifier-epoch", epochAddress(0n).toBase58(), "--plan-output", planPath];
+    execFileSync(`${ROOT}/crates/faultline-replay/target/debug/faultline.exe`, quorumArgs, { cwd: ROOT, stdio: "pipe", timeout: 120_000 });
+    const disagreementPlan = `${owned}/disagreement-plan.json`; const disagreement = spawnSync(`${ROOT}/crates/faultline-replay/target/debug/faultline.exe`, ["quorum", "verify", "--request", requestPaths[0], "--request", requestPaths[1], "--request", disagreeRequestPath, "--signed-output", outputPaths[0], "--signed-output", outputPaths[1], "--signed-output", disagreeOutputPath, "--gate-program-id", gate.toBase58(), "--expected-genesis-hash", genesis, "--verifier-epoch", epochAddress(0n).toBase58(), "--plan-output", disagreementPlan], { cwd: ROOT, encoding: "utf8", timeout: 120_000 }); assert.equal(disagreement.status, 22); assert(!existsSync(disagreementPlan));
+    const requests = requestPaths.map(value => JSON.parse(readFileSync(value, "utf8")));
+    const plan = validateAttestationPlan(JSON.parse(readFileSync(planPath, "utf8")), requests);
+    assert.equal(plan.signed_worker_outputs.length, 3); assert.equal(plan.result_hash, plan.signed_worker_outputs[0].output.replay_result_commitment);
+
+    const newAta = await createAta(payer, outsider.publicKey, setup.mint.publicKey); await mintTokens(setup.mint.publicKey, newAta, 1_000n);
+    await send(initializeStake(0n, outsider.publicKey, newAta, 100n), outsider);
+    const nextMembers = [setup.verifiers[1].publicKey, setup.verifiers[2].publicKey, outsider.publicKey];
+    await send(createEpoch(1n, nextMembers, 3), governance); await send(activateEpoch(1n), governance);
+    const nextStakes = sortedKeys(nextMembers).map(value => stakeAddress(setup.ep, value));
+    await fails(28, "epoch economics rejects missing stake binding", /WrongRemainingAccountCount/, () => send(activateEpochEconomics(1n, 0n, nextStakes.slice(0, 2)), governance));
+    await send(activateEpochEconomics(1n, 0n, nextStakes), governance);
+
+    const id2 = 2n; await prepareFundedProposal(setup, id2, 0, 80n, true); const trace2 = sha256(Buffer.from("m8-c3-rotation-trace")); const salt2 = sha256(Buffer.from("m8-c3-rotation-salt")); const bonded2 = await revealBond(id2, setup.hunters[1], setup.hunterAtas[1], trace2, salt2); const oldSelection = openEconomicRound(id2, 0n, 0n, setup.hunters[1].publicKey, bonded2.commitment, trace2, setup.canonical.map(value => stakeAddress(setup.ep, value)));
+    await fails(37, "old epoch cannot be selected for a new round", /WrongVerifierEpoch|ActiveVerifierEpochMismatch|ConstraintHasOne/, () => send(oldSelection.ix, payer));
+    const nextOpening = openEconomicRound(id2, 0n, 1n, setup.hunters[1].publicKey, bonded2.commitment, trace2, nextStakes); await send(nextOpening.ix, payer);
+    await check(37, "new round uses newly active epoch immediately", async () => assert(roundView(await accountData(nextOpening.round)).epoch.equals(epochAddress(1n))));
+    await check(38, "historical round retains snapshotted epoch after rotation", async () => assert(roundView(await accountData(opening.round)).epoch.equals(epochAddress(0n))));
+
+    const resultHash = Buffer.from(plan.result_hash, "hex"); const receiptHash = Buffer.from(plan.replay_receipt_hash, "hex");
+    const wrongResult = Buffer.from(resultHash); wrongResult[0] ^= 1;
+    await fails(31, "ReplayResultMismatch rejects noncanonical commitment", /ReplayResultMismatch/, () => send(createReplay(opening.round, wrongResult, plan.verdict_u8, receiptHash), payer));
+    await send(createReplay(opening.round, resultHash, plan.verdict_u8, receiptHash), payer);
+    await check(31, "replay result uses frozen recomputed commitment", async () => assert.deepEqual(replayView(await accountData(replayResultAddress(opening.round, resultHash))).hash, resultHash));
+    await fails(35, "finalization before third attestation is rejected", /QuorumNotReached/, () => send(finalizeReplay(id, opening.round, resultHash), outsider));
+
+    const baseCli = ["node_modules/tsx/dist/cli.mjs", "packages/faultline-sdk/src/attestation-cli.ts", "attestation", "submit", "--rpc-url", RPC, "--expected-genesis-hash", genesis, "--commitment", COMMITMENT, "--rpc-deadline-ms", "30000", "--confirmation-deadline-ms", "90000", "--demo-owned-run", owned, "--plan", planPath, ...requestPaths.flatMap(value => ["--request", value]), "--raw-executable", executablePath, "--build-manifest", manifestPath, "--policy", policy.toBase58(), "--proposal", proposal.toBase58(), "--invariant", invariantAddress(1n).toBase58(), "--trace-claim", traceClaim.toBase58(), "--verifier-registry", verifierRegistry.toBase58(), "--verifier-epoch", epochAddress(0n).toBase58(), "--verification-round", opening.round.toBase58(), "--economic-policy", setup.ep.toBase58(), "--verifier-epoch-economics", epochEconomicsAddress(epochAddress(0n), setup.ep).toBase58(), "--round-economics", roundEconomicsAddress(opening.round).toBase58(), "--candidate-buffer", realBuffer.publicKey.toBase58()];
+    const invokeOperator = (ordinal: number, overrides: Record<string, string> = {}) => { const args = [...baseCli, "--keypair", keyPaths[ordinal], "--verifier-stake", stakeAddress(setup.ep, setup.verifiers[ordinal].publicKey).toBase58()]; for (const [name, value] of Object.entries(overrides)) { const index = args.lastIndexOf(`--${name}`); if (index < 0) args.push(`--${name}`, value); else args[index + 1] = value; } return spawnSync("node.exe", args, { cwd: ROOT, encoding: "utf8", timeout: 150_000 }); };
+    const wrongManifestPath = `${owned}/wrong-manifest.json`; writeFileSync(wrongManifestPath, JSON.stringify({ executable_sha256: "00".repeat(32) })); const mismatch = invokeOperator(0, { "build-manifest": wrongManifestPath }); assert.notEqual(mismatch.status, 0); assert.equal(await connection.getAccountInfo(attestationAddress(opening.round, setup.verifiers[0].publicKey), COMMITMENT), null);
+    await check(29, "core account and worker-request substitution is rejected before signing", async () => {
+      const failure = invokeOperator(0, { proposal: proposalAddress(2n).toBase58() }); assert.notEqual(failure.status, 0);
+      for (const mutate of [
+        (copy: any) => { copy[0].coordinator_nonce = "00".repeat(32); },
+        (copy: any) => { copy[0].worker_ordinal = 1; },
+        (copy: any) => { copy[0].replay_job.proposal = proposalAddress(2n).toBase58(); },
+        (copy: any) => { copy[0].replay_job.invariant_account = outsider.publicKey.toBase58(); },
+        (copy: any) => { copy[0].replay_job.trace_claim = outsider.publicKey.toBase58(); },
+        (copy: any) => { copy[0].replay_job.verification_round = outsider.publicKey.toBase58(); },
+      ]) { const copy = structuredClone(requests); mutate(copy); assert.throws(() => validateAttestationPlan(plan, copy)); }
+      const signatureCopy: any = structuredClone(plan); signatureCopy.signed_worker_outputs[0].signature = signatureCopy.signed_worker_outputs[1].signature; assert.throws(() => validateAttestationPlan(signatureCopy, requests));
+    });
+    await check(30, "receipt result specification and executable bindings are exact", async () => {
+      assert.deepEqual(executableHash, payloadHash); assert.deepEqual(executableHash.toString("hex"), (JSON.parse(readFileSync(manifestPath, "utf8")) as { executable_sha256: string }).executable_sha256); assert.equal(baseJob.candidate_executable_sha256, executableHash.toString("hex")); assert.deepEqual(proposalView(await accountData(proposal)).candidateHash, executableHash); assert.notDeepEqual(fullHash, executableHash);
+      for (const field of ["replay_receipt_hash", "result_hash"] as const) { const copy: any = structuredClone(plan); copy[field] = "00".repeat(32); assert.throws(() => validateAttestationPlan(copy, requests)); }
+      const verdictCopy: any = structuredClone(plan); verdictCopy.verdict_u8 = verdictCopy.verdict_u8 === 0 ? 1 : 0; assert.throws(() => validateAttestationPlan(verdictCopy, requests));
+      for (const field of ["candidate_executable_sha256", "candidate_buffer_hash", "invariant_specification_hash"] as const) { const copy: any = structuredClone(requests); copy[0].replay_job[field] = "00".repeat(32); assert.throws(() => validateAttestationPlan(plan, copy)); }
+    });
+    const firstPreflight = await preflightDirectAttestation(connection, { endpoint: RPC, genesisHash: genesis, commitment: "confirmed", timeoutMilliseconds: 30_000 }, { plan, requests, signer: setup.verifiers[0].publicKey, addresses: { policy, proposal, invariant: invariantAddress(1n), traceClaim, verifierRegistry, verifierEpoch: epochAddress(0n), verificationRound: opening.round, economicPolicy: setup.ep, verifierEpochEconomics: epochEconomicsAddress(epochAddress(0n), setup.ep), roundEconomics: roundEconomicsAddress(opening.round), verifierStake: stakeAddress(setup.ep, setup.verifiers[0].publicKey), candidateBuffer: realBuffer.publicKey }, rawExecutable, manifestExecutableSha256: executableHash.toString("hex") });
+    const signatures: string[] = [];
+    for (let ordinal = 0; ordinal < 3; ordinal++) {
+      const submission = invokeOperator(ordinal); assert.equal(submission.status, 0, submission.stderr); const parsed = JSON.parse(submission.stdout); signatures.push(parsed.result.transaction_signature);
+      assert.equal(replayView(await accountData(replayResultAddress(opening.round, resultHash))).votes, ordinal + 1);
+      if (ordinal === 0) {
+        const duplicate = invokeOperator(0); assert.notEqual(duplicate.status, 0);
+        await check(33, "canonical attestation PDA rejects duplicate and equivocation", async () => {
+          const firstAttestationAddress = attestationAddress(opening.round, setup.verifiers[0].publicKey);
+          const firstAttestation = await accountData(firstAttestationAddress);
+          const canonicalVotes = replayView(await accountData(replayResultAddress(opening.round, resultHash))).votes;
+          assert.equal(canonicalVotes, 1);
+          const alternateReceipt = sha256(Buffer.from("m8-c3-alternate-receipt"));
+          const alternateResult = replayResultCommitment(proposal, invariantAddress(1n), traceClaim, executableHash, invariantSpecificationHash, plan.verdict_u8, alternateReceipt);
+          const alternateReplayAddress = replayResultAddress(opening.round, alternateResult);
+          await send(createReplay(opening.round, alternateResult, plan.verdict_u8, alternateReceipt), payer);
+          assert.equal(replayView(await accountData(alternateReplayAddress)).votes, 0);
+          let simulationFailed = false;
+          await expectFailure("33 verifier equivocation", async () => {
+            try {
+              return await send(attest(setup.verifiers[0].publicKey, id, 0n, opening.round, trace, alternateResult), setup.verifiers[0]);
+            } catch (error) {
+              assert.match(error instanceof Error ? error.message : String(error), /Simulation failed|Transaction simulation failed/);
+              simulationFailed = true;
+              throw error;
+            }
+          }, /VerifierAlreadyAttested/);
+          assert(simulationFailed);
+          assert.deepEqual(await accountData(firstAttestationAddress), firstAttestation);
+          assert.equal(replayView(await accountData(replayResultAddress(opening.round, resultHash))).votes, canonicalVotes);
+          assert.equal(replayView(await accountData(alternateReplayAddress)).votes, 0);
+          for (const verifier of setup.verifiers.slice(1)) assert.equal(await connection.getAccountInfo(attestationAddress(opening.round, verifier.publicKey), COMMITMENT), null);
+          assert.equal(new Set(setup.verifiers.map(value => attestationAddress(opening.round, value.publicKey).toBase58())).size, 3);
+        });
+        await fails(34, "non-member attestation is rejected", /UnauthorizedVerifier/, () => send(attest(outsider.publicKey, id, 0n, opening.round, trace, resultHash), outsider));
+        const wrongKeyPath = `${owned}/wrong-key.json`; const wrong = Keypair.generate(); const wrongBytes = [...wrong.secretKey]; writeFileSync(wrongKeyPath, JSON.stringify(wrongBytes)); wrongBytes.fill(0); const mismatchKey = spawnSync("node.exe", [...baseCli, "--keypair", wrongKeyPath, "--verifier-stake", stakeAddress(setup.ep, setup.verifiers[0].publicKey).toBase58()], { cwd: ROOT, encoding: "utf8", timeout: 60_000 }); assert.notEqual(mismatchKey.status, 0);
+      }
+      if (ordinal === 1) await fails(35, "finalization remains blocked before third attestation", /QuorumNotReached/, () => send(finalizeReplay(id, opening.round, resultHash), outsider));
+    }
+    await check(32, "three independent direct attestations reach three votes", async () => { assert.equal(new Set(signatures).size, 3); assert.equal(replayView(await accountData(replayResultAddress(opening.round, resultHash))).votes, 3); for (const verifier of setup.verifiers) assert((await connection.getAccountInfo(attestationAddress(opening.round, verifier.publicKey), COMMITMENT))?.owner.equals(gate)); });
+    await check(34, "wrong-key and non-member submissions fail closed", async () => assert.equal(await connection.getAccountInfo(attestationAddress(opening.round, outsider.publicKey), COMMITMENT), null));
+    const finalizationSignature = await send(finalizeReplay(id, opening.round, resultHash), outsider);
+    await check(35, "finalization succeeds only after all three attestations", async () => assert.equal(roundView(await accountData(opening.round)).status, 2));
+    await check(36, "worker authentication remains off chain", async () => { assert.equal(firstPreflight.instruction.data.length, 40); const stored = await accountData(attestationAddress(opening.round, setup.verifiers[0].publicKey)); assert.equal(stored.length, 177); assert(!stored.includes(Buffer.from(requests[0].coordinator_nonce, "hex"))); assert(!stored.includes(decodeBase58ForTest(plan.signed_worker_outputs[0].signature))); });
+    const newReceipt = sha256(Buffer.from("m8-c3-new-epoch-receipt")); const newResult = replayResultCommitment(proposalAddress(id2), invariantAddress(1n), traceAddress(proposalAddress(id2), trace2), setup.buffers[0].hash, invariantSpecificationHash, 0, newReceipt); await send(createReplay(nextOpening.round, newResult, 0, newReceipt), payer);
+    await check(38, "omitted verifier retains only historical-round authority", async () => { await expectFailure("38 omitted old verifier cannot attest new round", () => send(attest(setup.verifiers[0].publicKey, id2, 1n, nextOpening.round, trace2, newResult), setup.verifiers[0]), /UnauthorizedVerifier/); });
+    console.log(`M8_C3 EVIDENCE genesis=${genesis} slots=${await connection.getSlot(COMMITMENT)} verifiers=${setup.verifiers.map(value => value.publicKey.toBase58()).join(",")} attestations=${signatures.join(",")} finalize=${finalizationSignature} receipt=${plan.replay_receipt_hash} result=${plan.result_hash} executable=${executableHash.toString("hex")} full_account=${fullHash.toString("hex")} retries=0`);
+  } finally { rmSync(owned, { recursive: true, force: true }); }
+}
+
+function decodeBase58ForTest(value: string): Buffer {
+  const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"; let number = 0n; for (const character of value) number = number * 58n + BigInt(alphabet.indexOf(character)); const bytes: number[] = []; while (number > 0n) { bytes.push(Number(number & 0xffn)); number >>= 8n; } for (const character of value) { if (character === "1") bytes.push(0); else break; } return Buffer.from(bytes.reverse());
+}
+
 async function main(): Promise<void> {
   const index = process.argv.indexOf("--shard"); const shard = process.argv[index + 1] as Shard | undefined;
-  if (!shard || !["policy-funding", "stakes-withdrawal", "bonds-hold", "violation-fees", "bond-outcomes", "objective-slashing", "pending-refund", "paid-refund", "revealed-unopened"].includes(shard)) throw new Error("expected a supported economic-settlement shard");
+  if (!shard || !["policy-funding", "stakes-withdrawal", "bonds-hold", "violation-fees", "bond-outcomes", "objective-slashing", "pending-refund", "paid-refund", "revealed-unopened", "direct-attestation"].includes(shard)) throw new Error("expected a supported economic-settlement shard");
   if (process.env.FAULTLINE_ECONOMIC_SHARD !== shard) throw new Error("runner shard environment does not match requested shard");
   if (!process.env.FAULTLINE_ECONOMIC_GENESIS || await connection.getGenesisHash() !== process.env.FAULTLINE_ECONOMIC_GENESIS) throw new Error("refusing validator not owned by the Milestone 6 runner");
   try {
-    if (shard === "policy-funding") await runPolicyFunding();
+    if (shard === "direct-attestation") await runDirectAttestation();
+    else if (shard === "policy-funding") await runPolicyFunding();
     else if (shard === "stakes-withdrawal") await runStakesWithdrawal();
     else if (shard === "bonds-hold") await runBondsHold();
     else if (shard === "violation-fees") await runViolationFees();
@@ -1104,10 +1260,10 @@ async function main(): Promise<void> {
     else if (shard === "pending-refund") await runPendingRefund();
     else if (shard === "paid-refund") await runPaidRefund();
     else await runRevealedUnopened();
-    const phase = shard === "policy-funding" || shard === "stakes-withdrawal" ? "A" : shard === "pending-refund" || shard === "paid-refund" || shard === "revealed-unopened" ? "C" : "B";
-    console.log(`MILESTONE-6 PHASE-${phase} SHARD ${shard} PASSED`);
+    const phase = shard === "direct-attestation" ? "M8-C3" : shard === "policy-funding" || shard === "stakes-withdrawal" ? "A" : shard === "pending-refund" || shard === "paid-refund" || shard === "revealed-unopened" ? "C" : "B";
+    console.log(`${shard === "direct-attestation" ? "MILESTONE-8 CHECKPOINT-3" : `MILESTONE-6 PHASE-${phase}`} SHARD ${shard} PASSED`);
   } catch (error) {
-    console.error(`FIRST REAL FAILURE shard=${shard} assertion=${activeAssertion || "setup"}`);
+    console.error(`FIRST REAL FAILURE shard=${shard} assertion=${assertionTracker.active || "setup"}`);
     throw error;
   } finally {
     appendFileSync(`${ROOT}/.localnet/economic-settlement-${shard}-evidence.log`, `${evidence.join("\n")}\n`);

@@ -1,4 +1,6 @@
 export * from "./accounts.js";
+export * from "./attestation.js";
+export * from "./attestation-cli.js";
 export * from "./constants.js";
 export * from "./errors.js";
 export * from "./idl.js";

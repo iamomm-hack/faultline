@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('policy-funding', 'stakes-withdrawal', 'bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing', 'pending-refund', 'paid-refund', 'revealed-unopened')]
+  [ValidateSet('policy-funding', 'stakes-withdrawal', 'bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing', 'pending-refund', 'paid-refund', 'revealed-unopened', 'direct-attestation')]
   [string]$Shard
 )
 
@@ -176,7 +176,7 @@ foreach ($currentShard in $shards) {
     Remove-Item -LiteralPath $ledger -Recurse -Force
   }
   New-Item -ItemType Directory -Path $ledger | Out-Null
-  $phase = if ($currentShard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($currentShard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
+  $phase = if ($currentShard -eq 'direct-attestation') { 'M8-C3' } elseif ($currentShard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($currentShard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
   Set-Content -LiteralPath $evidence -Value "Milestone 6 Phase $phase shard=$currentShard"
   try {
     $flags = '--reset --rpc-port 8899 --faucet-port 9900 --ticks-per-slot 1024 --log'
@@ -248,13 +248,18 @@ foreach ($currentShard in $shards) {
       Start-Sleep -Milliseconds 100
     }
     if (Test-TcpPortListening 8899) { throw "Port 8899 remained occupied after owned cleanup for $currentShard" }
+    if ($currentShard -eq 'direct-attestation' -and (Test-Path -LiteralPath $ledger)) {
+      if ((Get-Item -LiteralPath $ledger).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing linked Checkpoint 3 ledger cleanup' }
+      Remove-Item -LiteralPath $ledger -Recurse -Force
+      Remove-Item -LiteralPath (Join-Path $localRoot 'economic-settlement-direct-attestation.pid') -Force -ErrorAction SilentlyContinue
+    }
     Write-Stage $evidence "CLEANUP COMPLETE shard=$currentShard port_8899_free=true elapsed_ms=$($cleanupWatch.ElapsedMilliseconds)"
   }
 }
 
 if ($Shard) {
-  $reportedPhase = if ($Shard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($Shard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
-  Write-Output "MILESTONE-6 PHASE-$reportedPhase SHARD PASSED: $Shard"
+  $reportedPhase = if ($Shard -eq 'direct-attestation') { 'M8-C3' } elseif ($Shard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($Shard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
+  Write-Output "$(if ($Shard -eq 'direct-attestation') { 'MILESTONE-8 CHECKPOINT-3' } else { "MILESTONE-6 PHASE-$reportedPhase" }) SHARD PASSED: $Shard"
 } else {
   Write-Output 'MILESTONE-6 PHASE-B ASSERTIONS 61-104 PASSED'
 }

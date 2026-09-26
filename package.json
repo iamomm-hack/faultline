@@ -24,6 +24,10 @@
     "typecheck": "tsc --noEmit",
     "typecheck:m8-c1": "tsc -p packages/faultline-idl/tsconfig.json --noEmit && tsc -p packages/faultline-sdk/tsconfig.json --noEmit",
     "test:m8-c1": "tsx --test --test-concurrency=1 packages/faultline-sdk/tests/checkpoint1.test.ts",
+    "test:m8-c3:commitment-parity": "tsx --test --test-concurrency=1 tests/milestone-8-checkpoint3-commitment-parity.test.ts",
+    "test:m8-c3:loader-state": "tsx --test --test-concurrency=1 tests/milestone-8-checkpoint3-loader-state.test.ts",
+    "test:m8-c3:cli-boundary": "tsx --test --test-concurrency=1 tests/milestone-8-checkpoint3-cli-boundary.test.ts",
+    "test:m8-c3": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-milestone-8-checkpoint3.ps1",
     "verify:m8-idl": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-milestone-8-idl.ps1 -Check"
   },
   "devDependencies": {
