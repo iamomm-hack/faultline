@@ -32,6 +32,8 @@
     "next-env.d.ts"
   ],
   "rules": {
+    "nextjs/no-img-element": "off",
+    "jsx-a11y/prefer-tag-over-role": "off",
     "no-array-constructor": "error",
     "no-var": "error",
     "prefer-const": "error",
