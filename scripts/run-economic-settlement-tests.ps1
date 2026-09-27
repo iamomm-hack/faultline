@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('policy-funding', 'stakes-withdrawal', 'bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing', 'pending-refund', 'paid-refund', 'revealed-unopened', 'direct-attestation', 'v2-violation')]
+  [ValidateSet('policy-funding', 'stakes-withdrawal', 'bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing', 'pending-refund', 'paid-refund', 'revealed-unopened', 'direct-attestation', 'v2-violation', 'v3-hold-upgrade')]
   [string]$Shard
 )
 
@@ -163,10 +163,12 @@ if (Test-TcpPortListening 8899) {
 
 foreach ($currentShard in $shards) {
   $validator = $null
+  $attemptId = "$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')-$PID"
+  $attemptPrefix = "economic-settlement-$currentShard-attempt-$attemptId"
   $ledger = [IO.Path]::GetFullPath((Join-Path $localRoot "economic-settlement-$currentShard"))
-  $evidence = Join-Path $localRoot "economic-settlement-$currentShard-evidence.log"
-  $validatorStdout = Join-Path $localRoot "economic-settlement-$currentShard.validator.stdout.log"
-  $validatorStderr = Join-Path $localRoot "economic-settlement-$currentShard.validator.stderr.log"
+  $evidence = Join-Path $localRoot "$attemptPrefix.evidence.log"
+  $validatorStdout = Join-Path $localRoot "$attemptPrefix.validator.stdout.log"
+  $validatorStderr = Join-Path $localRoot "$attemptPrefix.validator.stderr.log"
   if ([IO.Path]::GetDirectoryName($ledger) -ne $localRoot) { throw "Unsafe ledger path for $currentShard" }
   if (Test-TcpPortListening 8899) { throw "Port 8899 is LISTENING before $currentShard" }
   if (Test-Path -LiteralPath $ledger) {
@@ -176,8 +178,8 @@ foreach ($currentShard in $shards) {
     Remove-Item -LiteralPath $ledger -Recurse -Force
   }
   New-Item -ItemType Directory -Path $ledger | Out-Null
-  $phase = if ($currentShard -eq 'direct-attestation') { 'M8-C3' } elseif ($currentShard -eq 'v2-violation') { 'M8-C4' } elseif ($currentShard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($currentShard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
-  Set-Content -LiteralPath $evidence -Value "Faultline shard phase=$phase shard=$currentShard"
+  $phase = if ($currentShard -eq 'direct-attestation') { 'M8-C3' } elseif ($currentShard -eq 'v2-violation') { 'M8-C4' } elseif ($currentShard -eq 'v3-hold-upgrade') { 'M8-C5' } elseif ($currentShard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($currentShard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
+  Set-Content -LiteralPath $evidence -Value "Faultline shard phase=$phase shard=$currentShard attempt_id=$attemptId"
   try {
     $flags = '--reset --rpc-port 8899 --faucet-port 9900 --ticks-per-slot 1024 --log'
     Write-Stage $evidence "STAGE START name=validator-readiness timeout_seconds=45 flags=$flags"
@@ -206,15 +208,15 @@ foreach ($currentShard in $shards) {
     Invoke-OwnedProcess -Evidence $evidence -Stage 'gate-deployment' -FilePath $solanaExe -Arguments @(
       'program', 'deploy', 'artifacts\gate\faultline_gate.so', '--program-id', '.localnet\faultline-gate-program.json',
       '--upgrade-authority', '.localnet\payer.json', '--keypair', '.localnet\payer.json', '--url', 'http://127.0.0.1:8899', '--commitment', 'confirmed', '--output', 'json'
-    ) -TimeoutSeconds 600 -ProcessStdout (Join-Path $localRoot "economic-settlement-$currentShard.gate-deploy.stdout.log") -ProcessStderr (Join-Path $localRoot "economic-settlement-$currentShard.gate-deploy.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
+    ) -TimeoutSeconds 600 -ProcessStdout (Join-Path $localRoot "$attemptPrefix.gate-deploy.stdout.log") -ProcessStderr (Join-Path $localRoot "$attemptPrefix.gate-deploy.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
     Invoke-OwnedProcess -Evidence $evidence -Stage 'gate-finalization' -FilePath $solanaExe -Arguments @(
       'program', 'set-upgrade-authority', $ids.'faultline-gate-program', '--final', '--upgrade-authority', '.localnet\payer.json',
       '--keypair', '.localnet\payer.json', '--url', 'http://127.0.0.1:8899', '--commitment', 'confirmed', '--output', 'json'
-    ) -TimeoutSeconds 180 -ProcessStdout (Join-Path $localRoot "economic-settlement-$currentShard.gate-finalize.stdout.log") -ProcessStderr (Join-Path $localRoot "economic-settlement-$currentShard.gate-finalize.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
+    ) -TimeoutSeconds 180 -ProcessStdout (Join-Path $localRoot "$attemptPrefix.gate-finalize.stdout.log") -ProcessStderr (Join-Path $localRoot "$attemptPrefix.gate-finalize.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
     Invoke-OwnedProcess -Evidence $evidence -Stage 'treasury-deployment' -FilePath $solanaExe -Arguments @(
       'program', 'deploy', 'artifacts\treasury\v1\faultline_treasury.so', '--program-id', '.localnet\faultline-treasury-program.json',
       '--upgrade-authority', '.localnet\payer.json', '--keypair', '.localnet\payer.json', '--url', 'http://127.0.0.1:8899', '--commitment', 'confirmed', '--max-len', '500000', '--output', 'json'
-    ) -TimeoutSeconds 600 -ProcessStdout (Join-Path $localRoot "economic-settlement-$currentShard.treasury-deploy.stdout.log") -ProcessStderr (Join-Path $localRoot "economic-settlement-$currentShard.treasury-deploy.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
+    ) -TimeoutSeconds 600 -ProcessStdout (Join-Path $localRoot "$attemptPrefix.treasury-deploy.stdout.log") -ProcessStderr (Join-Path $localRoot "$attemptPrefix.treasury-deploy.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
 
     $genesis = Invoke-RestMethod -Uri 'http://127.0.0.1:8899' -Method Post -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}' -TimeoutSec 2
     $env:FAULTLINE_ECONOMIC_GENESIS = $genesis.result
@@ -226,14 +228,16 @@ foreach ($currentShard in $shards) {
     $shardTimeout = if ($currentShard -eq 'v2-violation') { 2100 } else { 2400 }
     Invoke-OwnedProcess -Evidence $evidence -Stage "typescript-$currentShard" -FilePath $nodeExe -Arguments @(
       'node_modules/tsx/dist/cli.mjs', 'tests/economic-settlement.spec.ts', '--shard', $currentShard
-    ) -TimeoutSeconds $shardTimeout -ProcessStdout (Join-Path $localRoot "economic-settlement-$currentShard.test.stdout.log") -ProcessStderr (Join-Path $localRoot "economic-settlement-$currentShard.test.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
+    ) -TimeoutSeconds $shardTimeout -ProcessStdout (Join-Path $localRoot "$attemptPrefix.test.stdout.log") -ProcessStderr (Join-Path $localRoot "$attemptPrefix.test.stderr.log") -ValidatorStdout $validatorStdout -ValidatorStderr $validatorStderr -ValidatorProcess $validator
     $finalConfirmedSlot = Get-ValidatorSlot 'confirmed'
     $finalFinalizedSlot = Get-ValidatorSlot 'finalized'
     if ($phase -in @('B', 'C') -and [int]$finalConfirmedSlot -ge 90) { throw "Phase $phase shard $currentShard exceeded confirmed-slot budget: $finalConfirmedSlot" }
     if ($currentShard -eq 'v2-violation' -and [int]$finalConfirmedSlot -ge 140) { throw "Milestone 8 Checkpoint 4 exceeded confirmed-slot budget: $finalConfirmedSlot" }
+    if ($currentShard -eq 'v3-hold-upgrade' -and [int]$finalConfirmedSlot -ge 160) { throw "Milestone 8 Checkpoint 5 exceeded confirmed-slot budget: $finalConfirmedSlot" }
     Write-Stage $evidence "SHARD COMPLETE name=$currentShard confirmed_final_slot=$finalConfirmedSlot finalized_final_slot=$finalFinalizedSlot"
   } finally {
     if ($currentShard -eq 'v2-violation') { Write-Stage $evidence 'ASSERT ACTIVE number=48 behavior=owned-state-cleanup' }
+    if ($currentShard -eq 'v3-hold-upgrade') { Write-Stage $evidence 'ASSERT ACTIVE number=57 behavior=owned-state-cleanup' }
     Remove-Item Env:FAULTLINE_ECONOMIC_GENESIS -ErrorAction SilentlyContinue
     Remove-Item Env:FAULTLINE_ECONOMIC_SHARD -ErrorAction SilentlyContinue
     if ($validator) {
@@ -251,7 +255,7 @@ foreach ($currentShard in $shards) {
       Start-Sleep -Milliseconds 100
     }
     if (Test-TcpPortListening 8899) { throw "Port 8899 remained occupied after owned cleanup for $currentShard" }
-    if ($currentShard -in @('direct-attestation', 'v2-violation') -and (Test-Path -LiteralPath $ledger)) {
+    if ($currentShard -in @('direct-attestation', 'v2-violation', 'v3-hold-upgrade') -and (Test-Path -LiteralPath $ledger)) {
       if ((Get-Item -LiteralPath $ledger).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing linked Milestone 8 ledger cleanup for $currentShard" }
       Remove-Item -LiteralPath $ledger -Recurse -Force
       Remove-Item -LiteralPath (Join-Path $localRoot "economic-settlement-$currentShard.pid") -Force -ErrorAction SilentlyContinue
@@ -262,12 +266,17 @@ foreach ($currentShard in $shards) {
       if ($ownedResidue.Count -ne 0 -or (Test-Path -LiteralPath $ledger) -or (Test-Path -LiteralPath (Join-Path $localRoot "economic-settlement-$currentShard.pid"))) { throw 'Checkpoint 4 owned runtime residue survived cleanup' }
       Write-Stage $evidence 'ASSERT 48 PASS v2 shard cleaned owned workers validator handles key files ledger IPC and run directory'
     }
+    if ($currentShard -eq 'v3-hold-upgrade') {
+      $ownedResidue = @(Get-ChildItem -LiteralPath $localRoot -Force | Where-Object { $_.Name -like 'm8-c5-owned-*' -or $_.Name -like 'm8-c5-*.ipc' })
+      if ($ownedResidue.Count -ne 0 -or (Test-Path -LiteralPath $ledger) -or (Test-Path -LiteralPath (Join-Path $localRoot "economic-settlement-$currentShard.pid"))) { throw 'Checkpoint 5 owned runtime residue survived cleanup' }
+      Write-Stage $evidence 'ASSERT 57 PASS v3 shard cleaned owned workers validator handles key files ledger IPC and run directory'
+    }
   }
 }
 
 if ($Shard) {
-  $reportedPhase = if ($Shard -eq 'direct-attestation') { 'M8-C3' } elseif ($Shard -eq 'v2-violation') { 'M8-C4' } elseif ($Shard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($Shard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
-  $label = if ($Shard -eq 'direct-attestation') { 'MILESTONE-8 CHECKPOINT-3' } elseif ($Shard -eq 'v2-violation') { 'MILESTONE-8 CHECKPOINT-4' } else { "MILESTONE-6 PHASE-$reportedPhase" }
+  $reportedPhase = if ($Shard -eq 'direct-attestation') { 'M8-C3' } elseif ($Shard -eq 'v2-violation') { 'M8-C4' } elseif ($Shard -eq 'v3-hold-upgrade') { 'M8-C5' } elseif ($Shard -in @('bonds-hold', 'violation-fees', 'bond-outcomes', 'objective-slashing')) { 'B' } elseif ($Shard -in @('pending-refund', 'paid-refund', 'revealed-unopened')) { 'C' } else { 'A' }
+  $label = if ($Shard -eq 'direct-attestation') { 'MILESTONE-8 CHECKPOINT-3' } elseif ($Shard -eq 'v2-violation') { 'MILESTONE-8 CHECKPOINT-4' } elseif ($Shard -eq 'v3-hold-upgrade') { 'MILESTONE-8 CHECKPOINT-5' } else { "MILESTONE-6 PHASE-$reportedPhase" }
   Write-Output "$label SHARD PASSED: $Shard"
 } else {
   Write-Output 'MILESTONE-6 PHASE-B ASSERTIONS 61-104 PASSED'

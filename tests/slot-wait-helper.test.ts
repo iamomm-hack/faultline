@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CHECKPOINT4_REFUND_SLOT_WAIT_DEADLINE_MS,
+  CHECKPOINT5_UPGRADE_SLOT_WAIT_DEADLINE_MS,
   waitForRequiredSlot
 } from "./slot-wait-helper.js";
 
@@ -22,6 +23,7 @@ test("Checkpoint 4 refund wait reaches the exact required slot and emits bounded
   assert.equal(result.count, 45);
   assert(heartbeats.length > 0);
   assert(CHECKPOINT4_REFUND_SLOT_WAIT_DEADLINE_MS < 35 * 60_000);
+  assert(CHECKPOINT5_UPGRADE_SLOT_WAIT_DEADLINE_MS < 40 * 60_000);
 });
 
 test("slot wait fails closed without reducing the required slot", async () => {

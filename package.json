@@ -29,6 +29,7 @@
     "test:m8-c3:cli-boundary": "tsx --test --test-concurrency=1 tests/milestone-8-checkpoint3-cli-boundary.test.ts",
     "test:m8-c3": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-milestone-8-checkpoint3.ps1",
     "test:m8-c4": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-milestone-8-checkpoint4.ps1",
+    "test:m8-c5": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-milestone-8-checkpoint5.ps1",
     "verify:m8-idl": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-milestone-8-idl.ps1 -Check"
   },
   "devDependencies": {
