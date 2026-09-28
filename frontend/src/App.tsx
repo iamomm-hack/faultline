@@ -1,25 +1,31 @@
-import { Navigate, Route, Routes } from "react-router-dom";
-import { AppShell } from "@/components/app-shell";
-import { FaultlineProvider } from "@/faultline/provider";
-import Home from "@/app/page";
-import DemoPage from "@/app/demo/page";
-import NewProposal from "@/app/proposals/new/page";
-import ProposalPage from "@/app/proposals/[proposalId]/page";
-import ResearcherPage from "@/app/researcher/[proposalId]/page";
-
+import { lazy, Suspense } from 'react';
+import { Route, Routes } from 'react-router-dom';
+import { SiteShell } from './components/SiteShell';
+import { MotionProvider } from './motion/system';
+import Landing from './pages/Landing';
+import { ProtocolProvider } from './protocol/ProtocolProvider';
+import { BootSignal } from './motion/BootSignal';
+const Product = lazy(() => import('./pages/Product'));
 export function App() {
   return (
-    <FaultlineProvider>
-      <AppShell>
-        <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/demo" element={<DemoPage />} />
-          <Route path="/proposals/new" element={<NewProposal />} />
-          <Route path="/proposals/:proposalId" element={<ProposalPage />} />
-          <Route path="/researcher/:proposalId" element={<ResearcherPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </AppShell>
-    </FaultlineProvider>
+    <ProtocolProvider>
+      <MotionProvider>
+        <BootSignal />
+        <SiteShell>
+          <Suspense
+            fallback={
+              <div className="route-loading" role="status">
+                Loading Faultline…
+              </div>
+            }
+          >
+            <Routes>
+              <Route path="/" element={<Landing />} />
+              <Route path="*" element={<Product />} />
+            </Routes>
+          </Suspense>
+        </SiteShell>
+      </MotionProvider>
+    </ProtocolProvider>
   );
 }
