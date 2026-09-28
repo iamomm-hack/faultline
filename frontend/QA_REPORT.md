@@ -1,68 +1,102 @@
-# Faultline frontend delivery / 2026-09-27
+# Faultline / image-led redesign QA
+Date: 2026-09-28. Branch: `frontend-demo`. Baseline: `848cbae5d82c98cf96aa130aae7124f78dfd92df`.
 
-## Scope
+## Visual audit and correction
 
-Built on `frontend-demo` from `18a8b6efbb2329c81420b9341452436df1df8273`. All changes are under `frontend/`. No protocol, SDK, IDL, manifest, backend suite, validator, original worktree, preserved WIP branch, deployment or push was changed/run. Existing Vite/React architecture was retained.
+The baseline hero isolated a procedural object in empty space; the failure surface, pipeline and outcomes repeated component grids and SVG illustrations. Evidence appeared as a row of data cells, architecture as boxed nodes, and the final CTA reused the hero drawing. This pass replaces that landing-page visual system, not the working application.
 
-## Completed routes and visual QA
+The new direction is **critical infrastructure under controlled inspection**. Ten chapters vary full-bleed photography, pale stone macros, monumental type, asymmetric image overlap, a photographic triptych, paper-and-hash composition, infrastructure annotations and a closing architectural frame. Only the product-window chapter uses interface panels. The story is predominantly imagery, large editorial typography and spatial composition; it is not a sequence of feature cards.
 
-| Route | Surface | Result |
+## Direct reference study
+
+All three references were inspected before product edits. Reference frames are in ignored `outputs/references/`; `tests/reference-study.mjs` reproduces the visual study.
+
+| Reference | Directly inspected | Applied principle, not copied material |
 | --- | --- | --- |
-| `/` | Editorial landing, Guard narrative, pipeline, outcomes, evidence, architecture, product preview, limitations | Pass |
-| `/app` | Dashboard, source status, counts, decisions, eligibility, settlement | Pass |
-| `/proposals` | Search, status filters, compact/expanded explorer, empty state | Pass |
-| `/proposals/proposal-v2` | Rejection, bound evidence, worker outputs, settlement, timeline | Pass |
-| `/proposals/proposal-v3` | Non-approving HOLD, separate authority, evidence and timeline | Pass |
-| `/demo` | Resettable v2/v3 walkthrough, disagreement, three attestations, separate approval and delay | Pass |
-| `/docs` | Architecture, evidence provenance, trust boundaries, RPC configuration | Pass |
+| [Kimia](https://kimia.live/) | Rendered opening, middle and lower page | Image-dominant opening, oversized controlled type, asymmetry, structural spacing and contrast between editorial and product surfaces |
+| [Valdyum](https://www.valdyum.live/) | Rendered full-viewport opening and scroll states | A scene changes under scroll: crop/scale, image masking, depth, transitions and stable foreground typography |
+| [Vouch frontend](https://github.com/SATISH-JALAN/Vouch/tree/main/frontend) | Public MotionProvider, Lenis, motion constants and route-transition files | One GSAP-driven scroll clock, lifecycle ownership, font refresh, reversible scoped effects and reduced-motion completeness |
 
-All seven routes were captured and checked at 1440×900, 1280×800, 1024×768, 768×900, 390×844 and 360×800: 42 route/viewport checks. No horizontal overflow or runtime/console errors. Desktop and mobile screenshots were reviewed for hierarchy, line breaks, evidence wrapping, navigation, stacked layouts and spacing. The 768px case uses a vertical product layout; phone screens use a static hero and vertical pipeline rather than a compressed pinned scene.
+No source implementation, branding, wording, illustration, photograph or layout was copied from these references. Existing Faultline motion infrastructure was extended in place.
 
-Automated WCAG A/AA checks at desktop and phone sizes found no violations on these routes. Additional normal-motion desktop checks pass. Keyboard checks cover the first-tab skip link, mobile menu Escape/focus restoration and route navigation. Native buttons/selects/links, visible focus, semantic headings, status announcements, copy feedback, text alternatives and a global motion toggle are provided. These checks are not a claim of a comprehensive assistive-technology certification.
+## Image inventory and provenance
 
-Screenshots and machine-readable results are generated in ignored `outputs/`. Reproduce against a production preview on port 3001 with `npm run test:browser` and `npm run test:motion`. The browser harness uses installed Microsoft Edge via Playwright; no machine-specific executable path is committed.
+Twelve distinct licensed photographs, each in 640/960/1280/1920px WebP sizes (48 local files). The image system uses source photography rather than generated artwork or runtime 3D.
 
-## Motion and asset architecture
+| Stem | Role |
+| --- | --- |
+| `monument` | Dominant hero / monumental boundary |
+| `fracture` | Inspection progression and failure-surface macro |
+| `boundary` | Physical obstruction / rejected candidate |
+| `passage` | Enforced gate and partially revealed HOLD progression |
+| `alloy` | Candidate material / explorer environmental header |
+| `receipts` | Layered evidence composition and proposal-detail header |
+| `inspection` | First photographic verifier fragment / observation |
+| `precision` | Second verifier fragment and preserved-candidate composition |
+| `aperture` | Third verifier fragment / structural integrity |
+| `infrastructure` | Architecture scene and dashboard environmental header |
+| `closing` | Final architectural frame |
+| `aggregate` | Exposed interior / failure-surface detail |
 
-`src/motion/system.tsx` owns GSAP/ScrollTrigger registration, Lenis synchronization with the GSAP ticker, reduced-motion subscription, route transitions, image/font refresh, cursor and magnetic controls. Scoped contexts and matchMedia cleanup revert route effects. Motion is optional, never necessary to understand an outcome.
+Every source page, original image URL, creator, licence and modification is recorded in [ASSET_PROVENANCE.md](public/images/faultline/ASSET_PROVENANCE.md). All use the verified Pexels License. No hotlinked media, invented creator credit, AI image or reference-site asset. Photography is explicitly an editorial metaphor, not imagery of Faultline facilities, workers or chain execution. Original bytes remain in ignored QA/source storage; optimized derivatives are the published assets.
 
-`Hero.tsx` synchronizes the pinned desktop narrative and chapter labels. `GuardScene.tsx` lazily loads Three.js; its aperture, candidate fragments, verifier array, displaced unsafe fragments, held passage and intact state core respond to scroll progress. The gate opens only in the explicitly labeled approval/loader portion of the illustration. This is a protocol schematic, not a transaction claim.
+## Motion architecture
 
-Rendering is demand-driven with no perpetual scene loop, DPR capped at 1.5, intersection and document-visibility checks, no real-time shadows, instanced bolts and byte markings, resource disposal and context-loss fallback. Mobile, reduced-motion and data-saver users retain the original SVG poster. The poster is preloaded and dimensioned. Receipt/fault/verifier diagrams, architecture, SVG poster and all Three geometry are original code-generated assets. Byte markings derive from the committed v2 payload hash. No stock images, AI art, copied assets or remote fonts are used.
+- `src/visuals/Hero.tsx`: one five-phase desktop pin, 300% scroll distance. Exposure uses a tight photographic crop and scrubbed zoom; inspection opens a mask; three photographic fragments converge; a rejection boundary closes; a passage opens only partially into explicitly non-approving HOLD.
+- `src/motion/cinematic.ts`: reversible scene-level effects—fracture mask, opposing focal-plane movement, verifier convergence, receipt parallax, causal architecture path and closing image drift.
+- `src/motion/system.tsx`: existing GSAP/ScrollTrigger/Lenis ownership retained. Critical-image/font refresh remains centralized; late chapter images no longer repeatedly reposition hash navigation.
+- Hero layers are absent from startup and warmed progressively after intentional scroll. Below-fold photographs request only near the viewport; no perpetual image animation or off-screen WebGL.
+- The previous Three scene is retained in source but is no longer imported into the landing bundle. No new dependency or lockfile change.
+- Mobile is unpinned and art-directed independently. Reduced motion and the motion toggle retain all meaningful content and outcomes. No information requires completing the animation.
 
-## Evidence and adapter boundary
+## Preserved application
 
-Demo Mode is deterministic local state without wallet, validator, RPC or broadcasts. All three simulated workers must complete; disagreement prevents submission; VIOLATION rejects terminally; HOLD never approves. v3 approval, eligibility delay and guarded execution are explicitly DEMO SIMULATION. Reset works without refreshing.
+`/app`, `/proposals`, both proposal-detail examples, `/demo`, `/docs`, redirects and error/empty states are retained. Product changes are limited to environmental header imagery; protocol records, demo state machine, RPC adapter, SDK bridge, commitment code and existing unit tests were not changed.
 
-Displayed hashes and the one available verifier public key come from committed checkpoint-1 format vectors. Those vectors are explicitly NOT VM execution evidence and contain HOLD even for v2. They are shown unchanged, never presented as proof of the simulated v2 VIOLATION. Missing verifier identities, buffer, epoch and signatures are not fabricated. The browser SDK inspector recomputes the original commitment, derives the replay-result PDA and constructs an unsigned IDL instruction without sending it.
+The v2/v3 walkthrough still requires three outputs, rejects disagreement, distinguishes terminal rejection from HOLD, keeps separate governance approval and the eligibility delay, and resets without refresh. SDK inspection and copy controls remain functional. RPC errors never substitute demo records.
 
-RPC Mode requires an explicit endpoint and expected genesis hash. It reads genuine accounts using committed SDK/IDL decoding and checks ownership/discriminators. Missing configuration, transport, genesis and decode errors are exposed without substituting demo data. SDK PDA seeds, account layouts, instruction construction, commitments and error definitions remain authoritative; the frontend bridge only adapts browser hashing/buffer support and avoids importing the SDK CLI.
+## Screenshots and responsive findings
 
-No live validator endpoint was supplied or contacted. Positive/negative adapter behavior was tested with controlled transport responses. Wallet signing, transaction broadcasting, historical transaction indexing and actual Checkpoint 5 guarded execution remain backend-integration boundaries. There is no mainnet, production Byzantine-security, audit or Checkpoint 5 completion claim.
+All seven major routes were captured at **1440×900, 1280×800, 1024×768, 768×1024, 390×844 and 360×800**: 42 route/viewport combinations.
 
-## Validation and performance
+The additional motion suite captures all five hero phases, then start/middle/end frames of all nine subsequent chapters at 1440px and 390px. Contact sheets and individual frames were reviewed for composition, crop, hierarchy, overlap and readability:
+- `outputs/cinema/hero-phase-0.png` through `hero-phase-4.png`
+- `outputs/cinema/{chapter}-{width}-{start|middle|end}.png`
+- `outputs/cinema/chapter-contact-1440.jpg` and `chapter-contact-390.jpg`
+- `outputs/cinema/landing-{width}-full.png`
+- Route captures and machine-readable `outputs/qa-results.json`
 
-- `npm run lint`: pass.
-- `npm run typecheck`: pass.
-- `npm test`: 22 tests pass across 3 files, including SDK parity and adapter failure cases.
-- `npm run build`: pass.
-- `npm run test:browser`: 42 route checks, 10 interaction scenarios, zero errors/overflow/accessibility violations.
-- `npm run test:motion`: normal-motion accessibility, WebGL progression and zero remaining route pin spacers pass.
+Corrections from visual QA: fixed dark-on-dark product CTA and rejection-badge overrides; moved a HOLD annotation inside its image mask; lightened the mobile fracture region behind dark typography; waited for photographic decoding in screenshot tests; staged clipped hero images explicitly rather than relying on native lazy-loading visibility. Phone outcomes stack vertically, the verifier triptych uses narrow photographic strips, evidence hashes wrap, and architecture labels become a readable list. No horizontal overflow or route errors were observed.
+
+## Accessibility
+
+Automated WCAG A/AA checks pass on all seven routes at desktop and phone sizes. The cinematic suite also checks WCAG 2.2 AA tags. Keyboard skip link, mobile-menu Escape/focus restoration, copy confirmation and native controls remain intact. Meaningful photographs have alt text; decorative environments use empty alt text. Contrast is maintained through image grading and localized scrims, not coloured status alone. Rejection and preservation have visible text labels. Reduced motion removes pins and preserves the story.
+
+Automated audits do not replace comprehensive assistive-technology or human usability testing.
+
+## Performance
+
+Final Lighthouse mobile: **Performance 98 / Accessibility 100 / Best practices 100 / SEO 100**. **LCP 2.0s, CLS 0, TBT 80ms.** All requested targets pass. Raw report: `outputs/lighthouse-cinematic-final.json`.
+
+Production bundles: main approximately 137KB gzip, CSS 12.6KB gzip, lazy product route 10.6KB gzip, lazy SDK 71.6KB gzip. The old 137KB-gzip Three chunk is no longer emitted. Only the responsive opening photograph is preloaded, and only on the landing route. Below-fold media is intersection-gated; hero progression requests are staged by scroll. Image boxes have stable dimensions. No remote fonts, runtime media hotlinks, new libraries or autoplay video.
+
+The first image-led Lighthouse run scored 89 with 3.6s LCP because native lazy loading fetched multiple distant chapters. Intersection-gated loading improved that to 96 and 2.6s LCP; the final pass also added an intermediate responsive size and tightened the prefetch distance. Scores are local throttled measurements, not production field data.
+
+## Validation
+
+- Lint, typecheck and production build: pass.
+- Existing focused tests: 22 pass across 3 files.
+- Existing browser regression: 42 route checks and 10 preserved interaction scenarios; zero runtime/console errors, horizontal overflow or automated accessibility violations.
+- Cinematic motion suite: five expected phases, partial HOLD mask, local decoded images, reduced-motion cleanup, desktop-to-phone resize and route pin cleanup.
+- Asset inspection: 12 distinct source photographs; all 48 WebP derivatives local and documented.
 - `git diff --check`: pass.
 
-Final Lighthouse mobile measurement: performance 94, accessibility 100, best-practices 100 and SEO 100; LCP 1.9s, CLS 0 and total blocking time 260ms. Earlier runs varied from 81–94; the slow run exposed avoidable small-screen ScrollTrigger initialization, which was removed before the final measurement. Animated text contrast and visible-label naming were also corrected. Local throttled results vary; they are not production field measurements. The final raw report is `outputs/lighthouse-mobile-optimized.json`.
+Reproduce with production preview on port 3001, then `npm run test:browser` and `npm run test:motion`. `python tests/contact-sheets.py` assembles chapter review sheets; `tests/prepare-images.py` reproduces the licensed image derivatives with Pillow.
 
-Main entry is approximately 138KB gzip, CSS 8.6KB gzip, lazy product route 8.4KB gzip, lazy SDK 71.6KB gzip and lazy Three scene 137KB gzip. SDK/RPC/Three are absent from initial mobile execution. The build retains an advisory for the lazy Three chunk exceeding 500KB uncompressed; it is not suppressed. Edge's software WebGL compiler emits a non-fatal precision warning in Three's environment shader; no application console errors were observed. Dependency remediation removed high/critical audit findings; four moderate findings remain in the committed SDK-compatible web3 dependency tree. A breaking protocol-library downgrade was not forced.
+## Honest boundaries and scope
 
-## Brand handoff
+v3 guarded execution remains DEMO SIMULATION, not Checkpoint 5 completion. HOLD is not approval. Live RPC requires explicit endpoint/genesis configuration; no live endpoint was supplied or exercised here. Wallet signing and transaction broadcasting are not implemented. Original checkpoint-1 hashes remain format vectors, not VM execution proof; missing identities/signatures are not fabricated. Common-mode VM risk and current worker-isolation limitations remain explicit.
 
-No approved Faultline logo asset exists in the supplied checkout. The site uses the plain Faultline name and a restrained wordmark/rule startup reveal, not an invented replacement symbol. Supplying the approved file is required to complete exact-logo integration. Legacy inactive frontend files were preserved instead of destructively deleting existing work.
+No approved logo asset was added or invented: the existing plain Faultline wordmark remains. Social image metadata now references the existing local asset; a production origin must be supplied if deployment later requires absolute social URLs.
 
-## Changed files
-
-- Configuration: `.oxlintrc.json`, `index.html`, `package.json`, `package-lock.json`, `tsconfig.json`, `vite.config.ts`, `vitest.config.ts`.
-- Foundation: `app/globals.css`, `src/App.tsx`, `src/main.tsx`, `src/components/SiteShell.tsx`, `src/components/SdkEvidence.tsx`.
-- Motion and visuals: `src/motion/system.tsx`, `src/motion/BootSignal.tsx`, `src/visuals/Hero.tsx`, `src/visuals/GuardScene.tsx`, `src/visuals/Diagrams.tsx`, `public/guard-aperture.svg`, `public/robots.txt`.
-- Routes: `src/pages/Landing.tsx`, `src/pages/Product.tsx`.
-- Data: `src/protocol/model.ts`, `src/protocol/ProtocolProvider.tsx`, `src/protocol/rpc-adapter.ts`, `src/protocol/sdk-browser.ts`, `src/protocol/browser-buffer.ts`, `src/protocol/browser-crypto.ts`.
-- Validation and handoff: `tests/protocol-adapters.test.ts`, `tests/visual-qa.mjs`, `tests/motion-qa.mjs`, `IMPLEMENTATION.md`, `QA_REPORT.md`.
+All changes are inside `frontend/`. No backend, on-chain semantics, worker logic, manifests, commitment algorithms, WIP branch or original worktree files were modified. No deployment or push.

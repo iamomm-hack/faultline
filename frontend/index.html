@@ -6,13 +6,24 @@
     <meta name="description" content="Safety claims. Enforced. Faultline binds Solana upgrades to replay evidence, verifier attestations and guarded authority." />
     <meta property="og:title" content="FAULTLINE" />
     <meta property="og:description" content="Executable safety invariants. Enforced deployment conditions." />
-    <meta property="og:image" content="https://faultline-gate.fine-vale-0544.chatgpt.site/og.png" />
+    <meta property="og:image" content="/og.png" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="FAULTLINE" />
     <meta name="twitter:description" content="Executable safety invariants. Enforced deployment conditions." />
-    <meta name="twitter:image" content="https://faultline-gate.fine-vale-0544.chatgpt.site/og.png" />
+    <meta name="twitter:image" content="/og.png" />
     <link rel="icon" href="data:," />
-    <link rel="preload" as="image" href="/guard-aperture.svg" />
+    <script>
+      if (location.pathname === '/') {
+        const poster = document.createElement('link');
+        poster.rel = 'preload';
+        poster.as = 'image';
+        poster.href = '/images/faultline/monument-1280.webp';
+        poster.imageSrcset = '/images/faultline/monument-640.webp 640w, /images/faultline/monument-960.webp 960w, /images/faultline/monument-1280.webp 1280w, /images/faultline/monument-1920.webp 1920w';
+        poster.imageSizes = '100vw';
+        poster.fetchPriority = 'high';
+        document.head.append(poster);
+      }
+    </script>
     <title>Faultline — Safety claims. Enforced.</title>
   </head>
   <body>

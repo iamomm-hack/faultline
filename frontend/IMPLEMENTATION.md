@@ -5,7 +5,7 @@
 Baseline: `18a8b6efbb2329c81420b9341452436df1df8273`, branch `frontend-demo`.
 The existing application is Vite + React 19 + React Router, not Next.js. Preserve that runtime, the lockfile, and committed SDK/IDL source. No protocol or backend files are changed.
 
-- `/`: editorial protocol story, demand-rendered Guard Aperture, evidence and architecture.
+- `/`: image-led protocol story, scroll-controlled photographic hero, evidence and architecture.
 - `/app`: protocol dashboard; `/proposals`: searchable explorer.
 - `/proposals/:proposalId`: evidence, authority and settlement detail.
 - `/demo`: resettable deterministic v2/v3 walkthrough.
@@ -14,7 +14,7 @@ The existing application is Vite + React 19 + React Router, not Next.js. Preserv
 - `src/visuals`: original procedural geometry and accessible static diagrams.
 - `src/protocol`: isolated demo and configured read-only RPC adapters.
 
-Visual thesis: an enforced structural boundary. Black machined geometry, paper-white editorial fields, large restrained typography, small evidence annotations, square controls and thin rules. No stock or generated artwork.
+Visual thesis after the 2026-09-28 correction: critical infrastructure under controlled inspection. Licensed monochrome architectural and material photography, oversized editorial typography, asymmetric crops, precise annotations and large negative-space areas. The former procedural Guard scene is retained but no longer imported or shipped in the landing-page bundle. Product behavior and SDK adapters are unchanged.
 
 ## Evidence and brand audit
 
@@ -22,7 +22,7 @@ The original frontend contains invented placeholder keys/hashes and a legacy 2-o
 
 No approved logo file is present in the supplied checkout. The old favicon is unrelated blue starter artwork and the old sidebar mark is CSS geometry. Use the plain Faultline name until the approved asset is supplied; do not invent a logo or claim a logo-symbol preloader was delivered.
 
-Reference principles: editorial density and negative space from kimia.live; the supplied Valdyum direction for scene evolution; the supplied Vouch direction for lifecycle-safe motion. Valdyum and Vouch could not be fetched through the research browser; do not claim source inspection of those references.
+References were directly inspected on 2026-09-28: Kimia and Valdyum via rendered browser frames, Vouch via its public frontend motion/lifecycle files. The earlier audit could not fetch two references; this redesign resolved that access limitation. Principles inform original compositions; no reference code, branding or assets were copied. See `QA_REPORT.md` for the mapping and `public/images/faultline/ASSET_PROVENANCE.md` for all 12 photograph sources and licence terms.
 
 ## Local configuration
 

@@ -30,6 +30,7 @@ import {
 import { CopyValue } from './Landing';
 import { SdkEvidence } from '../components/SdkEvidence';
 import { ArchitectureDiagram, ReceiptDiagram } from '../visuals/Diagrams';
+import { Photo, type PhotoName } from '../visuals/Photo';
 
 function PageTitle({
   eyebrow,
@@ -42,8 +43,22 @@ function PageTitle({
   description: string;
   action?: ReactNode;
 }) {
+  const image: PhotoName = eyebrow.startsWith('PROPOSAL /')
+    ? 'receipts'
+    : title === 'Proposal explorer'
+      ? 'alloy'
+      : title === 'Protocol overview'
+        ? 'infrastructure'
+        : title === 'Authority with conditions.'
+          ? 'monument'
+          : 'passage';
   return (
-    <div className="product-heading">
+    <div className="product-heading environmental-heading">
+      <Photo
+        name={image}
+        className="product-environment"
+        sizes="(max-width: 767px) 100vw, 55vw"
+      />
       <div>
         <span className="mono">{eyebrow}</span>
         <h1>{title}</h1>
