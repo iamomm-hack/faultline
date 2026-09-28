@@ -7,6 +7,7 @@
     "skipLibCheck": true,
     "strict": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "esModuleInterop": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
@@ -14,8 +15,22 @@
     "isolatedModules": true,
     "jsx": "react-jsx",
     "types": ["node", "vite/client"],
-    "paths": { "@/*": ["./*"] }
+    "paths": {
+      "@/*": ["./*"],
+      "@faultline/sdk": ["./src/protocol/sdk-browser.ts"],
+      "@faultline/idl": ["../packages/faultline-idl/src/index.ts"],
+      "@solana/web3.js": ["./node_modules/@solana/web3.js"]
+    }
   },
-  "include": ["src", "app", "components", "faultline", "lib", "tests", "vite.config.ts", "vitest.config.ts"],
+  "include": [
+    "src",
+    "app",
+    "components",
+    "faultline",
+    "lib",
+    "tests",
+    "vite.config.ts",
+    "vitest.config.ts"
+  ],
   "exclude": ["node_modules", "dist", "app/layout.tsx"]
 }

@@ -1,5 +1,6 @@
 export const DEFAULT_SLOT_WAIT_DEADLINE_MS = 8 * 60_000;
 export const CHECKPOINT4_REFUND_SLOT_WAIT_DEADLINE_MS = 13 * 60_000;
+export const CHECKPOINT5_UPGRADE_SLOT_WAIT_DEADLINE_MS = 13 * 60_000;
 export const SLOT_WAIT_HEARTBEAT_MS = 15_000;
 
 export async function waitForRequiredSlot(options: {

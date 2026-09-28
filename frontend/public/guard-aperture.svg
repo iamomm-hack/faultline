@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1000" fill="none">
+<defs><linearGradient id="metal" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#d0d0cd"/><stop offset=".26" stop-color="#767675"/><stop offset=".6" stop-color="#272727"/><stop offset="1" stop-color="#686867"/></linearGradient><linearGradient id="edge"><stop stop-color="#333"/><stop offset=".5" stop-color="#aaa"/><stop offset="1" stop-color="#333"/></linearGradient></defs>
+<g transform="translate(700 490) rotate(-24) skewX(13)">
+<g stroke="#262626"><path d="M-620 360H560M-620 380H560M-620 400H560M-620 420H560M-620 440H560"/><path d="M-450 320V460M-250 320V460M-50 320V460M150 320V460M350 320V460"/></g>
+<g transform="translate(105 -50)"><path d="M-235-270H235V270H-235ZM-165-200V200H165V-200Z" fill="#202020" fill-rule="evenodd" stroke="#777"/><path d="M-235-270L-195-305H275L235-270M235 270L275 235V-305" stroke="#777"/></g>
+<g transform="translate(70 -32)"><path d="M-235-270H235V270H-235ZM-165-200V200H165V-200Z" fill="#343434" fill-rule="evenodd" stroke="#969692"/></g>
+<g transform="translate(35 -16)"><path d="M-235-270H235V270H-235ZM-165-200V200H165V-200Z" fill="#444" fill-rule="evenodd" stroke="#b0b0ac"/></g>
+<path d="M-235-270H235V270H-235ZM-165-200V200H165V-200Z" fill="url(#metal)" fill-rule="evenodd" stroke="#bdbdb7"/>
+<path d="M-211-246H211V246H-211ZM-191-226H191V226H-191Z" stroke="#282828"/>
+<g fill="#0b0b0b" stroke="#9e9e98"><circle cx="-211" cy="-246" r="5"/><circle cx="211" cy="-246" r="5"/><circle cx="-211" cy="246" r="5"/><circle cx="211" cy="246" r="5"/></g>
+<g fill="#70706c" stroke="#b0b0ab"><path d="M-470-65H-345V-32H-470Z"/><path d="M-430-15H-290V18H-430Z"/><path d="M-485 36H-345V69H-485Z"/><path d="M-400 88H-285V121H-400Z"/></g>
+<g stroke="#646460" stroke-dasharray="3 8"><path d="M-345-48H-10M-290 0H30M-345 53H-10M-285 102H30"/></g>
+<g transform="translate(370 -45)"><path d="M-55-65H55V65H-55Z" fill="#242424" stroke="#b7b7b0"/><path d="M-55-65L-20-95H90L55-65M55 65L90 35V-95" stroke="#aaa"/><path d="M-37-47H37V47H-37Z" stroke="#555"/></g>
+</g></svg>
