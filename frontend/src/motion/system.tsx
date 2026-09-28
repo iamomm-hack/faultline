@@ -62,23 +62,14 @@ export function MotionProvider({ children }: { children: ReactNode }) {
     () => {
       window.scrollTo(0, 0);
       let active = true;
-      let anchored = false;
       const finish = () => {
         if (!active) return;
         if (enabled && matchMedia('(min-width: 768px)').matches)
           ScrollTrigger.refresh();
-        if (hash && !anchored) {
-          const target = document.getElementById(hash.slice(1));
-          if (target) {
-            target.scrollIntoView();
-            anchored = true;
-          }
-        }
+        if (hash) document.getElementById(hash.slice(1))?.scrollIntoView();
       };
       void document.fonts.ready.then(finish);
-      const images = Array.from(document.images).filter(
-        (img) => !img.complete && img.fetchPriority === 'high',
-      );
+      const images = Array.from(document.images).filter((img) => !img.complete);
       images.forEach((img) =>
         img.addEventListener('load', finish, { once: true }),
       );

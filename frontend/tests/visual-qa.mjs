@@ -27,7 +27,7 @@ try {
     [1440, 900],
     [1280, 800],
     [1024, 768],
-    [768, 1024],
+    [768, 900],
     [390, 844],
     [360, 800],
   ]) {
@@ -36,15 +36,6 @@ try {
     for (const route of routes) {
       await page.goto(`http://127.0.0.1:3001${route}`);
       await page.locator('h1').waitFor();
-      await page.evaluate(async () => {
-        const initialY = scrollY;
-        for (const image of Array.from(document.images)) {
-          image.scrollIntoView({ block: 'center' });
-          await new Promise((resolve) => setTimeout(resolve, 60));
-          if (image.currentSrc) await image.decode().catch(() => {});
-        }
-        window.scrollTo(0, initialY);
-      });
       await page.waitForTimeout(250);
       const overflow = await page.evaluate(
         () => document.documentElement.scrollWidth > innerWidth + 1,
@@ -168,8 +159,8 @@ try {
   );
   await page.goto('http://127.0.0.1:3001/');
   await page.emulateMedia({ reducedMotion: 'no-preference' });
-  await page.locator('.cinema-hero').waitFor();
-  for (const y of [0, 650, 1350, 2000, 2600]) {
+  await page.locator('.guard-canvas canvas').waitFor();
+  for (const y of [0, 550, 1100, 1750]) {
     await page.evaluate((y) => window.scrollTo(0, y), y);
     await page.waitForTimeout(850);
     await page.screenshot({ path: `outputs/hero-motion-${y}.png` });
@@ -178,9 +169,7 @@ try {
   await page.getByRole('heading', { name: 'Protocol overview' }).waitFor();
   const pinCount = await page.locator('.pin-spacer').count();
   if (pinCount) throw Error('Route left pin spacers behind');
-  report.interactions.push(
-    'scroll-driven photographic narrative and route cleanup',
-  );
+  report.interactions.push('scroll-driven WebGL narrative and route cleanup');
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('http://127.0.0.1:3001/');
   await page.getByRole('button', { name: 'Open menu' }).click();
@@ -202,7 +191,7 @@ try {
     throw Error('Menu Escape focus restoration failed');
   await page.goto('http://127.0.0.1:3001/');
   await page
-    .getByRole('heading', { name: 'Unsafe upgrades stop here.' })
+    .getByRole('heading', { name: 'Safety claims. Enforced.' })
     .waitFor();
   await page.keyboard.press('Tab');
   if (
