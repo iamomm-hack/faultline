@@ -15,3 +15,7 @@ docs/*
 /crates/faultline-replay/target/
 /node_modules/
 /test-ledger/
+
+pitch.md
+demo.md
+/outputs/
