@@ -17,6 +17,7 @@ Faultline is not a generic vulnerability scanner and does not certify that a pro
 - [Why Faultline exists](#why-faultline-exists)
 - [Faultline at a glance](#faultline-at-a-glance)
 - [The reference safety story](#the-reference-safety-story)
+- [Visual architecture overview](#visual-architecture-overview)
 - [What Faultline does](#what-faultline-does)
 - [Project status](#project-status)
 - [Choose where to start](#choose-where-to-start)
@@ -84,6 +85,85 @@ Faultline ships a deliberately small example that makes the entire mechanism ins
 The important point is the boundary, not merely the bug. v2 cannot ship through the Guard after the confirmed violation. v3 is not called “secure”; its replay result says only that `AUTH-001` was preserved for the exact bound trace and execution environment.
 
 You can explore the complete story without a wallet in the frontend's `/demo` route. It is an explicitly labeled local simulation. The real protocol demonstrations use the PowerShell/local-validator commands under [Local development](#local-development).
+
+## Visual architecture overview
+
+The three diagrams below show the core product before the detailed protocol reference.
+
+### From candidate to enforced decision
+
+```mermaid
+flowchart LR
+    Candidate[Candidate SBF] --> Buffer[Locked Buffer]
+    Buffer --> Proposal[Bound proposal]
+    Policy[Safety policy] --> Proposal
+    Challenge[Revealed trace] --> Round[Replay round]
+    Proposal --> Round
+    Round --> Workers[Three workers]
+    Workers --> Evidence[Signed evidence]
+    Evidence --> Votes[Direct attestations]
+    Votes --> Decision{Verdict}
+    Decision -->|VIOLATION| Reject[Reject]
+    Decision -->|HOLD| Approval[Governance decision]
+    Approval --> Delay[Challenge boundary]
+    Delay --> Guard[Guard PDA]
+    Guard --> Loader[Loader v3 upgrade]
+```
+
+The Buffer is locked before the challenge process. A VIOLATION ends at rejection. HOLD reaches the execution path only after a separate approval and the required slot boundary.
+
+### On-chain and off-chain responsibilities
+
+```mermaid
+flowchart TB
+    subgraph Offchain[Off-chain replay]
+        Inputs[Artifacts and trace] --> Canonical[Canonical validation]
+        Canonical --> VM[LiteSVM execution]
+        VM --> Receipt[Replay receipt]
+        Receipt --> Signed[Signed worker outputs]
+        Signed --> Consensus[Unanimity check]
+    end
+
+    subgraph Onchain[On-chain enforcement]
+        Epoch[Verifier epoch] --> Attest[Direct attestations]
+        Result[Replay result] --> Attest
+        Attest --> Finalize[Round finalization]
+        Finalize --> State[Proposal state]
+        State --> Guard[Guarded execution]
+    end
+
+    Consensus --> Result
+    Consensus --> Attest
+    Guard --> Loader[Loader v3]
+```
+
+Workers execute the replay, but their signatures do not directly change Solana state. Configured verifier identities submit normal signed transactions; the Gate verifies accounts, membership, commitments, quorum, timing, and state transitions.
+
+### Evidence and commitment chain
+
+```mermaid
+flowchart LR
+    Bytes[Candidate bytes] --> ExecutableHash[Executable hash]
+    PolicyFile[Invariant policy] --> SpecHash[Specification hash]
+    TraceFile[Canonical trace] --> TraceHash[Trace hash]
+    TraceHash --> TraceClaim[TraceClaim PDA]
+    Manifests[Runner and fixture] --> JobHash[Replay job hash]
+    ExecutableHash --> JobHash
+    SpecHash --> JobHash
+    TraceHash --> JobHash
+    JobHash --> Receipt[Canonical receipt]
+    Receipt --> ReceiptHash[Receipt hash]
+    ExecutableHash --> ResultHash[Result commitment]
+    SpecHash --> ResultHash
+    TraceClaim --> ResultHash
+    ReceiptHash --> ResultHash
+    Bindings[Proposal and invariant] --> ResultHash
+    Verdict[HOLD or VIOLATION] --> ResultHash
+    ResultHash --> ReplayResult[On-chain replay result]
+    ReplayResult --> Attestations[Verifier attestations]
+```
+
+Each layer binds the next one. Proposal and round accounts snapshot the candidate, invariant, trace claim, epoch, and threshold; the on-chain replay-result commitment also includes the verdict and replay-receipt hash.
 
 ## What Faultline does
 
